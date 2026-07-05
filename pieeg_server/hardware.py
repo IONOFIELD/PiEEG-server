@@ -12,6 +12,7 @@ import logging
 import os
 import struct
 import sys
+import time
 
 try:
     import fcntl
@@ -72,7 +73,19 @@ SIGN_TEST = 0x7FFFFF
 FULL_SCALE = 0xFFFFFF
 FULL_SCALE_PLUS_1 = 16777215
 NEGATIVE_OFFSET = 16777214
+FULL_SCALE_23 = (1 << 23) - 1   # 8388607: signed 24-bit positive full scale
 VREF_UV = 4.5e6  # 4.5V reference in microvolts
+
+# CHnSET register (0x05..0x0C) bit layout, per ADS1299 datasheet (TI SBAS499):
+#   bit 7    PDn     0 = channel powered on
+#   bits 6:4 GAINn   000=x1 001=x2 010=x4 011=x6 100=x8 101=x12 110=x24
+#   bit 3    SRB2    0 = SRB2 open
+#   bits 2:0 MUXn    000 = normal electrode input
+# Clinical EEG uses PGA gain x24. 0x60 = 0b0110_0000 -> PD=0, GAIN=110 (x24),
+# SRB2=0, MUX=000.
+GAIN_CODE_X24 = 0b110
+CHNSET_GAIN_X24_NORMAL = 0x60
+PGA_GAIN_X24 = 24            # numeric multiplier for the x24 gain code
 
 # --- GPIO pins ---
 CS_PIN = 19
@@ -81,6 +94,13 @@ DRDY_PIN_2 = 13    # DRDY chip 2
 
 # --- SPI settings ---
 SPI_SPEED_HZ = 4_000_000
+# Register reads/writes (RREG/WREG) must run MUCH slower than the streaming
+# clock. Each command byte needs ~4 tCLK (tCLK = 2.048 MHz internal osc) to be
+# decoded before the next byte; at 4 MHz that window is violated, so WREG never
+# latches and RREG returns 0x00. Measured on this board (Pi 4): register access
+# is unreliable at >=2 MHz and rock-solid (40/40) at 500 kHz. Streaming
+# (readbytes) has no per-byte command decode and stays at the full 4 MHz.
+REGISTER_SPEED_HZ = 500_000
 SPI_MODE = 0b01
 SPI_BITS = 8
 BYTES_PER_READ = 27  # 3 status + 8 channels * 3 bytes
@@ -145,10 +165,17 @@ class PiEEGHardware:
         self._spike_threshold = SPIKE_THRESHOLD
         self._spike_reset_after = SPIKE_RESET_AFTER
         self._register_state: dict[int, int] = {}
+        # PGA gain verified by register readback in _configure_adc.
+        self._pga_gain: int | None = None
 
     @property
     def num_channels(self) -> int:
         return self._num_channels
+
+    @property
+    def pga_gain(self) -> int | None:
+        """PGA gain confirmed by register readback (None until configured)."""
+        return self._pga_gain
 
     @property
     def spike_threshold(self) -> int:
@@ -438,28 +465,60 @@ class PiEEGHardware:
             self._spi2.bits_per_word = SPI_BITS
 
     def _send_command(self, chip_num: int, command: int):
+        # xfer2 keeps CS asserted for the whole transaction; commands run at the
+        # slow register clock so the chip reliably decodes them.
         if chip_num == 1:
-            self._spi1.xfer([command])
+            self._spi1.xfer2([command], REGISTER_SPEED_HZ)
         else:
             self._cs_set(0)
-            self._spi2.xfer([command])
+            self._spi2.xfer2([command], REGISTER_SPEED_HZ)
             self._cs_set(1)
 
     def _write_register(self, chip_num: int, register: int, value: int):
+        # WREG = [0x40|addr, num-1, value]. MUST use xfer2 (CS held low across
+        # all three bytes) at the slow register clock, or the write won't latch.
         data = [0x40 | register, 0x00, value]
         if chip_num == 1:
-            self._spi1.xfer(data)
+            self._spi1.xfer2(data, REGISTER_SPEED_HZ)
         else:
             self._cs_set(0)
-            self._spi2.xfer(data)
+            self._spi2.xfer2(data, REGISTER_SPEED_HZ)
             self._cs_set(1)
+
+    def _verify_comms(self, chip_num: int):
+        """Confirm SPI register access works before trusting any config.
+
+        The ID register (WHO_I_AM) reads a fixed ADS1299 value: bit4=1 and the
+        low 5 bits = 0b1_1110 (0x1E), so 0x1E/0x3E/... are valid. Right after
+        power-up/RESET the chip occasionally isn't settled and every read comes
+        back 0x00; retry the reset a few times before giving up.
+        """
+        for attempt in range(1, 6):
+            dev_id = self._rreg(chip_num, WHO_I_AM)
+            if (dev_id & 0x1F) == 0x1E:
+                logger.info("chip %d ID register = 0x%02X (ADS1299 comms OK)",
+                            chip_num, dev_id)
+                return
+            logger.warning("chip %d ID read 0x%02X invalid; retrying reset (%d/5)",
+                           chip_num, dev_id, attempt)
+            self._send_command(chip_num, CMD_RESET)
+            time.sleep(0.05)
+            self._send_command(chip_num, CMD_SDATAC)
+            time.sleep(2e-3)
+        raise RuntimeError(
+            f"ADS1299 chip {chip_num}: SPI comms failed -- ID register never "
+            f"read a valid value. Check wiring, power, and SPI mode.")
 
     def _configure_adc(self, chip_num: int):
         """Send the full initialization sequence to one ADC chip."""
         self._send_command(chip_num, CMD_WAKEUP)
         self._send_command(chip_num, CMD_STOP)
         self._send_command(chip_num, CMD_RESET)
+        time.sleep(0.05)                      # let the reset + oscillator settle
         self._send_command(chip_num, CMD_SDATAC)
+
+        # Confirm SPI register access before writing anything we later trust.
+        self._verify_comms(chip_num)
 
         # Register configuration (matches original PiEEG scripts)
         self._write_register(chip_num, 0x14, 0x80)  # GPIO
@@ -475,29 +534,92 @@ class PiEEGHardware:
         self._write_register(chip_num, 0x15, 0x20)
         self._write_register(chip_num, 0x17, 0x00)
 
-        # Enable all 8 channels with default gain
+        # Enable all 8 channels at PGA gain x24 (clinical EEG). Byte 0x60 is
+        # decoded in the CHNSET_GAIN_X24_NORMAL comment above.
         for ch_reg in (CH1SET, CH2SET, CH3SET, CH4SET,
                        CH5SET, CH6SET, CH7SET, CH8SET):
-            self._write_register(chip_num, ch_reg, 0x00)
+            self._write_register(chip_num, ch_reg, CHNSET_GAIN_X24_NORMAL)
+            logger.info("WREG CH@0x%02X <- 0x%02X (gain x24)",
+                        ch_reg, CHNSET_GAIN_X24_NORMAL)
+
+        # Verify the gain actually took. RREG works here because we are still
+        # in SDATAC (continuous read not re-enabled yet). A wrong gain silently
+        # corrupts every exported microvolt, so fail loudly on mismatch.
+        self._assert_gain_x24(chip_num)
 
         self._send_command(chip_num, CMD_RDATAC)
         self._send_command(chip_num, CMD_START)
 
-    @staticmethod
-    def _decode_channels(raw: list[int]) -> list[float]:
+    def _rreg(self, chip_num: int, register: int) -> int:
+        """Read one register value off the chip (must be in SDATAC).
+
+        RREG opcode is 0x20|addr, followed by (count-1)=0 and one dummy byte
+        that clocks the register value out. MUST use xfer2 (CS held low across
+        all three bytes) at the slow register clock: with plain xfer / at 4 MHz
+        this returns 0x00. The chip must not be streaming (RDATAC).
         """
-        Decode 8 channels from a 27-byte SPI read.
+        frame = [0x20 | register, 0x00, 0x00]
+        if chip_num == 1:
+            resp = self._spi1.xfer2(frame, REGISTER_SPEED_HZ)
+        else:
+            self._cs_set(0)
+            resp = self._spi2.xfer2(frame, REGISTER_SPEED_HZ)
+            self._cs_set(1)
+        return resp[2] & 0xFF
+
+    def _assert_gain_x24(self, chip_num: int):
+        """Read back every CHnSET and confirm the PGA gain is x24."""
+        codes = []
+        for ch_reg in (CH1SET, CH2SET, CH3SET, CH4SET,
+                       CH5SET, CH6SET, CH7SET, CH8SET):
+            value = self._rreg(chip_num, ch_reg)
+            code = (value >> 4) & 0b111
+            codes.append(code)
+            logger.info("RREG CH@0x%02X -> 0x%02X (gain code %d)",
+                        ch_reg, value, code)
+        if any(code != GAIN_CODE_X24 for code in codes):
+            raise RuntimeError(
+                f"ADS1299 chip {chip_num}: PGA gain readback FAILED. Expected "
+                f"gain code {GAIN_CODE_X24} (x24) on all channels, got {codes}. "
+                f"Refusing to run with an unverified gain.")
+        self._pga_gain = PGA_GAIN_X24
+        logger.info("chip %d PGA gain verified: x%d", chip_num, PGA_GAIN_X24)
+
+    def _physical_lsb_uv(self) -> float:
+        """Physically correct microvolts per ADC count for the programmed gain.
+
+        Datasheet: uV = code * Vref / (gain * (2^23 - 1)). Uses the gain
+        confirmed by register readback (falls back to x24 before configure).
+        """
+        gain = self._pga_gain or PGA_GAIN_X24
+        return VREF_UV / (gain * FULL_SCALE_23)
+
+    def _decode_channels(self, raw: list[int]) -> list[float]:
+        """
+        Decode 8 channels from a 27-byte SPI read into PHYSICAL microvolts.
 
         Bytes 0-2: status
         Bytes 3-26: 8 channels × 3 bytes (24-bit signed, MSB first)
 
+        uV = code * Vref / (gain * (2^23 - 1)), using the PGA gain read back
+        from the chip -- so the live stream, CSV, and LSL all carry physically
+        correct microvolts. Kept to 4 decimals: that is far finer than one
+        count (~0.0224 uV at gain 24), so the journal still inverts each value
+        back to the exact integer ADC code (counts stay bit-for-bit 1:1).
+
         Uses the compiled ``pieeg_core.decode_channels`` (~30× faster) when
-        available, with the pure-Python implementation below as the
-        reference and fallback.
+        available; that returns the older transport-scale uV (Vref/(2^24-1),
+        no gain), so we rescale it to the physical scale with a single factor.
         """
+        lsb_uv = self._physical_lsb_uv()
+
         if _native.HAS_NATIVE:
-            # Native path: Rust consumes the spidev byte list directly.
-            return _native.decode_channels(raw)
+            # Native returns transport-scale uV; convert to physical. The factor
+            # is (2^24-1) / (gain * (2^23-1)) -- i.e. add the gain and swap the
+            # full-scale denominator, without re-reading the codes.
+            gain = self._pga_gain or PGA_GAIN_X24
+            correction = FULL_SCALE_PLUS_1 / (gain * FULL_SCALE_23)
+            return [round(v * correction, 4) for v in _native.decode_channels(raw)]
 
         channels = []
         for i in range(3, 25, 3):
@@ -509,8 +631,6 @@ class PiEEGHardware:
             else:
                 signed_val = raw_val
 
-            # Convert to microvolts: µV = 1e6 * 4.5 * (raw / (2^24 - 1))
-            uv = round(VREF_UV * (signed_val / FULL_SCALE_PLUS_1), 2)
-            channels.append(uv)
+            channels.append(round(signed_val * lsb_uv, 4))
 
         return channels
