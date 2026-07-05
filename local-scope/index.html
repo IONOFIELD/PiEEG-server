@@ -1,0 +1,403 @@
+<!-- SPDX-License-Identifier: AGPL-3.0-only
+  PiEEG Local Scope — a LOCAL, on-the-Pi live viewer for the Gate 2 WebSocket
+  stream. It renders all 8 channels in physical microvolts for real-time
+  inspection and hardware troubleshooting.
+
+  This is a VIEWER ONLY. It never sends anything to the server and cannot change
+  acquisition, calibration, or the recording. The journal on the Pi is the
+  source of truth; this window is throwaway.
+
+  How it's built (for someone new to React):
+    * React draws the CONTROLS and the HEALTH panel (small components below).
+    * The fast waveform drawing is done on a <canvas> with requestAnimationFrame,
+      NOT through React — 250 frames/second would be far too many React updates.
+      Incoming samples are written into plain arrays (refs) that the canvas reads.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PiEEG Local Scope</title>
+
+<!-- React + Babel from a CDN so there is no build step. For offline use, run
+     local-scope/fetch_vendor.sh once to vendor these files next to this page. -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  // Force the CLASSIC JSX runtime: JSX -> React.createElement (the global React
+  // from the UMD build). The default "automatic" runtime injects an ES import
+  // that can't run in a plain inline script.
+  Babel.registerPreset("react-classic", {
+    presets: [[Babel.availablePresets.react, { runtime: "classic" }]],
+  });
+</script>
+
+<style>
+  :root {
+    --surface: #1a1a19;     /* chart surface (validated dark palette) */
+    --panel:   #232322;
+    --ink:     #ffffff;
+    --ink-dim: #c3c2b7;
+    --muted:   #6f6e69;
+    --grid:    #333331;
+    --critical:#d03b3b;     /* reserved status: railing */
+    --good:    #0ca30c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0d0d0d; color: var(--ink);
+    font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; background: var(--panel); border-bottom: 1px solid var(--grid);
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input[type=text] {
+    background: #101010; color: var(--ink); border: 1px solid var(--grid);
+    border-radius: 6px; padding: 5px 8px; width: 230px; font: inherit;
+  }
+  button, select {
+    background: #2c2c2b; color: var(--ink); border: 1px solid var(--grid);
+    border-radius: 6px; padding: 5px 10px; font: inherit; cursor: pointer;
+  }
+  button.primary { background: #1c5cab; border-color: #256abf; }
+  button:disabled { opacity: .5; cursor: default; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+  .muted { color: var(--muted); }
+  .dim { color: var(--ink-dim); }
+  main { display: grid; grid-template-columns: 1fr 210px; gap: 0; height: calc(100vh - 53px); }
+  #scope { width: 100%; height: 100%; display: block; background: var(--surface); }
+  aside { background: var(--panel); border-left: 1px solid var(--grid); padding: 12px; overflow-y: auto; }
+  aside h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .6px; color: var(--muted); margin: 14px 0 6px; }
+  aside h2:first-child { margin-top: 0; }
+  .stat { display: flex; justify-content: space-between; padding: 2px 0; }
+  .stat b { font-variant-numeric: tabular-nums; }
+  .chrow { display: flex; align-items: center; gap: 7px; padding: 3px 0; }
+  .swatch { width: 11px; height: 11px; border-radius: 2px; flex: 0 0 auto; }
+  .badge {
+    font-size: 10px; font-weight: 700; padding: 1px 5px; border-radius: 4px;
+    background: var(--critical); color: #fff; letter-spacing: .3px;
+  }
+  label.ck { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .seg { display: flex; gap: 4px; flex-wrap: wrap; }
+  .seg button.active { background: #1c5cab; border-color: #256abf; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react-classic">
+const { useState, useRef, useEffect, useCallback } = React;
+
+// ---- constants ---------------------------------------------------------- //
+// 8 categorical hues (dark-surface, validated with the dataviz validator). Each
+// channel also sits in its own labelled lane, so identity is never color-alone.
+const CH_COLORS = ["#3987e5","#199e70","#c98500","#008300",
+                   "#9085e9","#e66767","#d55181","#d95926"];
+const NUM_CH = 8;
+
+// The ADS1299 at PGA gain x24 can only see +/- Vref/24 = +/- 187500 uV at its
+// input. Anything near that rail is saturated (clipped) — flag it.
+const RAIL_UV = 187_500;
+const SAT_UV = 0.9 * RAIL_UV;          // 168750 uV -> "RAIL"
+
+const WINDOWS = [2, 5, 10];            // seconds of history on screen
+const UV_PER_DIV = [5, 10, 25, 50, 100, 200];
+const RING_CAP = 3000;                 // per-channel sample capacity (>=10s @250Hz)
+
+// ---- shared, mutable stream store (NOT React state — updated at 250 Hz) --- //
+function makeStore() {
+  return {
+    // one ring buffer per channel
+    ring: Array.from({length: NUM_CH}, () => new Float32Array(RING_CAP)),
+    writePos: 0,
+    count: 0,                          // total samples ever written
+    lastSeq: null,
+    dropped: 0,                        // total missing sequence numbers
+    lastDropAt: 0,                     // ms timestamp of the most recent gap
+    frameTimes: [],                    // arrival times (ms) for rate estimate
+    effectiveRate: 250,
+    sampleRate: 250,
+    peak: new Float32Array(NUM_CH),    // running |uV| peak per channel (for RAIL)
+  };
+}
+
+// ---- WebSocket ingest (writes the store, never re-renders per frame) ----- //
+function useStream(store) {
+  const [status, setStatus] = useState("disconnected");  // for the header only
+  const wsRef = useRef(null);
+
+  const connect = useCallback((url) => {
+    try { wsRef.current && wsRef.current.close(); } catch (e) {}
+    setStatus("connecting");
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+    ws.onopen = () => setStatus("connected");
+    ws.onclose = () => setStatus("disconnected");
+    ws.onerror = () => setStatus("error");
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      const s = store.current;
+      if (m.type === "hello") {
+        s.sampleRate = m.sample_rate;
+        s.effectiveRate = m.effective_rate;
+        return;
+      }
+      if (m.type !== "frame") return;
+      // Sequence-gap = dropped display frames (the Gate 2 loss signal).
+      if (s.lastSeq !== null && m.seq !== s.lastSeq + 1) {
+        s.dropped += (m.seq - s.lastSeq - 1);
+        s.lastDropAt = performance.now();
+      }
+      s.lastSeq = m.seq;
+      // Write one sample per channel into the ring buffers.
+      const p = s.writePos;
+      for (let c = 0; c < NUM_CH; c++) {
+        const v = m.channels[c];
+        s.ring[c][p] = v;
+        const a = Math.abs(v);
+        if (a > s.peak[c]) s.peak[c] = a;   // decayed elsewhere
+      }
+      s.writePos = (p + 1) % RING_CAP;
+      s.count++;
+      s.frameTimes.push(performance.now());
+    };
+  }, [store]);
+
+  const disconnect = useCallback(() => {
+    try { wsRef.current && wsRef.current.close(); } catch (e) {}
+  }, []);
+
+  return { status, connect, disconnect };
+}
+
+// ---- the waveform canvas (drawn imperatively via requestAnimationFrame) --- //
+function ScopeCanvas({ store, cfg }) {
+  const canvasRef = useRef(null);
+  const cfgRef = useRef(cfg);
+  cfgRef.current = cfg;                 // always read the latest config in rAF
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    let raf;
+
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = canvas.clientWidth * dpr;
+      canvas.height = canvas.clientHeight * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    resize();
+    window.addEventListener("resize", resize);
+
+    function draw() {
+      const s = store.current;
+      const { enabled, windowSec, uvPerDiv } = cfgRef.current;
+      const W = canvas.clientWidth, H = canvas.clientHeight;
+      ctx.clearRect(0, 0, W, H);
+
+      const lanes = [];
+      for (let c = 0; c < NUM_CH; c++) if (enabled[c]) lanes.push(c);
+      if (lanes.length === 0) { raf = requestAnimationFrame(draw); return; }
+
+      const leftPad = 58;                       // room for the uV scale
+      const laneH = H / lanes.length;
+      const rate = s.effectiveRate || 250;
+      const nShow = Math.min(RING_CAP, Math.round(windowSec * rate));
+      const pxPerDiv = laneH / 4;               // 4 divisions per lane
+      const pxPerUv = pxPerDiv / uvPerDiv;
+
+      // vertical time grid (1 s spacing)
+      ctx.strokeStyle = "#333331"; ctx.lineWidth = 1;
+      ctx.fillStyle = "#6f6e69"; ctx.font = "11px ui-sans-serif";
+      for (let t = 0; t <= windowSec; t++) {
+        const x = leftPad + ((windowSec - t) / windowSec) * (W - leftPad);
+        ctx.globalAlpha = 0.5; ctx.beginPath();
+        ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); ctx.globalAlpha = 1;
+        ctx.fillText(t === 0 ? "now" : `-${t}s`, x + 3, H - 5);
+      }
+
+      lanes.forEach((c, li) => {
+        const mid = li * laneH + laneH / 2;
+        // lane divider + horizontal division lines (recessive)
+        ctx.strokeStyle = "#2a2a29"; ctx.globalAlpha = 0.7;
+        for (let d = -2; d <= 2; d++) {
+          const y = mid + d * pxPerDiv;
+          ctx.beginPath(); ctx.moveTo(leftPad, y); ctx.lineTo(W, y); ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+
+        // uV axis: 0 at midline, +/- one division labelled in REAL microvolts
+        ctx.fillStyle = "#6f6e69"; ctx.font = "10px ui-sans-serif";
+        ctx.fillText("0", 40, mid + 3);
+        ctx.fillText(`+${uvPerDiv}`, 24, mid - pxPerDiv + 3);
+        ctx.fillText(`-${uvPerDiv}`, 24, mid + pxPerDiv + 3);
+
+        // channel label + RAIL badge
+        const railed = s.peak[c] > SAT_UV;
+        ctx.fillStyle = CH_COLORS[c]; ctx.font = "600 12px ui-sans-serif";
+        ctx.fillText(`ch${c + 1}`, 6, li * laneH + 14);
+        if (railed) {
+          ctx.fillStyle = "#d03b3b";
+          ctx.fillRect(6, li * laneH + 18, 34, 13);
+          ctx.fillStyle = "#fff"; ctx.font = "700 9px ui-sans-serif";
+          ctx.fillText("RAIL", 9, li * laneH + 28);
+        }
+
+        // the waveform: newest sample on the right, scrolling left
+        ctx.strokeStyle = CH_COLORS[c]; ctx.lineWidth = 1.25;
+        ctx.beginPath();
+        for (let i = 0; i < nShow; i++) {
+          const idx = (s.writePos - nShow + i + RING_CAP * 2) % RING_CAP;
+          const v = s.ring[c][idx];
+          const x = leftPad + (i / (nShow - 1)) * (W - leftPad);
+          let y = mid - v * pxPerUv;
+          y = Math.max(li * laneH + 1, Math.min((li + 1) * laneH - 1, y)); // clip to lane
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      });
+
+      raf = requestAnimationFrame(draw);
+    }
+    raf = requestAnimationFrame(draw);
+    return () => { cancelAnimationFrame(raf); window.removeEventListener("resize", resize); };
+  }, [store]);
+
+  return <canvas id="scope" ref={canvasRef} />;
+}
+
+// ---- health panel (updated ~4 Hz, not per frame) ------------------------ //
+function useHealth(store) {
+  const [h, setH] = useState({ rate: 0, dropped: 0, recentDrop: false, sat: [] });
+  useEffect(() => {
+    const id = setInterval(() => {
+      const s = store.current;
+      const now = performance.now();
+      // rate = frames arrived in the last second
+      s.frameTimes = s.frameTimes.filter(t => now - t < 1000);
+      const rate = s.frameTimes.length;
+      // decay the per-channel peak so a transient RAIL clears after it passes
+      const sat = [];
+      for (let c = 0; c < NUM_CH; c++) {
+        sat.push(s.peak[c] > SAT_UV);
+        s.peak[c] *= 0.6;               // ~0.5 s decay at 4 Hz
+      }
+      setH({ rate, dropped: s.dropped, recentDrop: (now - s.lastDropAt) < 1500, sat });
+    }, 250);
+    return () => clearInterval(id);
+  }, [store]);
+  return h;
+}
+
+function HealthPanel({ health, status }) {
+  return (
+    <div>
+      <h2>Connection</h2>
+      <div className="stat"><span className="dim">Sample rate</span>
+        <b>{health.rate} Hz</b></div>
+      <div className="stat"><span className="dim">Dropped frames</span>
+        <b style={{color: health.recentDrop ? "var(--critical)" : "inherit"}}>
+          {health.dropped}{health.recentDrop ? " ●" : ""}</b></div>
+      <div className="stat"><span className="dim">Link</span>
+        <b>{status}</b></div>
+    </div>
+  );
+}
+
+// ---- controls (display-only; nothing here touches the ADC) -------------- //
+function Controls({ cfg, setCfg, health }) {
+  const toggle = (c) => setCfg(p => {
+    const enabled = p.enabled.slice(); enabled[c] = !enabled[c];
+    return { ...p, enabled };
+  });
+  return (
+    <div>
+      <h2>Channels</h2>
+      {CH_COLORS.map((col, c) => (
+        <div className="chrow" key={c}>
+          <label className="ck">
+            <input type="checkbox" checked={cfg.enabled[c]} onChange={() => toggle(c)} />
+            <span className="swatch" style={{background: col}}></span>
+            ch{c + 1}
+          </label>
+          {health.sat[c] && <span className="badge">RAIL</span>}
+        </div>
+      ))}
+      <h2>Time window</h2>
+      <div className="seg">
+        {WINDOWS.map(w => (
+          <button key={w} className={cfg.windowSec === w ? "active" : ""}
+                  onClick={() => setCfg(p => ({...p, windowSec: w}))}>{w}s</button>
+        ))}
+      </div>
+      <h2>µV / div</h2>
+      <div className="seg">
+        {UV_PER_DIV.map(u => (
+          <button key={u} className={cfg.uvPerDiv === u ? "active" : ""}
+                  onClick={() => setCfg(p => ({...p, uvPerDiv: u}))}>{u}</button>
+        ))}
+      </div>
+      <h2 style={{marginTop: 18}}>Note</h2>
+      <p className="muted" style={{fontSize: 11, margin: 0}}>
+        Viewer only. Controls change the DISPLAY, never the ADC or the recording.
+        The Pi journal is the source of truth.
+      </p>
+    </div>
+  );
+}
+
+// ---- app ---------------------------------------------------------------- //
+function App() {
+  const store = useRef(makeStore());
+  const { status, connect, disconnect } = useStream(store);
+  const health = useHealth(store);
+  // Optional: ?ws=<url> pre-fills the address, ?autoconnect=1 connects on load,
+  // so the operator can bookmark a direct link to their Pi.
+  const params = new URLSearchParams(location.search);
+  const [url, setUrl] = useState(
+    params.get("ws") || `ws://${location.hostname || "127.0.0.1"}:1620`);
+  useEffect(() => { if (params.get("autoconnect")) connect(url); }, []);  // once
+  const [cfg, setCfg] = useState({
+    enabled: Array(NUM_CH).fill(true),
+    windowSec: 5,
+    uvPerDiv: 50,
+  });
+
+  const dotColor = { connected: "var(--good)", connecting: "#fab219",
+                     error: "var(--critical)", disconnected: "#6f6e69" }[status];
+
+  return (
+    <div>
+      <header>
+        <h1>PiEEG Local Scope <span className="muted" style={{fontWeight: 400}}>· live viewer</span></h1>
+        <div className="row">
+          <input type="text" value={url} onChange={e => setUrl(e.target.value)}
+                 placeholder="ws://<pi-ip>:1620" />
+          {status === "connected"
+            ? <button onClick={disconnect}>Disconnect</button>
+            : <button className="primary" onClick={() => connect(url)}>Connect</button>}
+          <span className="dot" style={{background: dotColor}}></span>
+          <span className="muted">{status}</span>
+        </div>
+      </header>
+      <main>
+        <ScopeCanvas store={store} cfg={cfg} />
+        <aside>
+          <HealthPanel health={health} status={status} />
+          <Controls cfg={cfg} setCfg={setCfg} health={health} />
+        </aside>
+      </main>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
