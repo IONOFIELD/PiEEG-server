@@ -33,6 +33,8 @@ from .auth import AuthManager
 from .cloud_relay import CloudRelayBridge
 from .filters import MultichannelFilter, MultichannelNotchFilter
 from .recorder import Recorder
+from .journal import JournalWriter
+from . import edf_export
 from .webhooks import WebhookStore
 from .osc_vrchat import VRChatOSCBridge, OSCConfig
 from .lsl import LSLBridge, LSLConfig  # LSLBridge defers pylsl import to run()
@@ -70,6 +72,13 @@ class PiEEGServer:
         self._recorder_task: asyncio.Task | None = None
         self._record_start_time: float | None = None
         self._recordings_dir = Path("recordings")
+        # Authoritative crash-safe journal (the real source of truth). Runs
+        # alongside the CSV recorder; EDF+ is exported from it on stop.
+        self._journal: JournalWriter | None = None
+        self._journal_task: asyncio.Task | None = None
+        # Base name (no extension) of the most recently finished session, used
+        # by the HTTP /download/edf and /download/journal endpoints.
+        self._last_session: str | None = None
         self._webhooks: WebhookStore | None = None
         self._osc_bridge: VRChatOSCBridge | None = None
         self._osc_task: asyncio.Task | None = None
@@ -203,11 +212,166 @@ class PiEEGServer:
                 body = b'{"warming_up": true}'
             return HTTPResponse(200, "OK", hdrs, body)
 
+        # --- recording download endpoints (React app = download client) --- #
+        # Parse once so query strings (?session=...) don't break matching.
+        route = urlparse(request.path)
+        qs = parse_qs(route.query)
+        if route.path == "/api/recordings":
+            body = json.dumps(self._list_recordings()).encode()
+            hdrs = self._cors_headers(request)
+            hdrs["Content-Type"] = "application/json"
+            hdrs["Cache-Control"] = "no-store"
+            hdrs["Access-Control-Allow-Origin"] = "*"
+            return HTTPResponse(200, "OK", hdrs, body)
+        if route.path == "/download/bdf":
+            return await self._serve_bdf(request, qs)
+        if route.path == "/download/edf":
+            return await self._serve_edf(request, qs)
+        if route.path == "/download/journal":
+            return await self._serve_journal(request, qs)
+        if route.path == "/download":
+            # Optional unified route: /download?format=bdf|edf (default bdf).
+            fmt = (qs.get("format", ["bdf"])[0] or "bdf").lower()
+            if fmt == "edf":
+                return await self._serve_edf(request, qs)
+            if fmt == "bdf":
+                return await self._serve_bdf(request, qs)
+            if fmt == "journal":
+                return await self._serve_journal(request, qs)
+            hdrs = self._cors_headers(request)
+            return HTTPResponse(400, "Bad Request", hdrs,
+                                b"format must be bdf, edf, or journal\n")
+
         # For any other non-upgrade request, reject cleanly instead of
         # letting websockets fail with a confusing 426.
         if is_plain_http:
             hdrs = self._cors_headers(request)
             return HTTPResponse(400, "Bad Request", hdrs, b"WebSocket upgrade required\n")
+
+    # ---- recording download helpers ------------------------------------ #
+    def _list_recordings(self) -> dict:
+        """List recorded sessions (one per journal) with what's available.
+
+        The payload is additive: the older keys (``has_edf``/``edf_url``) are
+        kept so existing clients don't break, and BDF+ (the primary clinical
+        format) plus a structured ``formats`` block are added alongside.
+        """
+        sessions = []
+        if self._recordings_dir.exists():
+            for jrnl in sorted(self._recordings_dir.glob("*.eegj")):
+                base = jrnl.stem
+                has_bdf = (self._recordings_dir / f"{base}.bdf").exists()
+                has_edf = (self._recordings_dir / f"{base}.edf").exists()
+                sessions.append({
+                    "session": base,
+                    "journal_bytes": jrnl.stat().st_size,
+                    "has_sidecar": (self._recordings_dir / f"{base}.json").exists(),
+                    # --- legacy keys (unchanged) ---
+                    "has_edf": has_edf,
+                    "edf_url": f"/download/edf?session={base}",
+                    "journal_url": f"/download/journal?session={base}",
+                    # --- new: BDF+ is the primary clinical export ---
+                    "has_bdf": has_bdf,
+                    "bdf_url": f"/download/bdf?session={base}",
+                    "primary_format": "bdf",
+                    "formats": {
+                        "bdf": {"primary": True, "lossless": True,
+                                "present": has_bdf,
+                                "url": f"/download/bdf?session={base}"},
+                        "edf": {"primary": False, "lossless": False,
+                                "present": has_edf,
+                                "url": f"/download/edf?session={base}"},
+                        "journal": {"source_of_truth": True, "present": True,
+                                    "url": f"/download/journal?session={base}"},
+                    },
+                })
+        return {"recordings": sessions}
+
+    def _resolve_session(self, qs: dict) -> str | None:
+        """Pick a safe session base name from ?session=, else the latest one.
+
+        Path-traversal guard: we keep only the file *name* component, so a
+        value like ``../../etc/passwd`` can never escape the recordings dir.
+        """
+        raw = qs.get("session", [None])[0]
+        if raw is None:
+            return self._last_session
+        safe = Path(raw).name  # strip any directory components
+        return safe or None
+
+    async def _serve_edf(self, request, qs):
+        """Serve the EDF+ for a session (16-bit fallback)."""
+        return await self._serve_export(request, qs, fmt="edf")
+
+    async def _serve_bdf(self, request, qs):
+        """Serve the BDF+ for a session (24-bit lossless, primary)."""
+        return await self._serve_export(request, qs, fmt="bdf")
+
+    async def _serve_export(self, request, qs, fmt):
+        """Serve a clinical export, building it from the journal on demand.
+
+        ``fmt`` is "bdf" (primary, lossless) or "edf" (fallback). If the file
+        isn't already on disk we re-export it from the journal (the source of
+        truth) in a worker thread, then serve it. This is what lets any session
+        be downloaded in either format at any time.
+        """
+        session = self._resolve_session(qs)
+        hdrs = self._cors_headers(request)
+        hdrs["Access-Control-Allow-Origin"] = "*"
+        if not session:
+            return HTTPResponse(404, "Not Found", hdrs, b"no recording available\n")
+
+        out_path = self._recordings_dir / f"{session}.{fmt}"
+        journal_path = self._recordings_dir / f"{session}.eegj"
+        sidecar_path = self._recordings_dir / f"{session}.json"
+
+        # Build on demand if it isn't already on disk.
+        if not out_path.exists():
+            if not journal_path.exists():
+                return HTTPResponse(404, "Not Found", hdrs, b"unknown session\n")
+            loop = asyncio.get_running_loop()
+            try:
+                # run_in_executor passes these positionally to export_journal(
+                #   journal_path, sidecar_path, out_path, fmt)
+                await loop.run_in_executor(
+                    None, edf_export.export_journal,
+                    journal_path, sidecar_path, out_path, fmt)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("On-demand %s export failed for %s: %s",
+                               fmt.upper(), session, exc)
+                return HTTPResponse(500, "Server Error", hdrs,
+                                    f"{fmt.upper()} export failed: {exc}\n".encode())
+
+        return self._file_response(out_path, "application/octet-stream", hdrs)
+
+    async def _serve_journal(self, request, qs):
+        """Serve the raw binary journal (the source of truth) for a session."""
+        session = self._resolve_session(qs)
+        hdrs = self._cors_headers(request)
+        hdrs["Access-Control-Allow-Origin"] = "*"
+        if not session:
+            return HTTPResponse(404, "Not Found", hdrs, b"no recording available\n")
+        journal_path = self._recordings_dir / f"{session}.eegj"
+        if not journal_path.exists():
+            return HTTPResponse(404, "Not Found", hdrs, b"unknown session\n")
+        return self._file_response(journal_path, "application/octet-stream", hdrs)
+
+    @staticmethod
+    def _file_response(path: Path, content_type: str, hdrs: Headers):
+        """Read a file into memory and wrap it in a download HTTPResponse.
+
+        Loading whole-file is fine here: even a 2-hour, 8-channel journal is
+        only a few tens of MB, well within the Pi's RAM.
+        """
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            return HTTPResponse(500, "Server Error", hdrs,
+                                f"could not read {path.name}: {exc}\n".encode())
+        hdrs["Content-Type"] = content_type
+        hdrs["Content-Disposition"] = f'attachment; filename="{path.name}"'
+        hdrs["Content-Length"] = str(len(data))
+        return HTTPResponse(200, "OK", hdrs, data)
 
     async def run(self):
         """Start the WebSocket server and the broadcast loop."""
@@ -379,17 +543,41 @@ class PiEEGServer:
             await self._ws_reg_read(ws)
 
     async def _start_recording(self):
-        """Start recording EEG data to a timestamped CSV file."""
+        """Start recording: crash-safe binary journal + a convenience CSV.
+
+        The journal (.eegj + .json sidecar) is the authoritative source of
+        truth that EDF+ is later built from. The CSV is kept for backward
+        compatibility / quick inspection.
+        """
         if self._recorder_task and not self._recorder_task.done():
             logger.warning("Recording already in progress")
             return
 
-        filename = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S.csv")
-        output = self._recordings_dir / filename
+        # One timestamp -> one base name shared by the CSV, the journal, its
+        # sidecar, and the eventual EDF, so a session's files stay together.
+        session = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
+        output = self._recordings_dir / f"{session}.csv"
         self._recorder = Recorder(self._acq, output=output)
+
+        # Authoritative journal. Channel count/labels come from the hardware.
+        # gain comes from the register readback so the sidecar's microvolt
+        # calibration matches the chip; fall back to the JournalWriter default
+        # only if the hardware doesn't report a gain (e.g. mock).
+        gain = self._acq.pga_gain
+        journal_kwargs = {} if gain is None else {"gain": gain}
+        self._journal = JournalWriter(
+            self._acq, out_dir=self._recordings_dir, session_name=session,
+            num_channels=self._acq.num_channels,
+            sample_rate=self._sample_rate(),
+            **journal_kwargs,
+        )
+        self._last_session = session
+
         self._record_start_time = time.time()
+        self._journal_task = asyncio.create_task(self._journal.run())
         self._recorder_task = asyncio.create_task(self._recorder.run())
-        logger.info("Recording started: %s", output)
+        logger.info("Recording started: journal=%s csv=%s",
+                    self._journal.journal_path, output)
         await self._broadcast_record_status()
 
     async def _stop_recording(self):
@@ -398,11 +586,18 @@ class PiEEGServer:
             logger.warning("No recording in progress")
             return
 
+        # Stop both writers. Cancelling triggers each task's finally-block,
+        # which flushes/fsyncs and (for the journal) finalizes the sidecar.
         self._recorder_task.cancel()
-        try:
-            await self._recorder_task
-        except asyncio.CancelledError:
-            pass
+        if self._journal_task:
+            self._journal_task.cancel()
+        for task in (self._recorder_task, self._journal_task):
+            if task is None:
+                continue
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         frames = self._recorder.frames_written
         output = self._recorder._output
         filename = output.name
@@ -412,17 +607,68 @@ class PiEEGServer:
         # CSV on disk is complete and safe to hash for the post-stop report.
         rows, sha256 = self._csv_integrity(output)
         logger.info("Recording stopped: %d rows → %s (sha256=%s)", rows, filename, sha256)
+
+        # Export the primary clinical file (BDF+) from the journal now that it
+        # is flushed. Runs in a worker thread so a long export never stalls the
+        # event loop / live stream.
+        edf_info = await self._export_primary_on_stop()
+
         self._recorder = None
         self._recorder_task = None
+        self._journal = None
+        self._journal_task = None
         self._record_start_time = None
-        await self._broadcast_record_status(stop_info={
+        stop_info = {
             "filename": filename,
             "frames": frames,
             "rows": rows,
             "sha256": sha256,
             "duration": duration,
             "path": path,
-        })
+        }
+        stop_info.update(edf_info)
+        await self._broadcast_record_status(stop_info=stop_info)
+
+    async def _export_primary_on_stop(self) -> dict:
+        """Best-effort BDF+ (primary, lossless) export of the finished journal.
+
+        Returns fields to merge into the stop status. Never raises: if pyedflib
+        is missing or export fails, the journal + sidecar remain on disk and can
+        be converted later with ``python -m pieeg_server.edf_export``.
+
+        Only BDF+ is built here (the primary clinical file). The EDF+ fallback
+        is generated on demand when ``/download/edf`` is requested, so we don't
+        spend CPU on a format the client may never ask for. We still advertise
+        its URL below — the file is created the first time it's fetched.
+        """
+        if self._journal is None:
+            return {}
+        journal_path = self._journal.journal_path
+        sidecar_path = self._journal.sidecar_path
+        session = self._last_session
+        loop = asyncio.get_running_loop()
+        try:
+            bdf_path = await loop.run_in_executor(
+                None, edf_export.export_journal,
+                journal_path, sidecar_path, None, "bdf")
+            logger.info("BDF+ exported (primary): %s", bdf_path)
+            return {
+                "journal": str(journal_path.resolve()),
+                "primary_format": "bdf",
+                "bdf": str(bdf_path.resolve()),
+                "bdf_url": f"/download/bdf?session={session}",
+                # Fallback EDF+ is built lazily on first download.
+                "edf_url": f"/download/edf?session={session}",
+            }
+        except Exception as exc:  # noqa: BLE001 - export must not block stop
+            logger.warning("BDF export deferred (%s); journal is safe at %s",
+                           exc, journal_path)
+            return {
+                "journal": str(journal_path.resolve()),
+                "primary_format": "bdf",
+                "bdf": None,
+                "bdf_error": str(exc),
+            }
 
     @staticmethod
     def _csv_integrity(path: Path) -> tuple[int, str | None]:

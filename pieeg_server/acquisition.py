@@ -49,6 +49,15 @@ class AcquisitionLoop:
         return self._hw.num_channels
 
     @property
+    def pga_gain(self):
+        """PGA gain read back from the hardware (None if it doesn't report one).
+
+        Passed to the recorder so the sidecar calibration is derived from the
+        gain actually programmed on the chip, never a hard-coded guess.
+        """
+        return getattr(self._hw, "pga_gain", None)
+
+    @property
     def hampel(self) -> HampelFilter:
         """Access the Hampel spike filter for configuration."""
         return self._hampel
