@@ -1336,9 +1336,15 @@ export default function App({ wsUrl, onDisconnect }: { wsUrl?: string; onDisconn
                 <span className="modal-value">{formatElapsed(eeg.recordResult.duration)}</span>
               </div>
               <div className="modal-row">
-                <span className="modal-label">Frames</span>
-                <span className="modal-value">{eeg.recordResult.frames.toLocaleString()}</span>
+                <span className="modal-label">CSV rows</span>
+                <span className="modal-value">{eeg.recordResult.rows.toLocaleString()}</span>
               </div>
+              {eeg.recordResult.sha256 && (
+                <div className="modal-row">
+                  <span className="modal-label">SHA-256</span>
+                  <span className="modal-value modal-path">{eeg.recordResult.sha256}</span>
+                </div>
+              )}
               <div className="modal-row">
                 <span className="modal-label">Saved to</span>
                 <span className="modal-value modal-path">{eeg.recordResult.path}</span>

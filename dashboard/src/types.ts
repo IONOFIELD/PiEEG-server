@@ -69,6 +69,8 @@ export interface WSStatusMessage {
 export interface WSRecordStoppedPayload {
   filename: string;
   frames: number;
+  rows: number;
+  sha256: string | null;
   duration: number;
   path: string;
 }
@@ -141,6 +143,8 @@ export interface WSWebhookMessage {
 export interface RecordResult {
   filename: string;
   frames: number;
+  rows: number;
+  sha256: string | null;
   duration: number;
   path: string;
   downloadUrl: string;

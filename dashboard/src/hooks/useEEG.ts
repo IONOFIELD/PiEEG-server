@@ -156,6 +156,8 @@ export function useEEG(timeWindowSec = 4, wsUrl?: string): UseEEGReturn {
             setRecordResult({
               filename,
               frames,
+              rows: frames,       // one CSV data row per captured frame
+              sha256: null,       // not computed on the direct browser path
               duration,
               path: "Browser downloads",
               downloadUrl: url,
@@ -408,6 +410,8 @@ export function useEEG(timeWindowSec = 4, wsUrl?: string): UseEEGReturn {
             setRecordResult({
               filename: rs.stopped.filename,
               frames: rs.stopped.frames,
+              rows: rs.stopped.rows,
+              sha256: rs.stopped.sha256,
               duration: rs.stopped.duration,
               path: rs.stopped.path,
               downloadUrl: `${location.protocol}//${location.hostname}:${dashPort}/recordings/${rs.stopped.filename}`,

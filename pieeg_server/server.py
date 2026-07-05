@@ -16,6 +16,7 @@ Protocol (JSON over WebSocket):
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -403,19 +404,46 @@ class PiEEGServer:
         except asyncio.CancelledError:
             pass
         frames = self._recorder.frames_written
-        filename = self._recorder._output.name
+        output = self._recorder._output
+        filename = output.name
         duration = round(time.time() - self._record_start_time, 1) if self._record_start_time else 0
-        path = str(self._recorder._output.resolve())
-        logger.info("Recording stopped: %d frames → %s", frames, filename)
+        path = str(output.resolve())
+        # The recorder's file is closed once its task has finished above, so the
+        # CSV on disk is complete and safe to hash for the post-stop report.
+        rows, sha256 = self._csv_integrity(output)
+        logger.info("Recording stopped: %d rows → %s (sha256=%s)", rows, filename, sha256)
         self._recorder = None
         self._recorder_task = None
         self._record_start_time = None
         await self._broadcast_record_status(stop_info={
             "filename": filename,
             "frames": frames,
+            "rows": rows,
+            "sha256": sha256,
             "duration": duration,
             "path": path,
         })
+
+    @staticmethod
+    def _csv_integrity(path: Path) -> tuple[int, str | None]:
+        """Post-stop integrity summary for a finished CSV recording.
+
+        Returns the number of data rows (total CSV lines minus the header) and
+        the SHA-256 of the file's bytes. Returns (0, None) if the file is
+        missing or unreadable so a stop is never blocked by reporting.
+        """
+        try:
+            h = hashlib.sha256()
+            line_count = 0
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+                    line_count += chunk.count(b"\n")
+            rows = max(line_count - 1, 0)  # subtract the header row
+            return rows, h.hexdigest()
+        except OSError as exc:
+            logger.warning("Could not compute CSV integrity for %s: %s", path, exc)
+            return 0, None
 
     async def _broadcast_record_status(self, stop_info: dict | None = None):
         """Send recording status to all connected clients."""
