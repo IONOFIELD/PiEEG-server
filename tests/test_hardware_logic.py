@@ -211,72 +211,68 @@ class TestSpikeDetection:
 
 
 class TestADCDecoding:
-    """Test the 24-bit signed integer to µV conversion.
+    """Test the 24-bit signed integer to PHYSICAL µV conversion.
 
-    _decode_channels is a @staticmethod, so we call it directly.
-    Formula: µV = round(4.5e6 * (signed_val / 16777215), 2)
+    _decode_channels is now an instance method (it needs the PGA gain), and it
+    emits physically correct microvolts:
+        µV = round(signed_val * Vref / (gain * (2^23 - 1)), 4)
     """
 
+    GAIN = 24
+
+    def _hw(self):
+        """A PiEEGHardware instance without GPIO/SPI, gain fixed at x24."""
+        hw = PiEEGHardware.__new__(PiEEGHardware)
+        hw._pga_gain = self.GAIN
+        hw._num_channels = 8
+        return hw
+
+    def _uv(self, signed_val):
+        return round(signed_val * VREF_UV / (self.GAIN * (2**23 - 1)), 4)
+
     def test_decode_channels_returns_8_values(self):
-        raw = [0] * 27
-        channels = PiEEGHardware._decode_channels(raw)
+        channels = self._hw()._decode_channels([0] * 27)
         assert len(channels) == 8
 
     def test_decode_channels_zero(self):
-        raw = [0] * 27
-        channels = PiEEGHardware._decode_channels(raw)
+        channels = self._hw()._decode_channels([0] * 27)
         assert all(v == 0.0 for v in channels)
 
     def test_decode_channels_positive(self):
-        """0x400000 (positive, below sign threshold) → expected µV."""
+        """0x400000 (positive, below sign threshold) → expected physical µV."""
         raw = [0] * 27
         raw[3] = 0x40  # ch1 MSB
-        raw[4] = 0x00
-        raw[5] = 0x00
-        channels = PiEEGHardware._decode_channels(raw)
+        channels = self._hw()._decode_channels(raw)
         # 0x400000 = 4194304, signed_val = 4194304
-        expected = round(VREF_UV * (4194304 / FULL_SCALE_PLUS_1), 2)
-        assert channels[0] == expected
+        assert channels[0] == self._uv(4194304)
         assert channels[0] > 0
 
     def test_decode_channels_negative(self):
-        """0xFFFFFF (all ones) should decode to a negative value."""
+        """0xFFFFFF (all ones) decodes to signed_val = +1 (per NEGATIVE_OFFSET)."""
         raw = [0] * 27
-        raw[3] = 0xFF  # ch1
-        raw[4] = 0xFF
-        raw[5] = 0xFF
-        channels = PiEEGHardware._decode_channels(raw)
-        # raw_val = 0xFFFFFF = 16777215
-        # raw_val | SIGN_TEST = 0xFFFFFF | 0x7FFFFF = 0xFFFFFF = FULL_SCALE → True
-        # signed_val = 16777215 - NEGATIVE_OFFSET = 16777215 - 16777214 = 1
-        expected = round(VREF_UV * (1 / FULL_SCALE_PLUS_1), 2)
-        assert channels[0] == expected
+        raw[3] = raw[4] = raw[5] = 0xFF  # ch1
+        channels = self._hw()._decode_channels(raw)
+        # signed_val = 16777215 - 16777214 = 1
+        assert channels[0] == self._uv(1)
 
     def test_decode_full_negative(self):
-        """0x800000 should decode to a negative value (MSB set, sign bit)."""
+        """0x800000 (MSB set) decodes to signed_val = -8388606."""
         raw = [0] * 27
         raw[3] = 0x80
-        raw[4] = 0x00
-        raw[5] = 0x00
-        channels = PiEEGHardware._decode_channels(raw)
-        # raw_val = 0x800000 = 8388608
-        # raw_val | SIGN_TEST = 0x800000 | 0x7FFFFF = 0xFFFFFF = FULL_SCALE → True
+        channels = self._hw()._decode_channels(raw)
         # signed_val = 8388608 - 16777214 = -8388606
-        expected = round(VREF_UV * (-8388606 / FULL_SCALE_PLUS_1), 2)
-        assert channels[0] == expected
+        assert channels[0] == self._uv(-8388606)
         assert channels[0] < 0
 
     def test_all_channels_independent(self):
-        """Setting different values in different channel slots decodes independently."""
+        """Different values in different channel slots decode independently."""
         raw = [0] * 27
-        # Ch1 (bytes 3-5): 0x000001
-        raw[5] = 0x01
-        # Ch2 (bytes 6-8): 0x000002
-        raw[8] = 0x02
-        channels = PiEEGHardware._decode_channels(raw)
+        raw[5] = 0x01   # Ch1 = 0x000001
+        raw[8] = 0x02   # Ch2 = 0x000002
+        channels = self._hw()._decode_channels(raw)
         assert channels[0] != channels[1]
-        assert channels[0] == round(VREF_UV * (1 / FULL_SCALE_PLUS_1), 2)
-        assert channels[1] == round(VREF_UV * (2 / FULL_SCALE_PLUS_1), 2)
+        assert channels[0] == self._uv(1)
+        assert channels[1] == self._uv(2)
 
 
 class TestRegisterState:
