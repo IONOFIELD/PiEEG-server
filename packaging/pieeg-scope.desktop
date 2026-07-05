@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PiEEG Scope
+Comment=Live 8-channel EEG scope (kiosk). Exit with Ctrl+W or Alt+F4.
+Exec=/home/ionofield/PiEEG-server/scripts/launch_pieeg.sh
+Icon=/home/ionofield/PiEEG-server/packaging/pieeg-scope.svg
+Terminal=true
+Categories=Science;
+StartupNotify=true
