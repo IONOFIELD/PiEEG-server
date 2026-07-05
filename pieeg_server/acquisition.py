@@ -24,17 +24,29 @@ class AcquisitionLoop:
     """Runs the SPI read loop in a background thread, feeds async queues."""
 
     def __init__(self, hardware, loop: asyncio.AbstractEventLoop,
-                 mock: bool = False, ble: bool = False, serial: bool = False):
+                 mock: bool = False, ble: bool = False, serial: bool = False,
+                 interrupt: bool = False):
         self._hw = hardware
         self._loop = loop
         self._mock = mock
         self._ble = ble
         self._serial = serial
+        # interrupt=True -> block on a DRDY falling-edge event per sample
+        # instead of busy-polling the DRDY level (lower CPU, no missed edges).
+        self._interrupt = interrupt
         self._subscribers: list[asyncio.Queue] = []
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._sample_count = 0
         self._settle_remaining = 0
+        # Drop-detection instrumentation (populated by _run_hardware_interrupt).
+        self._drdy_events = 0        # DRDY edges seen
+        self._frames_read = 0        # frames actually decoded + enqueued
+        self._dropped_frames = 0     # samples missed (inferred from timing gaps)
+        self._gap_count = 0          # number of inter-edge gaps > 1.5x nominal
+        self._first_event_ns = None
+        self._last_event_ns = None
+        self._max_interval_ns = 0    # largest gap between consecutive DRDY edges
         # Device-agnostic Hampel spike filter (runs in acquisition thread)
         self._hampel = HampelFilter(num_channels=hardware.num_channels)
         # Default both spike filters to OFF (user can enable via dashboard)
@@ -116,6 +128,8 @@ class AcquisitionLoop:
             self._run_ble()
         elif self._serial:
             self._run_serial()
+        elif self._interrupt:
+            self._run_hardware_interrupt()
         else:
             self._run_hardware()
 
@@ -189,6 +203,92 @@ class AcquisitionLoop:
 
             # Non-blocking put into the asyncio queue from this thread
             self._loop.call_soon_threadsafe(self._enqueue, frame)
+
+    def _run_hardware_interrupt(self):
+        """Interrupt-driven acquisition: one frame per DRDY falling edge.
+
+        Blocks on a GPIO edge event (no busy-poll). The kernel timestamps each
+        edge, so any missed edge shows up as a larger-than-nominal interval and
+        is counted as a dropped sample. Decoding + journaling are unchanged:
+        read_sample() uses the existing gain-aware decoder, and frames go to the
+        same subscriber queues.
+        """
+        fs = getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE
+        nominal_ns = 1_000_000_000 / fs
+        gap_ns = 1.5 * nominal_ns          # interval beyond this = missed sample(s)
+        prev_ns = None
+
+        self._hw.enable_drdy_events()
+        try:
+            while not self._stop_event.is_set():
+                ts_ns = self._hw.wait_drdy_event(timeout=0.5)
+                if ts_ns is None:
+                    continue               # no edge yet — re-check the stop flag
+
+                self._drdy_events += 1
+                if self._first_event_ns is None:
+                    self._first_event_ns = ts_ns
+                else:
+                    interval = ts_ns - prev_ns
+                    if interval > self._max_interval_ns:
+                        self._max_interval_ns = interval
+                    if interval > gap_ns:
+                        # A DRDY edge is only truly MISSED when a full extra
+                        # period elapsed. round(interval/period)-1 gives the
+                        # count; a late-but-present edge (~1.5x) rounds to 0 via
+                        # round(x-1), so pure jitter is not miscounted as a drop.
+                        missed = round(interval / nominal_ns - 1.0)
+                        if missed > 0:
+                            self._dropped_frames += missed
+                            self._gap_count += 1
+                            logger.warning("DRDY gap: %.2f ms (~%d missed)",
+                                           interval / 1e6, missed)
+                self._last_event_ns = ts_ns
+                prev_ns = ts_ns
+
+                sample = self._hw.read_sample()
+                if sample is None:
+                    continue
+                # Discard settling frames after a register-config restart.
+                if self._settle_remaining > 0:
+                    self._settle_remaining -= 1
+                    continue
+
+                sample = self._hampel.apply(sample)
+                self._sample_count += 1
+                self._frames_read += 1
+                frame = {
+                    "t": round(time.time(), 6),
+                    "n": self._sample_count,
+                    "channels": sample,
+                }
+                self._loop.call_soon_threadsafe(self._enqueue, frame)
+        finally:
+            # Clean stop: halt streaming, then restore the DRDY level handle.
+            try:
+                self._hw.stop_streaming()
+            finally:
+                self._hw.disable_drdy_events()
+
+    def capture_stats(self) -> dict:
+        """Drop-detection summary for the interrupt loop.
+
+        effective_rate_hz is derived from the kernel edge timestamps
+        ((N-1) intervals over the measured span), independent of wall-clock.
+        """
+        span_s = 0.0
+        if self._first_event_ns is not None and self._last_event_ns is not None:
+            span_s = (self._last_event_ns - self._first_event_ns) / 1e9
+        rate = (self._drdy_events - 1) / span_s if span_s > 0 else 0.0
+        return {
+            "drdy_events": self._drdy_events,
+            "frames_read": self._frames_read,
+            "dropped_frames": self._dropped_frames,
+            "gap_count": self._gap_count,
+            "span_seconds": round(span_s, 3),
+            "effective_rate_hz": round(rate, 3),
+            "max_interval_ms": round(self._max_interval_ns / 1e6, 3),
+        }
 
     def _enqueue(self, frame: dict):
         for q in self._subscribers:

@@ -10,6 +10,7 @@ Must run on Raspberry Pi with SPI enabled and PiEEG shield connected.
 
 import logging
 import os
+import select
 import struct
 import sys
 import time
@@ -123,6 +124,12 @@ _GPIOHANDLE_REQUEST_OUTPUT = 1 << 1
 _HANDLE_REQUEST_SIZE = 364  # sizeof(struct gpiohandle_request)
 _HANDLE_DATA_SIZE    = 64   # sizeof(struct gpiohandle_data)
 
+# Line EVENTS (edge interrupts) — GPIO_GET_LINEEVENT_IOCTL = _IOWR(0xB4, 0x04, 48)
+_GPIO_GET_LINEEVENT = 0xC030B404
+_GPIOEVENT_REQUEST_FALLING_EDGE = 1 << 1   # ADS1299 DRDY asserts LOW = data ready
+_EVENT_REQUEST_SIZE = 48   # sizeof(struct gpioevent_request)
+_EVENT_DATA_SIZE    = 16   # sizeof(struct gpioevent_data): u64 timestamp + u32 id
+
 
 class PiEEGHardware:
     """Hardware abstraction for PiEEG shields (8 or 16 channels)."""
@@ -157,6 +164,7 @@ class PiEEGHardware:
         self._cs_fd = -1
         self._drdy_fd = -1
         self._drdy2_fd = -1
+        self._drdy_event_fd = -1   # falling-edge interrupt fd (interrupt mode)
         self._spi1 = None
         self._spi2 = None
         self._last_valid_value: int | None = None
@@ -217,6 +225,9 @@ class PiEEGHardware:
         if self._drdy_fd >= 0:
             os.close(self._drdy_fd)
             self._drdy_fd = -1
+        if self._drdy_event_fd >= 0:
+            os.close(self._drdy_event_fd)
+            self._drdy_event_fd = -1
         if self._drdy2_fd >= 0:
             os.close(self._drdy2_fd)
             self._drdy2_fd = -1
@@ -444,6 +455,77 @@ class PiEEGHardware:
         struct.pack_into("I", buf, 356, 1)           # lines = 1
         fcntl.ioctl(chip_fd, _GPIO_GET_LINEHANDLE, buf)
         return struct.unpack_from("i", buf, 360)[0]  # fd
+
+    # --- DRDY interrupt (edge event) support ---
+
+    @staticmethod
+    def _request_event_line(chip_fd: int, pin: int,
+                            consumer: bytes = b"pieeg_evt") -> int:
+        """Request a GPIO line as a FALLING-EDGE event source.
+
+        Returns a file descriptor that becomes readable on each edge; reading
+        16 bytes yields one struct gpioevent_data (u64 kernel timestamp, u32 id).
+        """
+        # struct gpioevent_request (48 bytes):
+        #   0..3   lineoffset       (u32)
+        #   4..7   handleflags      (u32)  -> INPUT
+        #   8..11  eventflags       (u32)  -> FALLING_EDGE
+        #   12..43 consumer_label   (char × 32)
+        #   44..47 fd               (i32, filled by kernel)
+        buf = bytearray(_EVENT_REQUEST_SIZE)
+        struct.pack_into("I", buf, 0, pin)
+        struct.pack_into("I", buf, 4, _GPIOHANDLE_REQUEST_INPUT)
+        struct.pack_into("I", buf, 8, _GPIOEVENT_REQUEST_FALLING_EDGE)
+        label = consumer[:32]
+        buf[12:12 + len(label)] = label
+        fcntl.ioctl(chip_fd, _GPIO_GET_LINEEVENT, buf)
+        return struct.unpack_from("i", buf, 44)[0]
+
+    def enable_drdy_events(self):
+        """Switch chip-1 DRDY to interrupt mode (falling-edge events).
+
+        A GPIO line can't be held as both a value-handle and an event source,
+        so we release the level handle first, then request the event fd.
+        """
+        if self._drdy_fd >= 0:
+            os.close(self._drdy_fd)
+            self._drdy_fd = -1
+        self._drdy_event_fd = self._request_event_line(
+            self._chip_fd, DRDY_PIN, consumer=b"pieeg_drdy_evt")
+        logger.info("DRDY interrupt mode enabled (falling-edge on GPIO%d)", DRDY_PIN)
+
+    def disable_drdy_events(self):
+        """Release the DRDY event fd and restore the level-read handle."""
+        if self._drdy_event_fd >= 0:
+            os.close(self._drdy_event_fd)
+            self._drdy_event_fd = -1
+        if self._drdy_fd < 0:
+            self._drdy_fd = self._request_line(
+                self._chip_fd, DRDY_PIN, _GPIOHANDLE_REQUEST_INPUT,
+                consumer=b"pieeg_drdy")
+
+    def wait_drdy_event(self, timeout: float = 0.5):
+        """Block until the next DRDY falling edge.
+
+        Returns the kernel event timestamp in nanoseconds (CLOCK_MONOTONIC),
+        or None if no edge arrived within ``timeout`` seconds (so the caller
+        can re-check its stop flag).
+        """
+        ready, _, _ = select.select([self._drdy_event_fd], [], [], timeout)
+        if not ready:
+            return None
+        data = os.read(self._drdy_event_fd, _EVENT_DATA_SIZE)
+        # First 8 bytes = u64 timestamp (nanoseconds).
+        return struct.unpack_from("Q", data, 0)[0]
+
+    def stop_streaming(self, chip_num: int = 1):
+        """Halt continuous conversion and return to a safe idle state.
+
+        STOP ends conversions; SDATAC leaves the device ready for register
+        access again (RREG/WREG are ignored while streaming).
+        """
+        self._send_command(chip_num, CMD_STOP)
+        self._send_command(chip_num, CMD_SDATAC)
 
     def _init_spi(self):
         speed = self._profile.spi_speed_hz
