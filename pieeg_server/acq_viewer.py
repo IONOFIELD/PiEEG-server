@@ -428,6 +428,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     style.map("TMenubutton",
               background=[("active", C["raised"])],
               bordercolor=[("active", C["border_hi"])])
+    # Corner "IP" button: a crisp 1px black outline so it reads as a distinct
+    # affordance against the toolbar surface.
+    style.configure("IP.TButton", background=C["surface"], foreground=C["text"],
+                    bordercolor="#000000", darkcolor="#000000",
+                    lightcolor="#000000", relief="solid", borderwidth=1)
+    style.map("IP.TButton", background=[("active", C["raised"])])
 
     # Two compact control rows so everything fits on one screen. The montage
     # controls are the TOP row, the signal filters the row below it. There is
@@ -456,7 +462,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Corner "IP" button: re-open the connection popup on demand (after it has
     # been minimised or closed). Only meaningful when there's a popup to show.
     if connect_popup:
-        ttk.Button(bar2, text="IP", width=3,
+        ttk.Button(bar2, text="IP", width=3, style="IP.TButton",
                    command=lambda: _show_connect_popup()).pack(side="right",
                                                                padx=(6, 2))
 
@@ -472,19 +478,26 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _disp_to_site = dict(elec_choices)
     _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
 
-    tk.Label(bar2, text="BIPOLAR", bg=C["surface"], fg=C["text_dim"],
-             font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(6, 4))
+    # Bipolar builder as ONE grouped unit — a hairline-bordered raised chip that
+    # holds the label, the A–B pickers and the "+ Add" button, so Add reads as
+    # part of the channel it builds rather than a loose button beside it.
+    grp = tk.Frame(bar2, bg=C["raised"], highlightbackground=C["border_hi"],
+                   highlightcolor=C["border_hi"], highlightthickness=1)
+    grp.pack(side="left", padx=(6, 0), pady=1)
+    tk.Label(grp, text="BIPOLAR", bg=C["raised"], fg=C["text_dim"],
+             font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 4))
     a_var = tk.StringVar(value=elec_display[0])
-    ttk.OptionMenu(bar2, a_var, elec_display[0], *elec_display).pack(side="left")
-    tk.Label(bar2, text="–", bg=C["surface"], fg=C["text_sec"]).pack(side="left",
-                                                                     padx=4)
+    ttk.OptionMenu(grp, a_var, elec_display[0], *elec_display).pack(side="left")
+    tk.Label(grp, text="–", bg=C["raised"], fg=C["text_sec"]).pack(side="left",
+                                                                   padx=4)
     b_var = tk.StringVar(value=_b_default)
-    ttk.OptionMenu(bar2, b_var, _b_default, *elec_display).pack(side="left")
-    ttk.Button(bar2, text="+ Add",
-               command=lambda: _add_bipolar()).pack(side="left", padx=8)
+    ttk.OptionMenu(grp, b_var, _b_default, *elec_display).pack(side="left")
+    ttk.Button(grp, text="+ Add",
+               command=lambda: _add_bipolar()).pack(side="left", padx=(6, 4),
+                                                     pady=2)
     pick_hint = tk.Label(bar2, text="", bg=C["surface"], fg=C["text_dim"],
                          font=(_MONO, _fs(9)))
-    pick_hint.pack(side="left", padx=6)
+    pick_hint.pack(side="left", padx=8)
 
     # ---- row 2 (below): signal filters (+ live status) -------------------- #
     bar = tk.Frame(root, bg=C["surface"])
@@ -739,16 +752,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                  font=(_MONO, _fs(16), "bold")).pack()
         tk.Label(pop, text=f"({mode})", bg=C["bg"], fg=C["text_sec"],
                  font=(_MONO, _fs(10))).pack(pady=(0, 8))
-
-        btns = tk.Frame(pop, bg=C["bg"])
-        btns.pack(side="bottom", pady=(0, 10))
-        # iconify() minimises rather than closing, so it can be re-raised from
-        # the taskbar or the corner "IP" button; Close destroys it (the button
-        # rebuilds it on demand).
-        ttk.Button(btns, text="Minimise",
-                   command=lambda: pop.iconify()).pack(side="left", padx=6)
-        ttk.Button(btns, text="Close",
-                   command=lambda: pop.destroy()).pack(side="left", padx=6)
+        # No in-window Minimise/Close buttons: the popup's own title bar already
+        # provides both, and the corner "IP" button re-opens it.
 
         # ---- collapsible version history --------------------------------- #
         # Collapsed by default: just the current version title, clickable. Click
@@ -787,8 +792,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     toggle.config(text=f"▸  What's new · {cur}")
                     pop.geometry(_COLLAPSED)
                 else:
-                    detail.pack(fill="both", expand=True, padx=12, pady=(0, 8),
-                                before=btns)
+                    detail.pack(fill="both", expand=True, padx=12, pady=(0, 8))
                     toggle.config(text=f"▾  What's new · {cur}")
                     # Grow downward, but never past the bottom of the screen:
                     # cap the height to the room below the window, and if even
