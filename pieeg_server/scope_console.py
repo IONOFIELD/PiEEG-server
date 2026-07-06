@@ -70,6 +70,10 @@ SCOPE_CHANGELOG = [
             "the window is the shutdown."),
     ("1.5", "Connection popup now shows this version history, and the window "
             "title shows the current version."),
+    ("1.6", "Added a corner \"IP\" button to re-open the connection popup after "
+            "it's minimised or closed. Version history is collapsed to the "
+            "current version and drops down on click. Removed the redundant "
+            "\"stays in front to transcribe\" note."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
