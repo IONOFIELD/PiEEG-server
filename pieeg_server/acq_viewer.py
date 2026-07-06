@@ -761,23 +761,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _EXPANDED_MAX = 560
         geo = {"w": 420, "collapsed": "420x180"}
 
-        # Own top navigation bar: the Pi's window manager doesn't decorate this
-        # topmost popup with title-bar controls, so provide Minimise + Close
-        # here. (Native decorations, if a WM ever draws them, are harmless.)
-        titlebar = tk.Frame(pop, bg=C["surface"])
-        titlebar.pack(side="top", fill="x")
-        tk.Label(titlebar, text="PiEEG · REACT EEG", bg=C["surface"],
-                 fg=C["text_dim"], font=("TkDefaultFont", _fs(9))).pack(
-                     side="left", padx=8, pady=3)
-        tk.Button(titlebar, text="✕", command=pop.destroy, bg=C["surface"],
-                  fg=C["text_sec"], activebackground=C["red"],
-                  activeforeground="#ffffff", relief="flat", bd=0, padx=9,
-                  font=("TkDefaultFont", _fs(11))).pack(side="right")
-        tk.Button(titlebar, text="—", command=pop.iconify, bg=C["surface"],
-                  fg=C["text_sec"], activebackground=C["raised"],
-                  activeforeground=C["text"], relief="flat", bd=0, padx=9,
-                  font=("TkDefaultFont", _fs(11))).pack(side="right")
-
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
         tk.Label(pop, text=header, bg=C["bg"], fg=C["text"],
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(10, 2))
