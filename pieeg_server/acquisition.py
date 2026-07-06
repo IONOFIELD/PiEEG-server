@@ -7,10 +7,13 @@ for downstream consumers (WebSocket server, file writer, etc.).
 """
 
 import asyncio
+import logging
 import threading
 import time
 
 from .spike_filter import HampelFilter
+
+logger = logging.getLogger("pieeg.acquisition")
 
 SAMPLE_RATE = 250  # Hz
 SAMPLE_INTERVAL = 1.0 / SAMPLE_RATE  # 4 ms
