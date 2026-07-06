@@ -441,21 +441,28 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # and dropdown widths are kept tight on purpose.
     def _menu(parent, label, values, initial, cb, width=None):
         # Uppercase micro-label in dim text — the Geist toolbar-label convention.
-        tk.Label(parent, text=label.upper(), bg=C["surface"], fg=C["text_dim"],
+        # Label bg matches its parent so it blends inside a chip or on a bar.
+        tk.Label(parent, text=label.upper(), bg=parent["bg"], fg=C["text_dim"],
                  font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 3))
         var = tk.StringVar(value=initial)
         om = ttk.OptionMenu(parent, var, initial, *values,
                             command=lambda _v: cb(var.get()))
         if width:
             om.configure(width=width)
-        om.pack(side="left")
+        om.pack(side="left", padx=(0, 4))
         return var
+
+    def _chip(parent):
+        # A hairline-bordered raised container that visually groups a cluster of
+        # related controls into one unit — the segmentation used across the bar.
+        return tk.Frame(parent, bg=C["raised"], highlightbackground=C["border_hi"],
+                        highlightcolor=C["border_hi"], highlightthickness=1)
 
     # ---- row 1 (top): montage controls ----------------------------------- #
     # The montage picker + Reset, then the bipolar channel builder: pick any two
     # electrodes and Add them as a bipolar channel, which builds the "Custom"
     # montage and selects it; switch the Montage dropdown back to any preset at
-    # any time to snap to it.
+    # any time to snap to it. Each cluster lives in its own bordered chip.
     bar2 = tk.Frame(root, bg=C["surface"])
     bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
@@ -466,10 +473,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                    command=lambda: _show_connect_popup()).pack(side="right",
                                                                padx=(6, 2))
 
-    montage_var = _menu(bar2, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
+    # Montage chip: [MONTAGE ⌄  Reset]
+    mchip = _chip(bar2)
+    mchip.pack(side="left", padx=(0, 6), pady=1)
+    montage_var = _menu(mchip, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
                         lambda v: _switch_montage(v), width=14)
-    ttk.Button(bar2, text="Reset",
-               command=lambda: _reset_montage()).pack(side="left", padx=(8, 14))
+    ttk.Button(mchip, text="Reset",
+               command=lambda: _reset_montage()).pack(side="left", padx=(2, 4),
+                                                       pady=2)
 
     # Each electrode is shown as "E1  Fp1" — the chip input AND its scalp site —
     # so you select by the physical electrode you seated on the head.
@@ -478,12 +489,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _disp_to_site = dict(elec_choices)
     _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
 
-    # Bipolar builder as ONE grouped unit — a hairline-bordered raised chip that
-    # holds the label, the A–B pickers and the "+ Add" button, so Add reads as
-    # part of the channel it builds rather than a loose button beside it.
-    grp = tk.Frame(bar2, bg=C["raised"], highlightbackground=C["border_hi"],
-                   highlightcolor=C["border_hi"], highlightthickness=1)
-    grp.pack(side="left", padx=(6, 0), pady=1)
+    # Bipolar chip: [BIPOLAR A – B  + Add] — Add reads as part of the channel it
+    # builds rather than a loose button beside it.
+    grp = _chip(bar2)
+    grp.pack(side="left", padx=(0, 0), pady=1)
     tk.Label(grp, text="BIPOLAR", bg=C["raised"], fg=C["text_dim"],
              font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 4))
     a_var = tk.StringVar(value=elec_display[0])
@@ -503,13 +512,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     bar = tk.Frame(root, bg=C["surface"])
     bar.pack(side="top", fill="x", padx=8, pady=(0, 4))
 
-    lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
+    # Filters chip: [LFF ⌄ HFF ⌄ NOTCH ⌄]
+    fchip = _chip(bar)
+    fchip.pack(side="left", padx=(0, 6), pady=1)
+    lff_var = _menu(fchip, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
                     lambda v: _apply_filters(), width=6)
-    hff_var = _menu(bar, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
+    hff_var = _menu(fchip, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
                     lambda v: _apply_filters(), width=6)
-    notch_var = _menu(bar, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
+    notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
                       lambda v: _apply_filters(), width=6)
-    sens_var = _menu(bar, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
+    # Sensitivity chip (display gain, kept separate from the frequency filters)
+    schip = _chip(bar)
+    schip.pack(side="left", pady=1)
+    sens_var = _menu(schip, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
                      str(DEFAULT_SENS), lambda v: None, width=5)
 
     # Live status with a Geist-style signal dot: green = frames flowing (live),
@@ -740,8 +755,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         pop.title("PiEEG · REACT EEG connection")
         pop.configure(bg=C["bg"])
         pop.attributes("-topmost", True)     # stay above the scope until minimised
-        _COLLAPSED, _EXPANDED_MAX = "460x230", 560
-        pop.geometry(_COLLAPSED)
+        # geo holds the framed collapsed size (computed once the content is
+        # built) and the width both states share, so the popup hugs its content
+        # when collapsed and only grows for the patch notes.
+        _EXPANDED_MAX = 560
+        geo = {"w": 420, "collapsed": "420x180"}
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
         tk.Label(pop, text=header, bg=C["bg"], fg=C["text"],
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(14, 2))
@@ -790,7 +808,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 if state["open"]:
                     detail.pack_forget()
                     toggle.config(text=f"▸  What's new · {cur}")
-                    pop.geometry(_COLLAPSED)
+                    pop.geometry(geo["collapsed"])
                 else:
                     detail.pack(fill="both", expand=True, padx=12, pady=(0, 8))
                     toggle.config(text=f"▾  What's new · {cur}")
@@ -805,11 +823,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     h = max(260, min(_EXPANDED_MAX, sh - y - margin))
                     if y + h + margin > sh:
                         y = max(20, sh - h - margin)
-                        pop.geometry(f"460x{h}+{x}+{y}")
+                        pop.geometry(f"{geo['w']}x{h}+{x}+{y}")
                     else:
-                        pop.geometry(f"460x{h}")
+                        pop.geometry(f"{geo['w']}x{h}")
                 state["open"] = not state["open"]
             toggle.bind("<Button-1>", _toggle)
+
+        # Frame the collapsed popup to its content now that everything is built
+        # (no fixed height): hug the widgets, with a little breathing room. This
+        # is the size it returns to when the patch notes are collapsed.
+        pop.update_idletasks()
+        geo["w"] = max(320, pop.winfo_reqwidth() + 20)
+        geo["collapsed"] = f"{geo['w']}x{pop.winfo_reqheight() + 8}"
+        pop.geometry(geo["collapsed"])
 
         pop.protocol("WM_DELETE_WINDOW", pop.destroy)
         pop.update_idletasks()
