@@ -98,6 +98,13 @@ SCOPE_CHANGELOG = [
             "title-bar controls on it."),
     ("2.2", "Connection popup now opens centred on the screen (and returns to "
             "centre when the patch notes are collapsed)."),
+    ("2.3", "Removed the connection popup's own Minimise/Close bar — the "
+            "window manager draws native title-bar controls right above it, "
+            "so the in-window pair was a duplicate."),
+    ("2.4", "PiEEG MOCK icon fixed: the launcher script was dropping its "
+            "--mock flag, so the icon opened the real scope. It now launches "
+            "the mock server with every channel on the 2 Hz square "
+            "calibration signal. The normal PiEEG Scope icon is unchanged."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -177,7 +184,8 @@ def main(argv=None):
     parser.add_argument("--serial-port", default=None,
                         help="serial device for ironbci32 (e.g. /dev/ttyACM0)")
     parser.add_argument("--mock", action="store_true",
-                        help="synthetic data, no PiEEG hardware (safe rehearsal)")
+                        help="mock server, no PiEEG hardware: all channels "
+                             "carry the 2 Hz square calibration signal")
     parser.add_argument("--seconds", type=float, default=None,
                         help="auto-close the viewer after N seconds (testing)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -205,6 +213,11 @@ def main(argv=None):
     if args.mock:
         from .mock import MockHardware
         hw = MockHardware(num_channels=num_ch, sample_rate=fs)
+        # Mock launches carry ONLY the calibration signal: every channel is put
+        # in the ADS1299 test-signal mode (CHnSET = 0x05), a 1.8 mV 2 Hz square
+        # wave — unmistakably synthetic, never confusable with a live EEG. The
+        # dashboard's input-mode presets can still switch modes after launch.
+        hw.configure_registers({reg: 0x05 for reg in MockHardware.CH_REGS})
     elif ble:
         from .ironbci import IronBCIHardware
         hw = IronBCIHardware(num_channels=num_ch)
