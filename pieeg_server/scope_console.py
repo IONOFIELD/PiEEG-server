@@ -110,6 +110,11 @@ SCOPE_CHANGELOG = [
             "montage with a star (e.g. \"Transverse*\"); the new Save button "
             "next to Reset persists them so your setup survives a reboot. "
             "Reset still returns the factory montage."),
+    ("2.6", "The server the Scope launches now reports per-channel electrode "
+            "contact (ADS1299 lead-off): each channel reads green (both inputs "
+            "connected), amber (one side floating) or red (both off), sent to "
+            "REACT so you can seat electrodes without eyeballing the trace. "
+            "The in-process lead viewer still shows waveforms only."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
