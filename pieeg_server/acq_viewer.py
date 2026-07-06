@@ -846,11 +846,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             toggle.bind("<Button-1>", _toggle)
 
         # Frame the collapsed popup to its content now that everything is built
-        # (no fixed height): hug the widgets, with a little breathing room. This
-        # is the size it returns to when the patch notes are collapsed.
+        # (no fixed height): hug the widgets, with a little breathing room,
+        # centred on the screen. This is the size (and spot) it returns to when
+        # the patch notes are collapsed.
         pop.update_idletasks()
         geo["w"] = max(320, pop.winfo_reqwidth() + 20)
-        geo["collapsed"] = f"{geo['w']}x{pop.winfo_reqheight() + 8}"
+        _h = pop.winfo_reqheight() + 8
+        _cx = max(0, (pop.winfo_screenwidth() - geo["w"]) // 2)
+        _cy = max(0, (pop.winfo_screenheight() - _h) // 2)
+        geo["collapsed"] = f"{geo['w']}x{_h}+{_cx}+{_cy}"
         pop.geometry(geo["collapsed"])
 
         pop.protocol("WM_DELETE_WINDOW", pop.destroy)

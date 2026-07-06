@@ -96,6 +96,8 @@ SCOPE_CHANGELOG = [
     ("2.1", "Connection popup now carries its own top navigation bar with "
             "Minimise and Close, since the Pi's window manager doesn't draw "
             "title-bar controls on it."),
+    ("2.2", "Connection popup now opens centred on the screen (and returns to "
+            "centre when the patch notes are collapsed)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
