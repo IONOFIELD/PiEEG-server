@@ -95,6 +95,14 @@ async def main():
 asyncio.run(main())
 ```
 
+  The `hello` frame carries a strict JSON boolean `"mock"`: `false` for real
+  hardware, `true` when the stream is synthetic (started with `--mock`, i.e.
+  `MockHardware` + `AcquisitionLoop(mock=True)`). REACT-EEG reads this and, on
+  `mock: true`, **refuses to display or record the stream** (shows an error and
+  blocks reconnect) — by design, so a `--mock` demo stream can never be captured
+  as real patient data. A real-hardware stream advertises `mock: false` and
+  connects normally.
+
   For a browser client instead: import `demo-cert.pem` into the OS trust
   store (macOS: Keychain Access → System → import → set "Always Trust").
 

@@ -168,6 +168,9 @@ class WSStreamServer:
             "decimate": self._decimate,
             "effective_rate": self.effective_rate,
             "channels": self._num_channels,
+            # Self-label synthetic feeds (defense-in-depth) so a REACT-EEG client
+            # refuses to record them as real. Mirrors server.py / demo_stream.py.
+            "mock": bool(getattr(self._acq, "_mock", False)),
         }
         try:
             await ws.send(json.dumps(hello))

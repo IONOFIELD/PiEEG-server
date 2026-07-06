@@ -82,6 +82,7 @@ async def test_synthetic_source_zero_loss():
             assert hello["type"] == "hello"
             assert hello["decimate"] == 1
             assert hello["effective_rate"] == 250
+            assert hello["mock"] is False   # FakeSource has no _mock -> real
 
             async def feed():
                 for i in range(N):
@@ -103,6 +104,21 @@ async def test_synthetic_source_zero_loss():
     assert seqs == list(range(N))
     # The original synthetic counter is preserved and in order too.
     assert ns == list(range(N))
+
+
+@pytest.mark.asyncio
+async def test_hello_advertises_mock_true_for_synthetic_source():
+    """A synthetic (--mock) source self-labels so a client can refuse it."""
+    src = FakeSource()
+    src._mock = True
+    srv = WSStreamServer(src, host="127.0.0.1", port=0, sample_rate=250)
+    task = await _start(srv)
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{srv.bound_port}") as ws:
+            hello = await _recv_json(ws)
+            assert hello["mock"] is True
+    finally:
+        await _shutdown(srv, task)
 
 
 async def test_decimation_reports_rate_and_stays_contiguous():
