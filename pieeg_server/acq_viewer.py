@@ -93,6 +93,32 @@ WINDOW_SECONDS = 10.0     # width of the strip-chart
 PX_PER_MM = 4.0           # screen pixels per "millimetre" for sensitivity
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
 
+# ── REACT EEG (Geist) palette, adapted for the Tk scope ──────────────────────
+# Mirrors the dashboard's design tokens (dashboard/src/index.css): near-black
+# surfaces, hairline borders, blue accent, and the signal colours green=live /
+# yellow=paused / red=stop, with the EEG curve in the dashboard's canvas blue.
+# Anything numeric is drawn in a mono font. Tk can't composite alpha, so the
+# dashboard's white-alpha borders are approximated with solid hex.
+GEIST = {
+    "bg":        "#000000",   # app background (Geist --bg)
+    "surface":   "#111111",   # control-bar / raised surfaces
+    "raised":    "#171717",
+    "border":    "#242424",   # hairline border (~white @ 6-10%)
+    "border_hi": "#333333",
+    "text":      "#ededed",
+    "text_sec":  "#a1a1a1",
+    "text_dim":  "#666666",
+    "accent":    "#0070f3",
+    "accent_lt": "#3291ff",
+    "green":     "#00c853",   # live / connected
+    "red":       "#ee4444",   # stop / error
+    "yellow":    "#eab308",   # paused / stalled
+    "canvas_bg": "#0d1117",   # --canvas-bg
+    "grid":      "#21262d",   # row separators / grid
+    "axis":      "#8b949e",   # --canvas-axis-text
+    "curve":     "#58a6ff",   # --canvas-curve
+}
+
 
 class StreamingFilter:
     """Causal HFF (low-pass) + LFF (high-pass) held across streaming chunks.
@@ -357,10 +383,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     electrodes = electrodes or DEFAULT_ELECTRODES[:num_channels]
     model = ViewerModel(num_channels, fs, electrodes)
 
+    C = GEIST                               # short alias for the palette
     root = tk.Tk()
     root.title(title)
     root.geometry("1000x640")
-    root.configure(bg="#111318")
+    root.configure(bg=C["bg"])
 
     # Shrink every bit of on-screen text ~10% for more room. Scaling the Tk
     # named fonts covers all the un-fonted widgets (labels, dropdowns, buttons);
@@ -378,24 +405,38 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _f.configure(size=_fs(_sz) if _sz > 0 else -_fs(-_sz))
         except tk.TclError:
             pass
+    # Mono family for anything numeric (labels, values, addresses) — the Geist
+    # "mono for data" convention. TkFixedFont is always present; fall back to it.
+    _MONO = tkfont.nametofont("TkFixedFont").actual("family")
 
-    # dark ttk styling to match the demo popups
+    # Geist-style dark ttk theme: near-black surfaces, hairline borders, blue
+    # focus/active accent, flat (no bevel) controls.
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
     except tk.TclError:
         pass
-    style.configure("TLabel", background="#111318", foreground="#e6e6e6")
-    style.configure("TButton", background="#22262e", foreground="#e6e6e6")
-    style.configure("TMenubutton", background="#22262e", foreground="#e6e6e6")
+    style.configure("TLabel", background=C["bg"], foreground=C["text"])
+    style.configure("TButton", background=C["surface"], foreground=C["text_sec"],
+                    bordercolor=C["border"], relief="flat", focuscolor=C["accent"])
+    style.map("TButton",
+              background=[("active", C["raised"]), ("pressed", C["raised"])],
+              foreground=[("active", C["text"])],
+              bordercolor=[("active", C["border_hi"])])
+    style.configure("TMenubutton", background=C["surface"], foreground=C["text"],
+                    bordercolor=C["border"], relief="flat", arrowcolor=C["text_sec"])
+    style.map("TMenubutton",
+              background=[("active", C["raised"])],
+              bordercolor=[("active", C["border_hi"])])
 
     # Two compact control rows so everything fits on one screen. The montage
     # controls are the TOP row, the signal filters the row below it. There is
     # no shutdown button — closing the window is the shutdown. Labels, padding
     # and dropdown widths are kept tight on purpose.
     def _menu(parent, label, values, initial, cb, width=None):
-        tk.Label(parent, text=label, bg="#111318",
-                 fg="#9aa4b2").pack(side="left", padx=(8, 2))
+        # Uppercase micro-label in dim text — the Geist toolbar-label convention.
+        tk.Label(parent, text=label.upper(), bg=C["surface"], fg=C["text_dim"],
+                 font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 3))
         var = tk.StringVar(value=initial)
         om = ttk.OptionMenu(parent, var, initial, *values,
                             command=lambda _v: cb(var.get()))
@@ -409,7 +450,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # electrodes and Add them as a bipolar channel, which builds the "Custom"
     # montage and selects it; switch the Montage dropdown back to any preset at
     # any time to snap to it.
-    bar2 = tk.Frame(root, bg="#111318")
+    bar2 = tk.Frame(root, bg=C["surface"])
     bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
     # Corner "IP" button: re-open the connection popup on demand (after it has
@@ -431,20 +472,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _disp_to_site = dict(elec_choices)
     _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
 
-    tk.Label(bar2, text="Bipolar:", bg="#111318",
-             fg="#9aa4b2").pack(side="left", padx=(6, 4))
+    tk.Label(bar2, text="BIPOLAR", bg=C["surface"], fg=C["text_dim"],
+             font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(6, 4))
     a_var = tk.StringVar(value=elec_display[0])
     ttk.OptionMenu(bar2, a_var, elec_display[0], *elec_display).pack(side="left")
-    tk.Label(bar2, text="–", bg="#111318", fg="#e6e6e6").pack(side="left", padx=4)
+    tk.Label(bar2, text="–", bg=C["surface"], fg=C["text_sec"]).pack(side="left",
+                                                                     padx=4)
     b_var = tk.StringVar(value=_b_default)
     ttk.OptionMenu(bar2, b_var, _b_default, *elec_display).pack(side="left")
     ttk.Button(bar2, text="+ Add",
                command=lambda: _add_bipolar()).pack(side="left", padx=8)
-    pick_hint = tk.Label(bar2, text="", bg="#111318", fg="#9aa4b2")
+    pick_hint = tk.Label(bar2, text="", bg=C["surface"], fg=C["text_dim"],
+                         font=(_MONO, _fs(9)))
     pick_hint.pack(side="left", padx=6)
 
-    # ---- row 2 (below): signal filters (+ status) ------------------------- #
-    bar = tk.Frame(root, bg="#111318")
+    # ---- row 2 (below): signal filters (+ live status) -------------------- #
+    bar = tk.Frame(root, bg=C["surface"])
     bar.pack(side="top", fill="x", padx=8, pady=(0, 4))
 
     lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
@@ -456,11 +499,41 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     sens_var = _menu(bar, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
                      str(DEFAULT_SENS), lambda v: None, width=5)
 
-    status = tk.Label(bar, text="starting...", bg="#111318", fg="#9aa4b2")
-    status.pack(side="right", padx=8)
+    # Live status with a Geist-style signal dot: green = frames flowing (live),
+    # yellow = buffered but stalled this tick, red = no data yet.
+    status_wrap = tk.Frame(bar, bg=C["surface"])
+    status_wrap.pack(side="right", padx=8)
+    status_dot = tk.Label(status_wrap, text="●", bg=C["surface"], fg=C["yellow"])
+    status_dot.pack(side="left", padx=(0, 5))
+    status = tk.Label(status_wrap, text="starting…", bg=C["surface"],
+                      fg=C["text_sec"], font=(_MONO, _fs(9)))
+    status.pack(side="left")
+
+    # ---- signature blue→green gradient hairline (Geist header motif) ------ #
+    def _lerp(c1, c2, t):
+        p = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+        q = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#%02x%02x%02x" % tuple(round(p[k] + (q[k] - p[k]) * t)
+                                       for k in range(3))
+    hair = tk.Canvas(root, height=2, bg=C["bg"], highlightthickness=0)
+    hair.pack(side="top", fill="x")
+
+    def _paint_hairline(_evt=None):
+        hair.delete("all")
+        w = hair.winfo_width()
+        if w < 4:
+            return
+        segs = 120
+        for i in range(segs):
+            t = i / (segs - 1)
+            base = _lerp(C["accent_lt"], C["green"], t)
+            fade = max(0.0, min(1.0, min(t, 1 - t) / 0.2))   # transparent ends
+            hair.create_line(w * t, 1, w * (i + 1) / segs, 1,
+                             fill=_lerp(C["bg"], base, fade))
+    hair.bind("<Configure>", _paint_hairline)
 
     # ---- full-width chart (no left column) -------------------------------- #
-    canvas = tk.Canvas(root, bg="#0b0d11", highlightthickness=0)
+    canvas = tk.Canvas(root, bg=C["canvas_bg"], highlightthickness=0)
     canvas.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
     # Right-click a lead to rename it (Custom montage only). Button-3 is the
     # right button on X11; Button-2 covers the middle/right on some trackpads.
@@ -568,46 +641,54 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 coords = np.empty(xs.size * 2)
                 coords[0::2] = xs
                 coords[1::2] = ys
-                # 1) row separator (background)
+                # 1) row separator (hairline grid)
                 canvas.create_line(0, k * row_h, W, k * row_h,
-                                   fill="#1a1e26", tags="trace")
-                # 2) the framed lead-name box (as wide as it is tall)
+                                   fill=C["grid"], tags="trace")
+                # 2) accent tick at the far left of the row — the Geist
+                #    channel-label "border-left: 2px solid accent" motif.
+                canvas.create_line(0, top, 0, bot, fill=C["accent"], width=2,
+                                   tags="trace")
+                # 3) the framed lead-name box (as wide as it is tall)
                 canvas.create_rectangle(box_x, top, box_x + box_w, bot,
-                                        outline="#3a4354", width=1, tags="trace")
-                # 3) the EEG trace, drawn on top so it runs THROUGH the box
-                canvas.create_line(*coords.tolist(), fill="#7fd1ff",
+                                        outline=C["border_hi"], width=1,
+                                        tags="trace")
+                # 4) the EEG trace, drawn on top so it runs THROUGH the box
+                canvas.create_line(*coords.tolist(), fill=C["curve"],
                                    width=1, tags="trace")
-                # 4) lead labels centred where the trace crosses, on a small
+                # 5) lead labels centred where the trace crosses, on a small
                 #    chip so they stay readable: the CHIP-INPUT pair (E1-E3) on
                 #    top — which physical electrode to reseat — and the scalp
-                #    SITE pair (Fp1-C3) dimmed under it.
+                #    SITE pair (Fp1-C3) dimmed under it. Mono, per the Geist
+                #    "numeric data is monospace" convention.
                 cx = box_x + box_w / 2.0
                 e_name = model.epair_name(r["pair"])
                 s_name = model.row_label(r)
                 chip = max(28.0, max(len(e_name), len(s_name)) * 6.0)
                 canvas.create_rectangle(cx - chip / 2, base - 13, cx + chip / 2,
-                                        base + 13, fill="#0b0d11", outline="",
-                                        tags="trace")
-                # E-pair on top (bold) and the channel name under it. Kept close
-                # in colour so they read as one label, told apart by weight and
-                # a slight brightness step rather than a big colour jump.
-                canvas.create_text(cx, base - 5, text=e_name, fill="#dbe1ea",
-                                   font=("TkDefaultFont", _fs(8), "bold"),
-                                   tags="trace")
-                canvas.create_text(cx, base + 6, text=s_name, fill="#bcc4d1",
-                                   font=("TkDefaultFont", _fs(8)), tags="trace")
+                                        base + 13, fill=C["canvas_bg"],
+                                        outline="", tags="trace")
+                canvas.create_text(cx, base - 5, text=e_name, fill=C["text"],
+                                   font=(_MONO, _fs(8), "bold"), tags="trace")
+                canvas.create_text(cx, base + 6, text=s_name, fill=C["text_sec"],
+                                   font=(_MONO, _fs(8)), tags="trace")
             # calibration marker: 100 uV vertical, 1 s horizontal
             cal_uv = 100.0 / sens * PX_PER_MM
             cal_s = W / WINDOW_SECONDS
             x0, y0 = 40, H - 16
-            canvas.create_line(x0, y0, x0, y0 - cal_uv, fill="#e6e6e6", tags="trace")
-            canvas.create_line(x0, y0, x0 + cal_s, y0, fill="#e6e6e6", tags="trace")
+            canvas.create_line(x0, y0, x0, y0 - cal_uv, fill=C["text_dim"],
+                               tags="trace")
+            canvas.create_line(x0, y0, x0 + cal_s, y0, fill=C["text_dim"],
+                               tags="trace")
             canvas.create_text(x0 + 6, y0 - cal_uv, text="100 µV", anchor="w",
-                               fill="#9aa4b2", tags="trace")
+                               fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
             canvas.create_text(x0 + cal_s + 4, y0, text="1 s", anchor="w",
-                               fill="#9aa4b2", tags="trace")
+                               fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
         pct = int(100 * model.filled / model.win)
-        status.config(text=f"buffer {pct:3d}%   +{got} frames/tick")
+        status.config(text=f"buffer {pct:3d}%   +{got}/tick")
+        # Signal dot: green = frames flowing, yellow = buffered but stalled,
+        # red = nothing yet.
+        status_dot.config(fg=C["green"] if got > 0
+                          else C["yellow"] if model.filled > 0 else C["red"])
         root.after(REDRAW_MS, _redraw)
 
     def _on_close():
@@ -644,21 +725,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         pop = tk.Toplevel(root)
         _popup_ref["win"] = pop
         pop.title("PiEEG · REACT EEG connection")
-        pop.configure(bg="#111318")
+        pop.configure(bg=C["bg"])
         pop.attributes("-topmost", True)     # stay above the scope until minimised
         _COLLAPSED, _EXPANDED_MAX = "460x230", 560
         pop.geometry(_COLLAPSED)
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
-        tk.Label(pop, text=header, bg="#111318", fg="#e6e6e6",
+        tk.Label(pop, text=header, bg=C["bg"], fg=C["text"],
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(14, 2))
-        tk.Label(pop, text="Connect REACT EEG to", bg="#111318", fg="#9aa4b2",
-                 font=("TkDefaultFont", _fs(11))).pack(pady=(4, 2))
-        tk.Label(pop, text=f"ws://{ip}:{port}", bg="#111318", fg="#7fd1ff",
-                 font=("TkDefaultFont", _fs(16), "bold")).pack()
-        tk.Label(pop, text=f"({mode})", bg="#111318", fg="#e6e6e6",
-                 font=("TkDefaultFont", _fs(10))).pack(pady=(0, 8))
+        tk.Label(pop, text="CONNECT REACT EEG TO", bg=C["bg"], fg=C["text_dim"],
+                 font=("TkDefaultFont", _fs(10))).pack(pady=(4, 2))
+        # The address is data → mono, in the accent blue.
+        tk.Label(pop, text=f"ws://{ip}:{port}", bg=C["bg"], fg=C["accent_lt"],
+                 font=(_MONO, _fs(16), "bold")).pack()
+        tk.Label(pop, text=f"({mode})", bg=C["bg"], fg=C["text_sec"],
+                 font=(_MONO, _fs(10))).pack(pady=(0, 8))
 
-        btns = tk.Frame(pop, bg="#111318")
+        btns = tk.Frame(pop, bg=C["bg"])
         btns.pack(side="bottom", pady=(0, 10))
         # iconify() minimises rather than closing, so it can be re-raised from
         # the taskbar or the corner "IP" button; Close destroys it (the button
@@ -675,23 +757,23 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             state = {"open": False}
             cur = f"v{version}  (current)" if version else "version history"
             toggle = tk.Label(pop, text=f"▸  What's new · {cur}",
-                              bg="#111318", fg="#7fd1ff", cursor="hand2",
+                              bg=C["bg"], fg=C["accent_lt"], cursor="hand2",
                               font=("TkDefaultFont", _fs(10), "bold"))
             toggle.pack(pady=(2, 2))
 
-            detail = tk.Frame(pop, bg="#111318")
+            detail = tk.Frame(pop, bg=C["bg"])
             sb = tk.Scrollbar(detail)
             sb.pack(side="right", fill="y")
-            txt = tk.Text(detail, bg="#0b0d11", fg="#dbe1ea", bd=0,
+            txt = tk.Text(detail, bg=C["canvas_bg"], fg=C["text"], bd=0,
                           highlightthickness=0, wrap="word",
                           yscrollcommand=sb.set,
                           font=("TkDefaultFont", _fs(9)))
             txt.pack(side="left", fill="both", expand=True)
             sb.config(command=txt.yview)
-            txt.tag_configure("ver", foreground="#7fd1ff",
-                              font=("TkDefaultFont", _fs(10), "bold"),
+            txt.tag_configure("ver", foreground=C["accent_lt"],
+                              font=(_MONO, _fs(10), "bold"),
                               spacing1=6)
-            txt.tag_configure("note", foreground="#bcc4d1", lmargin1=8,
+            txt.tag_configure("note", foreground=C["text_sec"], lmargin1=8,
                               lmargin2=8, spacing3=4)
             for ver, note in reversed(changelog):
                 label = f"v{ver}" + ("  (current)" if ver == version else "")
