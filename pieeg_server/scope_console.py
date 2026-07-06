@@ -46,6 +46,33 @@ import threading
 
 logger = logging.getLogger("pieeg.scope_console")
 
+# ── PiEEG Scope version history ──────────────────────────────────────────────
+# The Scope's own product version (separate from the repo's git tags). It starts
+# at 1.0 and every shipped update bumps it by 0.1; SCOPE_VERSION below is always
+# the last entry. The connect popup shows this whole chain and the window title
+# shows the current version. When you ship the next Scope update, append one
+# ("1.6", "…") line here — that keeps the version, the title and the popup notes
+# in lockstep from a single source.
+SCOPE_CHANGELOG = [
+    ("1.0", "Consolidated PiEEG Scope: one launch = ws://<ip>:1616 server + web "
+            "dashboard + webhooks + an in-process live 10-second lead viewer "
+            "(montages, HFF/LFF, sensitivity, bipolar channel builder)."),
+    ("1.1", "Added a Notch filter (50/60 Hz mains hum). Moved the connection "
+            "info into an always-on-top in-process popup; shutdown built into "
+            "the viewer window."),
+    ("1.2", "Connection popup now appears over the scope AFTER the live feed "
+            "loads and stays in front until you minimise/close it. Launcher "
+            "terminal window hidden."),
+    ("1.3", "Controls reorganised into two rows so they fit without maximising. "
+            "Window title and popup now say \"REACT EEG\"."),
+    ("1.4", "All on-screen text ~10% smaller for room. Montage controls moved "
+            "to the top row. Removed the separate Shut down button — closing "
+            "the window is the shutdown."),
+    ("1.5", "Connection popup now shows this version history, and the window "
+            "title shows the current version."),
+]
+SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
+
 # ch1..chN -> scalp labels used by the viewer's montages (first 8 are named).
 _ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
@@ -248,14 +275,17 @@ def main(argv=None):
                 "viewer. Close the window to stop the server.",
                 ip, args.port, mode, acq.num_channels, fs,
                 " · MOCK" if args.mock else "")
-    title = (f"PiEEG Scope   ·   REACT EEG connects to  ws://{ip}:{args.port}"
+    title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   REACT EEG connects to  "
+             f"ws://{ip}:{args.port}"
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
     # ---- viewer (blocks in the main thread until the window closes) -------- #
     try:
         run_viewer(tk_q, num_channels=acq.num_channels, fs=fs,
                    electrodes=electrodes, title=title,
-                   connect_popup={"ip": ip, "port": args.port, "mode": mode},
+                   connect_popup={"ip": ip, "port": args.port, "mode": mode,
+                                  "version": SCOPE_VERSION,
+                                  "changelog": SCOPE_CHANGELOG},
                    auto_close_ms=(int(args.seconds * 1000) if args.seconds else None))
     finally:
         # ---- orderly shutdown --------------------------------------------- #

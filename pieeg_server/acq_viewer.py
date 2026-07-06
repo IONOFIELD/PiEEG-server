@@ -624,23 +624,55 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ip = connect_popup.get("ip", "127.0.0.1")
         port = connect_popup.get("port", 1616)
         mode = str(connect_popup.get("mode", "offline")).upper()
+        version = connect_popup.get("version")
+        changelog = connect_popup.get("changelog") or []
         pop = tk.Toplevel(root)
         pop.title("PiEEG · REACT EEG connection")
         pop.configure(bg="#111318")
         pop.attributes("-topmost", True)     # stay above the scope until minimised
-        pop.geometry("420x210")
+        # Taller when a changelog is shown so the version history fits.
+        pop.geometry("460x540" if changelog else "420x210")
+        header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
+        tk.Label(pop, text=header, bg="#111318", fg="#e6e6e6",
+                 font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(14, 2))
         tk.Label(pop, text="Connect REACT EEG to", bg="#111318", fg="#9aa4b2",
-                 font=("TkDefaultFont", _fs(11))).pack(pady=(18, 2))
+                 font=("TkDefaultFont", _fs(11))).pack(pady=(4, 2))
         tk.Label(pop, text=f"ws://{ip}:{port}", bg="#111318", fg="#7fd1ff",
                  font=("TkDefaultFont", _fs(16), "bold")).pack()
         tk.Label(pop, text=f"({mode})", bg="#111318", fg="#e6e6e6",
-                 font=("TkDefaultFont", _fs(10))).pack(pady=(0, 10))
+                 font=("TkDefaultFont", _fs(10))).pack(pady=(0, 8))
         tk.Label(pop, text="This stays in front so you can transcribe it.\n"
                            "Minimise it when you're done — the live scope is "
                            "running behind it.",
-                 bg="#111318", fg="#9aa4b2", justify="center").pack(pady=(0, 12))
+                 bg="#111318", fg="#9aa4b2", justify="center").pack(pady=(0, 8))
+
+        # ---- version history (newest first) ------------------------------- #
+        if changelog:
+            tk.Label(pop, text="Version history", bg="#111318", fg="#9aa4b2",
+                     font=("TkDefaultFont", _fs(10), "bold")).pack(pady=(2, 2))
+            wrap = tk.Frame(pop, bg="#111318")
+            wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+            sb = tk.Scrollbar(wrap)
+            sb.pack(side="right", fill="y")
+            txt = tk.Text(wrap, bg="#0b0d11", fg="#dbe1ea", bd=0,
+                          highlightthickness=0, wrap="word",
+                          yscrollcommand=sb.set,
+                          font=("TkDefaultFont", _fs(9)))
+            txt.pack(side="left", fill="both", expand=True)
+            sb.config(command=txt.yview)
+            txt.tag_configure("ver", foreground="#7fd1ff",
+                              font=("TkDefaultFont", _fs(10), "bold"),
+                              spacing1=6)
+            txt.tag_configure("note", foreground="#bcc4d1", lmargin1=8,
+                              lmargin2=8, spacing3=4)
+            for ver, note in reversed(changelog):
+                label = f"v{ver}" + ("  (current)" if ver == version else "")
+                txt.insert("end", label + "\n", ("ver",))
+                txt.insert("end", note + "\n", ("note",))
+            txt.configure(state="disabled")     # read-only
+
         btns = tk.Frame(pop, bg="#111318")
-        btns.pack()
+        btns.pack(pady=(0, 10))
         # iconify() minimises rather than closing, so the info can be re-opened
         # from the taskbar if the operator needs a second look.
         ttk.Button(btns, text="Minimise",
