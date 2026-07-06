@@ -105,6 +105,11 @@ SCOPE_CHANGELOG = [
             "--mock flag, so the icon opened the real scope. It now launches "
             "the mock server with every channel on the 2 Hz square "
             "calibration signal. The normal PiEEG Scope icon is unchanged."),
+    ("2.5", "Montages are now editable and saveable: right-click a lead to "
+            "rename, hide, reorder or (on Custom) remove it. Edits mark the "
+            "montage with a star (e.g. \"Transverse*\"); the new Save button "
+            "next to Reset persists them so your setup survives a reboot. "
+            "Reset still returns the factory montage."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
