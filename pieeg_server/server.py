@@ -420,6 +420,9 @@ class PiEEGServer:
             "cloud_relay_status": self._get_cloud_relay_status(),
             "spike_config": self._get_spike_config(),
             "hampel_config": self._get_hampel_config(),
+            # Tells the client to show the per-electrode contact readout; the
+            # server periodically emits {"status":"leadoff", ...} messages.
+            "impedance_supported": self._leadoff_supported(),
         }
         welcome.update(self._get_record_status())
         await ws.send(json.dumps(welcome))
@@ -718,6 +721,10 @@ class PiEEGServer:
         queue = self._queue
         _hampel_frame = 0
         _hampel_last_count = 0
+        # Emit lead-off (electrode contact) status at ~4 Hz — low rate, never
+        # touches the sample stream. Stride derives from the real sample rate.
+        _leadoff_stride = max(self._sample_rate() // 4, 1)
+        _leadoff_frame = 0
 
         while True:
             frame = await queue.get()
@@ -766,6 +773,12 @@ class PiEEGServer:
                     stale.add(ws)
 
             self._clients -= stale
+
+            # Emit lead-off status at ~4 Hz (electrode contact readout)
+            _leadoff_frame += 1
+            if _leadoff_frame >= _leadoff_stride:
+                _leadoff_frame = 0
+                await self._broadcast_leadoff()
 
             # Emit Hampel replaced_count at ~1 Hz (every 250 frames)
             _hampel_frame += 1
@@ -843,6 +856,38 @@ class PiEEGServer:
         if not self._clients:
             return
         payload = json.dumps(event)
+        stale = set()
+        for ws in list(self._clients):
+            try:
+                await ws.send(payload)
+            except websockets.ConnectionClosed:
+                stale.add(ws)
+        self._clients -= stale
+
+    # ── Lead-off (electrode contact) status ────────────────────
+
+    def _leadoff_supported(self) -> bool:
+        """True if the active hardware can report per-channel lead-off."""
+        hw = getattr(self._acq, "_hw", None)
+        return hw is not None and callable(getattr(hw, "leadoff_status", None))
+
+    async def _broadcast_leadoff(self):
+        """Push the latest per-channel electrode-contact readout to clients.
+
+        Message: {"status":"leadoff","channels":[{"ch","off","p_off","n_off"}],
+        "ts":<unix>}. A channel with "off": true is floating / high-impedance
+        (no good electrode contact). Low rate, additive to the sample stream.
+        """
+        if not self._clients or not self._leadoff_supported():
+            return
+        channels = self._acq._hw.leadoff_status()
+        if channels is None:
+            return
+        payload = json.dumps({
+            "status": "leadoff",
+            "channels": channels,
+            "ts": time.time(),
+        })
         stale = set()
         for ws in list(self._clients):
             try:

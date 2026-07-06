@@ -17,6 +17,10 @@ from pieeg_server.hardware import (
     EXPECTED_STATUS, BYTES_PER_READ,
     CS_PIN, DRDY_PIN, DRDY_PIN_2, SPI_SPEED_HZ,
     CH1SET, CH2SET, CH3SET, CH4SET, CH5SET, CH6SET, CH7SET, CH8SET,
+    LOFF, LOFF_SENSP, LOFF_SENSN, LOFF_STATP, LOFF_STATN, CONFIG4,
+    CONFIG4_PD_LOFF_COMP, LOFF_SENSE_ALL,
+    STATUS_SYNC_MASK, STATUS_SYNC_VALUE,
+    parse_leadoff_status, _status_sync_ok,
     PiEEGHardware,
 )
 
@@ -443,6 +447,176 @@ class TestMockRegisterConfig:
             values = [s[ch] for s in samples]
             rms = statistics.stdev(values)
             assert rms < 5, f"Channel {ch} RMS {rms} too high for shorted 16ch mode"
+
+
+class TestLeadOffRegisters:
+    """Verify the lead-off register addresses/values match the ADS1299 datasheet."""
+
+    def test_register_addresses(self):
+        assert LOFF == 0x04
+        assert LOFF_SENSP == 0x0F
+        assert LOFF_SENSN == 0x10
+        assert LOFF_STATP == 0x12
+        assert LOFF_STATN == 0x13
+        assert CONFIG4 == 0x17
+
+    def test_comparator_power_bit(self):
+        # PD_LOFF_COMP is CONFIG4 bit 1.
+        assert CONFIG4_PD_LOFF_COMP == 0x02
+
+    def test_sense_all_channels(self):
+        assert LOFF_SENSE_ALL == 0xFF
+
+    def test_sync_marker(self):
+        assert STATUS_SYNC_MASK == 0xF0
+        assert STATUS_SYNC_VALUE == 0xC0
+        # The historical fixed header must still pass the relaxed sync check.
+        assert (EXPECTED_STATUS[0] & STATUS_SYNC_MASK) == STATUS_SYNC_VALUE
+
+
+class TestLeadOffStatusParsing:
+    """Parse a synthetic 24-bit STATUS word into per-channel off flags.
+
+    STATUS layout (MSB first): 1100 + LOFF_STATP[7:0] + LOFF_STATN[7:0]
+    + GPIO[3:0]. This encoder mirrors that so tests read like the register map.
+    """
+
+    @staticmethod
+    def _status_bytes(statp=0, statn=0, gpio=0):
+        word = (0xC << 20) | ((statp & 0xFF) << 12) | ((statn & 0xFF) << 4) | (gpio & 0x0F)
+        return [(word >> 16) & 0xFF, (word >> 8) & 0xFF, word & 0xFF]
+
+    def test_all_connected_reports_no_off(self):
+        chans = parse_leadoff_status(self._status_bytes())
+        assert len(chans) == 8
+        assert [c["ch"] for c in chans] == list(range(1, 9))
+        assert all(c["off"] is False for c in chans)
+        assert all(c["p_off"] is False and c["n_off"] is False for c in chans)
+
+    def test_channel1_positive_off(self):
+        chans = parse_leadoff_status(self._status_bytes(statp=0b0000_0001))
+        assert chans[0]["p_off"] is True
+        assert chans[0]["n_off"] is False
+        assert chans[0]["off"] is True
+        # Only channel 1 flagged
+        assert all(c["off"] is False for c in chans[1:])
+
+    def test_channel8_negative_off(self):
+        chans = parse_leadoff_status(self._status_bytes(statn=0b1000_0000))
+        assert chans[7]["ch"] == 8
+        assert chans[7]["n_off"] is True
+        assert chans[7]["p_off"] is False
+        assert chans[7]["off"] is True
+        assert all(c["off"] is False for c in chans[:7])
+
+    def test_mixed_pattern(self):
+        # ch2 P off, ch5 N off, ch3 both off
+        statp = (1 << 1) | (1 << 2)          # channels 2, 3 (P)
+        statn = (1 << 4) | (1 << 2)          # channels 5, 3 (N)
+        chans = parse_leadoff_status(self._status_bytes(statp=statp, statn=statn))
+        off = {c["ch"] for c in chans if c["off"]}
+        assert off == {2, 3, 5}
+        assert chans[2]["p_off"] and chans[2]["n_off"]   # ch3 both
+        assert chans[1]["p_off"] and not chans[1]["n_off"]  # ch2 P only
+        assert chans[4]["n_off"] and not chans[4]["p_off"]  # ch5 N only
+
+    def test_gpio_bits_ignored(self):
+        # GPIO nibble must not leak into any channel flag.
+        chans = parse_leadoff_status(self._status_bytes(gpio=0b1111))
+        assert all(c["off"] is False for c in chans)
+
+    def test_channel_offset_for_second_chip(self):
+        chans = parse_leadoff_status(self._status_bytes(statp=0b0000_0001),
+                                     channel_offset=8)
+        assert [c["ch"] for c in chans] == list(range(9, 17))
+        assert chans[0]["ch"] == 9 and chans[0]["off"] is True
+
+    def test_sync_ok_helper(self):
+        assert _status_sync_ok(self._status_bytes()) is True
+        assert _status_sync_ok(self._status_bytes(statp=0xFF, statn=0xFF, gpio=0xF)) is True
+        # A frame that lost the 1100 marker is rejected.
+        assert _status_sync_ok([0x00, 0x00, 0x00]) is False
+        assert _status_sync_ok([0x30, 0x00, 0x00]) is False
+
+
+class TestPiEEGLeadOffState:
+    """PiEEGHardware caches lead-off state from the data-stream STATUS word."""
+
+    def _make_hw(self, num_channels=8):
+        hw = PiEEGHardware.__new__(PiEEGHardware)
+        hw._num_channels = num_channels
+        hw._leadoff = []
+        return hw
+
+    @staticmethod
+    def _frame(statp=0, statn=0, gpio=0):
+        raw = [0] * 27
+        word = (0xC << 20) | ((statp & 0xFF) << 12) | ((statn & 0xFF) << 4) | (gpio & 0x0F)
+        raw[0], raw[1], raw[2] = (word >> 16) & 0xFF, (word >> 8) & 0xFF, word & 0xFF
+        return raw
+
+    def test_status_none_before_first_read(self):
+        assert self._make_hw().leadoff_status() is None
+
+    def test_update_from_single_chip(self):
+        hw = self._make_hw(8)
+        hw._update_leadoff(self._frame(statp=0b0000_0001))
+        status = hw.leadoff_status()
+        assert len(status) == 8
+        assert status[0]["off"] is True
+        assert all(c["off"] is False for c in status[1:])
+
+    def test_update_from_two_chips_offsets_channels(self):
+        hw = self._make_hw(16)
+        # chip1: ch1 off; chip2: ch1-of-chip2 off => reported as ch9
+        hw._update_leadoff(self._frame(statp=0b0000_0001),
+                           self._frame(statp=0b0000_0001))
+        status = hw.leadoff_status()
+        assert len(status) == 16
+        assert [c["ch"] for c in status] == list(range(1, 17))
+        off = {c["ch"] for c in status if c["off"]}
+        assert off == {1, 9}
+
+    def test_corrupt_frame_keeps_previous_state(self):
+        hw = self._make_hw(8)
+        hw._update_leadoff(self._frame(statp=0b0000_0001))
+        # A desynced frame (no 1100 marker) must not overwrite good state.
+        hw._update_leadoff([0x00, 0x00, 0x00])
+        assert hw.leadoff_status()[0]["off"] is True
+
+    def test_status_returns_copy(self):
+        hw = self._make_hw(8)
+        hw._update_leadoff(self._frame())
+        status = hw.leadoff_status()
+        status[0]["off"] = True
+        assert hw.leadoff_status()[0]["off"] is False
+
+
+class TestMockLeadOff:
+    """Mock reports all-connected by default and honors a fixed pattern."""
+
+    def test_all_connected_by_default(self):
+        from pieeg_server.mock import MockHardware
+        hw = MockHardware(num_channels=8)
+        hw.open()
+        status = hw.leadoff_status()
+        assert len(status) == 8
+        assert all(c["off"] is False for c in status)
+
+    def test_set_pattern(self):
+        from pieeg_server.mock import MockHardware
+        hw = MockHardware(num_channels=8)
+        hw.open()
+        hw.set_leadoff_pattern([2, 5])
+        off = {c["ch"] for c in hw.leadoff_status() if c["off"]}
+        assert off == {2, 5}
+
+    def test_16ch_reports_all_channels(self):
+        from pieeg_server.mock import MockHardware
+        hw = MockHardware(num_channels=16)
+        hw.open()
+        status = hw.leadoff_status()
+        assert [c["ch"] for c in status] == list(range(1, 17))
 
 
 class TestAcquisitionRestartWithConfig:

@@ -59,6 +59,31 @@ CH6SET = 0x0A
 CH7SET = 0x0B
 CH8SET = 0x0C
 
+# --- Lead-off (electrode contact) registers, per ADS1299 datasheet ---
+LOFF = 0x04         # comparator thresholds + lead-off current + AC/DC mode
+LOFF_SENSP = 0x0F   # per-channel enable, positive input lead-off sense
+LOFF_SENSN = 0x10   # per-channel enable, negative input lead-off sense
+LOFF_STATP = 0x12   # read-only status: positive input off/floating (per bit)
+LOFF_STATN = 0x13   # read-only status: negative input off/floating (per bit)
+CONFIG4 = 0x17      # lead-off comparator power + single-shot
+
+# LOFF register value: COMP_TH=000 (comparator trips at 95%/5% of supply),
+# ILEAD_OFF=00 (6 nA lead-off current), FLEAD_OFF=00 (DC lead-off). DC lead-off
+# is the simplest/most robust mode: a floating high-impedance electrode drifts
+# to a rail and trips the comparator; a connected one stays mid-supply.
+# AC lead-off (an injected current for an impedance MAGNITUDE in kΩ) is a
+# harder follow-on — TODO, not implemented here.
+LOFF_DC_95_5 = 0x00
+LOFF_SENSE_ALL = 0xFF          # enable lead-off sensing on all 8 channels
+CONFIG4_PD_LOFF_COMP = 0x02    # bit 1: power up the lead-off comparators
+
+# STATUS word sync marker: every ADS1299 data frame begins with a 24-bit STATUS
+# word whose top 4 bits are fixed 1100. The remaining bits carry LOFF_STATP[7:0]
+# + LOFF_STATN[7:0] + GPIO[3:0], which now VARY once lead-off sensing is on — so
+# frame-sync validation must key on the fixed nibble only, not the whole word.
+STATUS_SYNC_MASK = 0xF0
+STATUS_SYNC_VALUE = 0xC0
+
 # --- ADC commands ---
 CMD_WAKEUP = 0x02
 CMD_RESET = 0x06
@@ -131,6 +156,39 @@ _EVENT_REQUEST_SIZE = 48   # sizeof(struct gpioevent_request)
 _EVENT_DATA_SIZE    = 16   # sizeof(struct gpioevent_data): u64 timestamp + u32 id
 
 
+def _status_sync_ok(raw: list[int]) -> bool:
+    """True if the frame's STATUS word carries the fixed 1100 sync marker."""
+    return (raw[0] & STATUS_SYNC_MASK) == STATUS_SYNC_VALUE
+
+
+def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
+    """Decode one ADS1299 24-bit STATUS word into per-channel lead-off flags.
+
+    STATUS layout (MSB first): 1100 + LOFF_STATP[7:0] + LOFF_STATN[7:0]
+    + GPIO[3:0]. LOFF_STATP/N bit i (0-indexed) maps to channel i+1; a set bit
+    means that electrode's positive (P) or negative (N) input is off/floating
+    (impedance above the comparator threshold). ``channel_offset`` shifts the
+    reported channel numbers, e.g. 8 for the second ADS1299 in 16-channel mode.
+
+    Returns a list of 8 dicts: {"ch", "off", "p_off", "n_off"} where "off" is
+    the OR of P and N (i.e. "this electrode has poor/no contact").
+    """
+    word = (status_bytes[0] << 16) | (status_bytes[1] << 8) | status_bytes[2]
+    statp = (word >> 12) & 0xFF
+    statn = (word >> 4) & 0xFF
+    channels = []
+    for i in range(8):
+        p_off = bool(statp & (1 << i))
+        n_off = bool(statn & (1 << i))
+        channels.append({
+            "ch": channel_offset + i + 1,
+            "off": p_off or n_off,
+            "p_off": p_off,
+            "n_off": n_off,
+        })
+    return channels
+
+
 class PiEEGHardware:
     """Hardware abstraction for PiEEG shields (8 or 16 channels)."""
 
@@ -175,6 +233,9 @@ class PiEEGHardware:
         self._register_state: dict[int, int] = {}
         # PGA gain verified by register readback in _configure_adc.
         self._pga_gain: int | None = None
+        # Latest per-channel lead-off (electrode contact) state, parsed from the
+        # STATUS word of the live data stream. Empty until the first read.
+        self._leadoff: list[dict] = []
 
     @property
     def num_channels(self) -> int:
@@ -263,12 +324,19 @@ class PiEEGHardware:
             raw2 = self._spi2.readbytes(BYTES_PER_READ)
             self._cs_set(1)
 
+            # Update lead-off status from both STATUS words. Done BEFORE the
+            # spike/validity gates below so a floating electrode (which reads as
+            # huge noise and is spike-rejected) still reports its "off" state.
+            self._update_leadoff(raw1, raw2)
+
             # Spike detection: check last channel of chip 2 (bytes 24-26)
             if not self._is_valid_frame(raw2):
                 return None
 
-            # Validate status bytes from chip 2
-            if (raw2[0], raw2[1], raw2[2]) != EXPECTED_STATUS:
+            # Validate the frame sync marker on chip 2. Only the fixed 1100
+            # nibble is checked — the rest of the STATUS word now carries live
+            # lead-off/GPIO bits (see STATUS_SYNC_MASK) and legitimately varies.
+            if not _status_sync_ok(raw2):
                 return None
 
             channels = []
@@ -277,9 +345,38 @@ class PiEEGHardware:
             return channels
         else:
             # 8-channel mode: spike detection on chip 1
+            self._update_leadoff(raw1)
             if not self._is_valid_frame(raw1):
                 return None
             return self._decode_channels(raw1)
+
+    def _update_leadoff(self, raw1: list[int], raw2: list[int] | None = None):
+        """Refresh cached lead-off state from the STATUS word(s) of a frame.
+
+        Only trusts a frame whose sync marker is intact; a desynced/corrupt
+        frame leaves the previous good state in place rather than reporting
+        garbage contact readings.
+        """
+        if not _status_sync_ok(raw1):
+            return
+        leadoff = parse_leadoff_status(raw1)
+        if raw2 is not None:
+            if not _status_sync_ok(raw2):
+                return
+            leadoff = leadoff + parse_leadoff_status(raw2, channel_offset=8)
+        self._leadoff = leadoff
+
+    def leadoff_status(self) -> list[dict] | None:
+        """Latest per-channel electrode lead-off state, or None before any read.
+
+        Each entry: {"ch": int, "off": bool, "p_off": bool, "n_off": bool}.
+        ``off`` True means the electrode is floating / high-impedance (no good
+        contact). Derived from the DC lead-off comparators via the data-stream
+        STATUS word; updated continuously as samples are read.
+        """
+        if not self._leadoff:
+            return None
+        return [dict(c) for c in self._leadoff]
 
     def _is_valid_frame(self, raw: list[int]) -> bool:
         """Spike detection matching the original not_spike script.
@@ -607,14 +704,19 @@ class PiEEGHardware:
         self._write_register(chip_num, CONFIG1, 0x96)
         self._write_register(chip_num, CONFIG2, 0xD4)
         self._write_register(chip_num, CONFIG3, 0xFF)
-        self._write_register(chip_num, 0x04, 0x00)
-        self._write_register(chip_num, 0x0D, 0x00)
-        self._write_register(chip_num, 0x0E, 0x00)
-        self._write_register(chip_num, 0x0F, 0x00)
-        self._write_register(chip_num, 0x10, 0x00)
-        self._write_register(chip_num, 0x11, 0x00)
-        self._write_register(chip_num, 0x15, 0x20)
-        self._write_register(chip_num, 0x17, 0x00)
+        self._write_register(chip_num, LOFF, LOFF_DC_95_5)  # DC lead-off, 95%/5%
+        self._write_register(chip_num, 0x0D, 0x00)          # BIAS_SENSP
+        self._write_register(chip_num, 0x0E, 0x00)          # BIAS_SENSN
+        # Enable lead-off sensing on all 8 P and N inputs so the STATUS word
+        # reports per-channel electrode contact. Additive: does not touch the
+        # sample rate, gain, filtering, or channel data path.
+        self._write_register(chip_num, LOFF_SENSP, LOFF_SENSE_ALL)
+        self._write_register(chip_num, LOFF_SENSN, LOFF_SENSE_ALL)
+        self._write_register(chip_num, 0x11, 0x00)          # LOFF_FLIP
+        self._write_register(chip_num, 0x15, 0x20)          # MISC1
+        # Power the lead-off comparators (PD_LOFF_COMP); without this the
+        # LOFF_STATP/N status bits stay stuck and never flag a floating lead.
+        self._write_register(chip_num, CONFIG4, CONFIG4_PD_LOFF_COMP)
 
         # Enable all 8 channels at PGA gain x24 (clinical EEG). Byte 0x60 is
         # decoded in the CHNSET_GAIN_X24_NORMAL comment above.
