@@ -1,8 +1,8 @@
 """
-PiEEG demo console — one launch that does BOTH demo-day jobs at once:
+PiEEG secure-link console — one launch that does BOTH secure-link jobs at once:
 
-  1. Brings up the hardened wss demo stream for the laptop (REACT EEG),
-     exactly like `python -m pieeg_server.demo_stream`: TLS, token auth,
+  1. Brings up the hardened wss secure-link stream for the laptop (REACT EEG),
+     exactly like `python -m pieeg_server.securelink_stream`: TLS, token auth,
      strict single-interface bind, Ethernet-preferred with Wi-Fi drop.
   2. Pops up the local acquisition viewer (pieeg_server/acq_viewer) on the
      Pi's own screen so YOU can watch the electrodes live while the laptop
@@ -11,21 +11,21 @@ PiEEG demo console — one launch that does BOTH demo-day jobs at once:
 HOW THE TWO SHARE THE DATA
     Both are read-only subscribers on the SAME acquisition fan-out (the same
     pattern ws_server.py already uses). The viewer reads frames in-process, so
-    it does NOT take the demo stream's single client slot — the laptop still
+    it does NOT take the secure-link stream's single client slot — the laptop still
     gets its own wss connection. Nothing in acquisition/hardware/journal/
-    export/ws_server/demo_stream is modified; this module only wires the
-    existing public pieces together (DemoStreamServer, choose_mode,
+    export/ws_server/securelink_stream is modified; this module only wires the
+    existing public pieces together (SecureLinkStreamServer, choose_mode,
     load_token, build_ssl_context, bring_wifi_down) and adds the viewer.
 
 CLEAN EXIT
     Closing the viewer window ends the session: it stops the stream, stops
     acquisition, frees the SPI bus, and — if it had dropped Wi-Fi for the
-    Ethernet demo — turns Wi-Fi back on. (scripts/demo/shutdown_demo.sh is the
+    Ethernet secure-link — turns Wi-Fi back on. (scripts/securelink/shutdown_securelink.sh is the
     standalone fallback if the console was killed hard.)
 
 USAGE
-    python -m pieeg_server.demo_console            # real hardware
-    python -m pieeg_server.demo_console --mock     # synthetic data rehearsal
+    python -m pieeg_server.securelink_console            # real hardware
+    python -m pieeg_server.securelink_console --mock     # synthetic data rehearsal
                                                    # (never drops Wi-Fi)
 """
 
@@ -36,7 +36,7 @@ import queue
 import subprocess
 import threading
 
-logger = logging.getLogger("pieeg.demo_console")
+logger = logging.getLogger("pieeg.securelink_console")
 
 
 def restore_wifi():
@@ -46,15 +46,15 @@ def restore_wifi():
         subprocess.run(["nmcli", "radio", "wifi", "on"], check=True, timeout=15)
     except (subprocess.SubprocessError, OSError) as e:
         logger.error("Could not restore Wi-Fi automatically (%s). Run "
-                     "scripts/demo/wifi_restore.sh by hand.", e)
+                     "scripts/securelink/wifi_restore.sh by hand.", e)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="PiEEG demo console: hardened wss stream + local live "
+        description="PiEEG secure-link console: hardened wss stream + local live "
                     "viewer in one launch.")
     parser.add_argument("--port", type=int, default=None,
-                        help="demo stream port (default from demo_stream)")
+                        help="secure-link stream port (default from securelink_stream)")
     parser.add_argument("--mock", action="store_true",
                         help="synthetic data, no PiEEG hardware; never drops "
                              "Wi-Fi (safe rehearsal)")
@@ -65,10 +65,10 @@ def main(argv=None):
                         format="%(asctime)s %(name)s %(message)s")
 
     # Import here so --help works even off the Pi. These are the EXISTING
-    # public pieces of the demo path; we do not modify them.
+    # public pieces of the secure-link path; we do not modify them.
     from .acquisition import AcquisitionLoop
     from .acq_viewer import run_viewer, DEFAULT_ELECTRODES
-    from . import demo_stream as ds
+    from . import securelink_stream as ds
 
     port = args.port or ds.DEFAULT_PORT
 
@@ -90,7 +90,7 @@ def main(argv=None):
         hw.open()
         acq = AcquisitionLoop(hw, loop, interrupt=True)
 
-    server = ds.DemoStreamServer(acq, bind_ip=bind_ip, token=token,
+    server = ds.SecureLinkStreamServer(acq, bind_ip=bind_ip, token=token,
                                  ssl_context=ssl_ctx, port=port, mode=mode)
 
     # In-process bridge: acquisition subscriber queue -> thread-safe queue the
@@ -135,7 +135,7 @@ def main(argv=None):
         loop.create_task(_boot())
         loop.run_forever()
 
-    bg = threading.Thread(target=_run_loop, name="pieeg-demo-loop", daemon=True)
+    bg = threading.Thread(target=_run_loop, name="pieeg-secure-link-loop", daemon=True)
     bg.start()
     if not ready.wait(timeout=15):
         logger.error("stream server did not become ready; aborting.")
@@ -145,7 +145,7 @@ def main(argv=None):
 
     acq.start()
 
-    # Ethernet demo posture: only now, with the socket verifiably bound to the
+    # Ethernet secure-link posture: only now, with the socket verifiably bound to the
     # Ethernet IP, drop Wi-Fi. Never in --mock (would cut this session).
     wifi_dropped = False
     if mode == "ethernet" and not args.mock:

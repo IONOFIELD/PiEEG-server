@@ -1,4 +1,4 @@
-"""Tests for the hardened demo stream (wss + token auth + strict bind).
+"""Tests for the hardened secure-link stream (wss + token auth + strict bind).
 
 All additive; nothing here touches acquisition/hardware/journal/export or the
 kiosk ws_server. Uses the same FakeSource pattern as test_ws_server.py and a
@@ -14,11 +14,11 @@ import subprocess
 import pytest
 import websockets
 
-from pieeg_server import demo_stream
-from pieeg_server.demo_stream import (
+from pieeg_server import securelink_stream
+from pieeg_server.securelink_stream import (
     CLOSE_AUTH_FAILED,
     CLOSE_BUSY,
-    DemoStreamServer,
+    SecureLinkStreamServer,
 )
 
 # Only the coroutine tests get the asyncio mark (the mode/token tests are
@@ -31,7 +31,7 @@ def _pieeg_log_text(caplog):
     The websockets library traces raw payloads at DEBUG level, so the token
     can legitimately appear in ITS debug records during tests. The guarantee
     we make (and verify) is that pieeg code never logs it; the runbook tells
-    operators never to enable websockets DEBUG logging during a demo.
+    operators never to enable websockets DEBUG logging during a live session.
     """
     return "\n".join(r.getMessage() for r in caplog.records
                      if r.name.startswith("pieeg."))
@@ -71,13 +71,13 @@ class FakeSource:
 @pytest.fixture(scope="session")
 def tls_files(tmp_path_factory):
     """Self-signed cert/key for 127.0.0.1, used by server and clients."""
-    d = tmp_path_factory.mktemp("demo-tls")
+    d = tmp_path_factory.mktemp("securelink-tls")
     key, cert = d / "key.pem", d / "cert.pem"
     subprocess.run(
         ["openssl", "req", "-x509", "-newkey", "ec",
          "-pkeyopt", "ec_paramgen_curve:prime256v1",
          "-keyout", str(key), "-out", str(cert), "-days", "2", "-nodes",
-         "-subj", "/CN=pieeg-demo-test",
+         "-subj", "/CN=pieeg-securelink-test",
          "-addext", "subjectAltName=IP:127.0.0.1"],
         check=True, capture_output=True)
     return cert, key
@@ -86,7 +86,7 @@ def tls_files(tmp_path_factory):
 @pytest.fixture
 def server_ssl(tls_files):
     cert, key = tls_files
-    return demo_stream.build_ssl_context(cert_file=cert, key_file=key)
+    return securelink_stream.build_ssl_context(cert_file=cert, key_file=key)
 
 
 @pytest.fixture
@@ -118,7 +118,7 @@ async def _shutdown(server, task):
 
 def _make(server_ssl, **kw):
     src = FakeSource()
-    srv = DemoStreamServer(src, bind_ip="127.0.0.1", token=TEST_TOKEN,
+    srv = SecureLinkStreamServer(src, bind_ip="127.0.0.1", token=TEST_TOKEN,
                            ssl_context=server_ssl, port=0, **kw)
     return src, srv
 
@@ -146,7 +146,7 @@ async def test_client_without_token_is_rejected_before_any_frames(
     src, srv = _make(server_ssl)
     task = await _start(srv)
     try:
-        with caplog.at_level(logging.WARNING, logger="pieeg.demo_stream"):
+        with caplog.at_level(logging.WARNING, logger="pieeg.securelink_stream"):
             async with websockets.connect(_uri(srv), ssl=client_ssl) as ws:
                 # First message is NOT an auth message -> immediate rejection.
                 await ws.send(json.dumps({"type": "gimme"}))
@@ -180,7 +180,7 @@ async def test_wrong_token_rejected_and_token_never_logged(
 
 @pytest.mark.asyncio
 async def test_silent_client_times_out(server_ssl, client_ssl, monkeypatch):
-    monkeypatch.setattr(demo_stream, "AUTH_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(securelink_stream, "AUTH_TIMEOUT_S", 0.3)
     src, srv = _make(server_ssl)
     task = await _start(srv)
     try:
@@ -227,7 +227,7 @@ async def test_valid_token_gets_hello_and_contiguous_seq(
 @pytest.mark.asyncio
 async def test_hello_advertises_mock_true_for_synthetic_source(
         server_ssl, client_ssl):
-    # A --mock demo (MockHardware + AcquisitionLoop(mock=True)) must self-label
+    # A --mock secure-link stream (MockHardware + AcquisitionLoop(mock=True)) must self-label
     # so REACT-EEG refuses to record synthetic data as a real patient.
     src, srv = _make(server_ssl)
     src._mock = True
@@ -281,19 +281,19 @@ async def test_plaintext_ws_cannot_connect(server_ssl, client_ssl):
 
 def test_server_refuses_to_exist_without_tls():
     with pytest.raises(ValueError, match="TLS"):
-        DemoStreamServer(FakeSource(), bind_ip="127.0.0.1",
+        SecureLinkStreamServer(FakeSource(), bind_ip="127.0.0.1",
                          token=TEST_TOKEN, ssl_context=None)
 
 
 def test_server_refuses_wildcard_bind(server_ssl):
     with pytest.raises(ValueError, match="wildcard"):
-        DemoStreamServer(FakeSource(), bind_ip="0.0.0.0",
+        SecureLinkStreamServer(FakeSource(), bind_ip="0.0.0.0",
                          token=TEST_TOKEN, ssl_context=server_ssl)
 
 
 def test_build_ssl_context_refuses_missing_files(tmp_path):
     with pytest.raises(SystemExit):
-        demo_stream.build_ssl_context(cert_file=tmp_path / "nope.pem",
+        securelink_stream.build_ssl_context(cert_file=tmp_path / "nope.pem",
                                       key_file=tmp_path / "nope-key.pem")
 
 
@@ -302,33 +302,33 @@ def _fake_ips(mapping):
     return lambda iface: mapping.get(iface)
 
 
-def test_mode_ethernet_when_carrier_and_demo_ip(monkeypatch):
-    monkeypatch.setattr(demo_stream, "interface_ipv4",
+def test_mode_ethernet_when_carrier_and_securelink_ip(monkeypatch):
+    monkeypatch.setattr(securelink_stream, "interface_ipv4",
                         _fake_ips({"eth0": "192.168.77.1", "wlan0": "10.0.0.47"}))
-    monkeypatch.setattr(demo_stream, "ethernet_carrier_up", lambda *a: True)
-    assert demo_stream.choose_mode() == ("ethernet", "192.168.77.1")
+    monkeypatch.setattr(securelink_stream, "ethernet_carrier_up", lambda *a: True)
+    assert securelink_stream.choose_mode() == ("ethernet", "192.168.77.1")
 
 
 def test_mode_wifi_when_no_ethernet_carrier(monkeypatch):
-    monkeypatch.setattr(demo_stream, "interface_ipv4",
+    monkeypatch.setattr(securelink_stream, "interface_ipv4",
                         _fake_ips({"eth0": "192.168.77.1", "wlan0": "10.0.0.47"}))
-    monkeypatch.setattr(demo_stream, "ethernet_carrier_up", lambda *a: False)
-    assert demo_stream.choose_mode() == ("wifi", "10.0.0.47")
+    monkeypatch.setattr(securelink_stream, "ethernet_carrier_up", lambda *a: False)
+    assert securelink_stream.choose_mode() == ("wifi", "10.0.0.47")
 
 
 def test_mode_wifi_when_eth_has_wrong_ip(monkeypatch):
-    # Carrier up but NOT the demo static IP -> not the demo link; use Wi-Fi.
-    monkeypatch.setattr(demo_stream, "interface_ipv4",
+    # Carrier up but NOT the secure-link static IP -> not the secure link; use Wi-Fi.
+    monkeypatch.setattr(securelink_stream, "interface_ipv4",
                         _fake_ips({"eth0": "192.168.1.50", "wlan0": "10.0.0.47"}))
-    monkeypatch.setattr(demo_stream, "ethernet_carrier_up", lambda *a: True)
-    assert demo_stream.choose_mode() == ("wifi", "10.0.0.47")
+    monkeypatch.setattr(securelink_stream, "ethernet_carrier_up", lambda *a: True)
+    assert securelink_stream.choose_mode() == ("wifi", "10.0.0.47")
 
 
 def test_refuses_to_start_when_no_usable_interface(monkeypatch):
-    monkeypatch.setattr(demo_stream, "interface_ipv4", _fake_ips({}))
-    monkeypatch.setattr(demo_stream, "ethernet_carrier_up", lambda *a: False)
+    monkeypatch.setattr(securelink_stream, "interface_ipv4", _fake_ips({}))
+    monkeypatch.setattr(securelink_stream, "ethernet_carrier_up", lambda *a: False)
     with pytest.raises(SystemExit, match="refusing to start"):
-        demo_stream.choose_mode()
+        securelink_stream.choose_mode()
 
 
 def test_wifi_teardown_runs_nmcli_radio_off(monkeypatch):
@@ -338,25 +338,25 @@ def test_wifi_teardown_runs_nmcli_radio_off(monkeypatch):
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
-    monkeypatch.setattr(demo_stream.subprocess, "run", fake_run)
-    assert demo_stream.bring_wifi_down() is True
+    monkeypatch.setattr(securelink_stream.subprocess, "run", fake_run)
+    assert securelink_stream.bring_wifi_down() is True
     assert calls == [["nmcli", "radio", "wifi", "off"]]
 
 
 # ---- token loading ---------------------------------------------------------------- #
 def test_token_from_env(monkeypatch):
     monkeypatch.setenv("PIEEG_DEMO_TOKEN", TEST_TOKEN)
-    assert demo_stream.load_token() == TEST_TOKEN
+    assert securelink_stream.load_token() == TEST_TOKEN
 
 
 def test_short_token_refused(monkeypatch):
     monkeypatch.setenv("PIEEG_DEMO_TOKEN", "short")
     with pytest.raises(SystemExit, match="weak token"):
-        demo_stream.load_token()
+        securelink_stream.load_token()
 
 
 def test_missing_token_refused(monkeypatch, tmp_path):
     monkeypatch.delenv("PIEEG_DEMO_TOKEN", raising=False)
-    monkeypatch.setattr(demo_stream, "TOKEN_FILE", tmp_path / "absent")
+    monkeypatch.setattr(securelink_stream, "TOKEN_FILE", tmp_path / "absent")
     with pytest.raises(SystemExit, match="no token"):
-        demo_stream.load_token()
+        securelink_stream.load_token()

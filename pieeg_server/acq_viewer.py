@@ -1,9 +1,9 @@
 """
-Basic live EEG review window for the PiEEG demo (Tkinter, no extra deps).
+Basic live EEG review window for PiEEG (Tkinter, no extra deps).
 
 WHAT THIS IS
     A small on-screen "acquisition module" that pops up on the Pi during a
-    demo and shows a rolling 10-second strip-chart of the electrodes, with
+    live session and shows a rolling 10-second strip-chart of the electrodes, with
     the everyday EEG-review knobs:
 
       * HFF  (high-frequency filter -> a low-pass; trims muscle/EMG buzz)
@@ -14,7 +14,7 @@ WHAT THIS IS
 
     It is a live VIEW only. Like ws_server.py it is a read-only subscriber on
     the acquisition fan-out, so it never touches acquisition, calibration, the
-    journal, or the export, and it does NOT consume the demo stream's single
+    journal, or the export, and it does NOT consume the secure-link stream's single
     client slot (the laptop still gets its own wss connection).
 
 MONTAGES (bipolar, built from the 8 PiEEG inputs)
@@ -29,7 +29,7 @@ RUN IT ALONE (no hardware, to try the UI)
     python -m pieeg_server.acq_viewer --mock
 
 NORMALLY
-    Launched by pieeg_server/demo_console.py, which feeds it live frames.
+    Launched by pieeg_server/securelink_console.py, which feeds it live frames.
 """
 
 import argparse
@@ -970,7 +970,7 @@ def main(argv=None):
                    auto_close_ms=(2500 if args.shot else None))
         return
     p.error("run with --mock (try the UI) or --selftest, or launch via "
-            "pieeg_server.demo_console")
+            "pieeg_server.securelink_console")
 
 
 if __name__ == "__main__":
