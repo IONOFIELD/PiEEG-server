@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# wifi_restore.sh — turn the Wi-Fi radio back ON after an Ethernet demo.
+# wifi_restore.sh — turn the Wi-Fi radio back ON after an Ethernet secure-link.
 #
-# The demo streamer turns Wi-Fi OFF when it starts in Ethernet mode (so the
+# The secure-link streamer turns Wi-Fi OFF when it starts in Ethernet mode (so the
 # EEG stream exists only on the wired link). Wi-Fi does NOT come back by
-# itself — run this script when the demo is over.
+# itself — run this script when the secure link is over.
 #
 # USAGE
 #   ./wifi_restore.sh

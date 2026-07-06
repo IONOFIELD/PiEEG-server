@@ -1,6 +1,6 @@
-# PiEEG demo-day runbook (printable — works with NO internet)
+# PiEEG secure-link runbook (printable — works with NO internet)
 
-**Print this page.** Once the demo starts, the Pi's Wi-Fi goes down: no
+**Print this page.** Once the secure link starts, the Pi's Wi-Fi goes down: no
 internet, no Claude Code, no online help. Every command below runs in a plain
 terminal on the Pi (or the laptop where marked). Commands are shown one per
 line — type them exactly.
@@ -21,7 +21,7 @@ One client at a time.
 
 > Logging caution: pieeg code never logs the token, but the `websockets`
 > library traces raw payloads if its loggers are set to DEBUG. Never enable
-> DEBUG logging during a real demo (the default INFO setup is safe).
+> DEBUG logging during a real secure-link (the default INFO setup is safe).
 
 ---
 
@@ -42,17 +42,17 @@ chmod 600 config/demo_token
 
 - Generate the TLS certificate (covers 192.168.77.1 automatically):
 ```
-./scripts/demo/gen_demo_cert.sh
+./scripts/securelink/gen_securelink_cert.sh
 ```
 
-- Configure the Ethernet demo IP. After this, plugging the cable in gives
+- Configure the Ethernet secure-link IP. After this, plugging the cable in gives
   eth0 the address 192.168.77.1 **automatically**; with no cable, Wi-Fi and
   everything else behave exactly as before:
 ```
-./scripts/demo/demo_eth_up.sh
+./scripts/securelink/securelink_eth_up.sh
 ```
 
-  - To undo later: `./scripts/demo/demo_eth_down.sh` (add `--delete` to
+  - To undo later: `./scripts/securelink/securelink_eth_down.sh` (add `--delete` to
     remove the profile completely).
 
 ### A2. One-time laptop setup
@@ -99,7 +99,7 @@ asyncio.run(main())
   hardware, `true` when the stream is synthetic (started with `--mock`, i.e.
   `MockHardware` + `AcquisitionLoop(mock=True)`). REACT-EEG reads this and, on
   `mock: true`, **refuses to display or record the stream** (shows an error and
-  blocks reconnect) — by design, so a `--mock` demo stream can never be captured
+  blocks reconnect) — by design, so a `--mock` secure-link stream can never be captured
   as real patient data. A real-hardware stream advertises `mock: false` and
   connects normally.
 
@@ -113,7 +113,7 @@ PART B is offline-safe, and PART C brings Wi-Fi back.
 
 ---
 
-## PART B — demo day, in order
+## PART B — secure-link, in order
 
 ### B1. Physical setup
 
@@ -124,7 +124,7 @@ PART B is offline-safe, and PART C brings Wi-Fi back.
 
 ```
 cd ~/PiEEG-server
-./scripts/demo/demo_preflight.sh
+./scripts/securelink/securelink_preflight.sh
 ```
 
 Expected: four `[ OK ]` lines and `RESULT: READY`. Each possible failure is
@@ -137,17 +137,17 @@ printed with its fix. Do not continue until it says READY.
 ### B3. (Recommended) firewall: restrict the port to the laptop only
 
 ```
-sudo ./scripts/demo/demo_firewall.sh apply 192.168.77.2
+sudo ./scripts/securelink/securelink_firewall.sh apply 192.168.77.2
 ```
 
 ### B4. Start the console (Pi terminal, or the "PiEEG - REACT EEG" desktop icon)
 
 ```
 cd ~/PiEEG-server
-./scripts/demo/start_demo_console.sh
+./scripts/securelink/start_securelink_console.sh
 ```
 
-This does BOTH demo jobs in one launch:
+This does BOTH secure-link jobs in one launch:
 - serves the laptop over `wss://192.168.77.1:1621` (token auth, one client),
 - opens a **local live EEG viewer** on the Pi's screen so you can watch the
   electrodes yourself.
@@ -166,11 +166,11 @@ Using the local viewer:
   reorder. Session-only; never overwrites the three presets. "Reset montage"
   restores the current preset.
 
-(Stream only, no viewer: `./scripts/demo/start_demo_stream.sh`. Viewer only,
+(Stream only, no viewer: `./scripts/securelink/start_securelink_stream.sh`. Viewer only,
 no hardware: `.venv/bin/python -m pieeg_server.acq_viewer --mock`.)
 
 Watch the startup lines. You must see, in this order:
-- `Demo stream: wss://192.168.77.1:1621 (mode=ethernet, ...)`
+- `Secure-link stream: wss://192.168.77.1:1621 (mode=ethernet, ...)`
 - `... bringing Wi-Fi DOWN now ...`   ← Wi-Fi drops **only after** the bind
 
 If instead it says `mode=wifi` → the cable/IP wasn't ready; press Ctrl-C,
@@ -196,7 +196,7 @@ python3 eeg_client.py
 ```
 
 Expected: one `hello` line, then a continuous stream of frames. On the Pi
-you'll see `Authenticated demo client ('192.168.77.2', ...)`.
+you'll see `Authenticated secure-link client ('192.168.77.2', ...)`.
 
 Quick auth check (optional): run the client once with a wrong token in
 `demo_token` — it must be disconnected with close code 4401, and the Pi log
@@ -204,7 +204,7 @@ shows `REJECTED ... invalid auth`. Restore the correct token file afterwards.
 
 ---
 
-## PART C — tear-down (after the demo)
+## PART C — tear-down (after the secure link)
 
 **Easiest:** just close the viewer window. The console stops the stream,
 frees the SPI bus, and turns Wi-Fi back on for you.
@@ -213,7 +213,7 @@ frees the SPI bus, and turns Wi-Fi back on for you.
 stream-only launcher) — run the **"PiEEG Shutdown (restore Wi-Fi)"** desktop
 icon, or:
 ```
-./scripts/demo/shutdown_demo.sh
+./scripts/securelink/shutdown_securelink.sh
 ```
 This stops any stream/console process, turns Wi-Fi back on, and removes the
 firewall rule if present.
@@ -222,15 +222,15 @@ Manual equivalents, if you prefer them:
 - Stop the stream: **Ctrl-C** in its terminal (or close the viewer).
 - Wi-Fi back on:
 ```
-./scripts/demo/wifi_restore.sh
+./scripts/securelink/wifi_restore.sh
 ```
 - Remove the firewall rule:
 ```
-sudo ./scripts/demo/demo_firewall.sh remove
+sudo ./scripts/securelink/securelink_firewall.sh remove
 ```
-- (Optional) release the demo Ethernet config until next time:
+- (Optional) release the secure link Ethernet config until next time:
 ```
-./scripts/demo/demo_eth_down.sh
+./scripts/securelink/securelink_eth_down.sh
 ```
 
 ---
@@ -240,13 +240,13 @@ sudo ./scripts/demo/demo_firewall.sh remove
 | Symptom | Fix |
 |---|---|
 | preflight: `no cable link` | Reseat both cable ends; try another cable/port; laptop must be awake. |
-| preflight: `demo IP ... NOT on eth0` | `./scripts/demo/demo_eth_up.sh`, then unplug/replug the cable. |
+| preflight: `secure-link IP ... NOT on eth0` | `./scripts/securelink/securelink_eth_up.sh`, then unplug/replug the cable. |
 | Startup says `mode=wifi` with cable in | Cable came up after the check — Ctrl-C, run preflight, start again. |
 | `refusing to start — no token found` | PART A step A1 (token). |
 | `refusing to start — TLS cert/key not found` | PART A step A1 (cert). |
 | Laptop: `certificate verify failed` | Laptop's `demo-cert.pem` is stale — recopy it from the Pi. |
 | Laptop: closed with code 4401 | Token mismatch: laptop `demo_token` ≠ Pi `config/demo_token`. |
 | Laptop: closed with code 4409 | Another client is connected — only one allowed. Close it first. |
-| Laptop: connection refused/timeout | Laptop wired IP must be exactly 192.168.77.2 (B6 needs A2's static IP); firewall applied with a different IP? `sudo ./scripts/demo/demo_firewall.sh status` |
-| Need Wi-Fi back mid-demo | `nmcli radio wifi on` (or `./scripts/demo/wifi_restore.sh`). |
-| Stream died and won't restart ("resource busy") | Wait 5 s and retry — the SPI device frees on clean exit. If stuck: `pkill -f demo_stream`, wait, retry. |
+| Laptop: connection refused/timeout | Laptop wired IP must be exactly 192.168.77.2 (B6 needs A2's static IP); firewall applied with a different IP? `sudo ./scripts/securelink/securelink_firewall.sh status` |
+| Need Wi-Fi back mid-secure-link | `nmcli radio wifi on` (or `./scripts/securelink/wifi_restore.sh`). |
+| Stream died and won't restart ("resource busy") | Wait 5 s and retry — the SPI device frees on clean exit. If stuck: `pkill -f securelink_stream`, wait, retry. |

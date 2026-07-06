@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# demo_eth_down.sh — undo the demo Ethernet link configuration.
+# securelink_eth_down.sh — undo the secure link Ethernet link configuration.
 #
-# Deactivates the "pieeg-demo-eth" profile AND switches its autoconnect off,
-# so eth0 stops holding the demo static IP and will NOT grab it again the
+# Deactivates the "pieeg-secure-link-eth" profile AND switches its autoconnect off,
+# so eth0 stops holding the secure link static IP and will NOT grab it again the
 # next time a cable is plugged in (normal DHCP behaviour returns via the
 # stock "Wired connection 1" profile). The profile itself is kept so
-# demo_eth_up.sh can re-enable it next demo; pass --delete to remove it
+# securelink_eth_up.sh can re-enable it next secure-link; pass --delete to remove it
 # entirely.
 #
 # USAGE
-#   ./demo_eth_down.sh            # deactivate + disable autoconnect
-#   ./demo_eth_down.sh --delete   # ...and delete the profile completely
+#   ./securelink_eth_down.sh            # deactivate + disable autoconnect
+#   ./securelink_eth_down.sh --delete   # ...and delete the profile completely
 set -euo pipefail
 
-CON_NAME="pieeg-demo-eth"
+CON_NAME="pieeg-secure-link-eth"
 
 if nmcli -t -f NAME connection show | grep -qx "${CON_NAME}"; then
   # Disable autoconnect FIRST so deactivating doesn't just re-trigger it.

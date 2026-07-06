@@ -18,7 +18,7 @@ WHAT THIS IS
 
 HOW IT SHARES THE DATA (nothing downstream changes)
     The viewer is a read-only subscriber on the SAME acquisition fan-out the
-    server already uses (the pattern ws_server.py/demo_console.py use). It
+    server already uses (the pattern ws_server.py/securelink_console.py use). It
     reads frames in-process, so it does NOT take a client slot — every REACT
     laptop still gets its own ws:// connection exactly as before. Acquisition,
     hardware, the journal, recording, and export are untouched; this module
@@ -27,7 +27,7 @@ HOW IT SHARES THE DATA (nothing downstream changes)
 CLEAN EXIT
     Closing the viewer window ends the session: it stops the WebSocket server
     (frees port 1616), stops the dashboard, stops acquisition, and frees the
-    SPI bus. Unlike the demo console this path never touches Wi-Fi (the Scope
+    SPI bus. Unlike the secure-link console this path never touches Wi-Fi (the Scope
     serves over the normal LAN), so there is nothing to restore.
 
 USAGE
@@ -119,18 +119,18 @@ def _connect_target() -> tuple[str, str]:
     The IP is never hard-coded: it is derived from the live interface state at
     launch, so it always matches whatever the operator actually plugged in.
 
-      * On the Ethernet demo cable -> ("ethernet", "192.168.77.1")
+      * On the Ethernet secure-link cable -> ("ethernet", "192.168.77.1")
       * On normal Wi-Fi            -> ("wifi", <the current wlan IPv4>)
 
-    Detection reuses demo_stream.choose_mode() — the SAME read-only interface
-    check the demo uses — so the scope's hint and the demo's bind never drift
+    Detection reuses securelink_stream.choose_mode() — the SAME read-only interface
+    check the secure link uses — so the scope's hint and the secure link's bind never drift
     apart. choose_mode() only inspects local interfaces (no network traffic),
     so this works with Wi-Fi dropped / fully offline. If it can't resolve an
     interface at all it exits internally; we catch that and fall back to a
     local-only lookup, and finally to loopback, so the scope still launches.
     """
     try:
-        from .demo_stream import choose_mode
+        from .securelink_stream import choose_mode
         mode, ip = choose_mode()
         if ip:
             return mode, ip
@@ -139,7 +139,7 @@ def _connect_target() -> tuple[str, str]:
     except Exception:  # noqa: BLE001 - hint must never block the scope
         pass
     # Offline / detection failed: try a local host lookup, skipping loopback and
-    # the demo-cable address so a Wi-Fi laptop is never mis-hinted.
+    # the secure-link-cable address so a Wi-Fi laptop is never mis-hinted.
     try:
         for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
             if not ip.startswith("127.") and not ip.startswith("192.168.77."):

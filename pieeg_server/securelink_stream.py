@@ -1,11 +1,11 @@
 """
-Hardened demo WebSocket stream (wss + token) for streaming live EEG to ONE
+Hardened secure-link WebSocket stream (wss + token) for streaming live EEG to ONE
 laptop while electrodes are on a person.
 
 WHAT THIS IS
-    A SEPARATE, additive streaming path for demo mode. It reuses the existing
+    A SEPARATE, additive streaming path for secure-link mode. It reuses the existing
     ``acquisition.subscribe()`` fan-out (same physical-microvolt frames, same
-    ``seq`` numbering as ws_server.py) but adds the protections the demo
+    ``seq`` numbering as ws_server.py) but adds the protections the secure link
     posture needs:
 
       1. TLS only (wss). The server refuses to start without a cert + key.
@@ -19,8 +19,8 @@ WHAT THIS IS
          This is a secondary limit only - the token is the real access control.
 
 NETWORK MODE (chosen at startup, printed loudly, never silent)
-    Ethernet demo link present (carrier up on ETHERNET_IFACE and the demo
-    static IP configured, see scripts/demo/demo_eth_up.sh):
+    Ethernet secure link present (carrier up on ETHERNET_IFACE and the secure link
+    static IP configured, see scripts/securelink/securelink_eth_up.sh):
         -> bind to the Ethernet IP, then bring Wi-Fi DOWN so the stream
            exists only on the wired point-to-point link. (Bind first, Wi-Fi
            down second: if the bind fails we have not cut our own network.)
@@ -34,10 +34,10 @@ WHAT THIS DOES NOT TOUCH
     localhost kiosk stream), local-scope/, launch_pieeg.sh. This module is a
     read-only subscriber, exactly like ws_server.py, and runs independently:
 
-        python -m pieeg_server.demo_stream            # real hardware
-        python -m pieeg_server.demo_stream --mock     # rehearsal, no hardware
+        python -m pieeg_server.securelink_stream            # real hardware
+        python -m pieeg_server.securelink_stream --mock     # rehearsal, no hardware
 
-    See docs/DEMO_STREAM.md for the full demo-day runbook.
+    See docs/SECURELINK_STREAM.md for the full secure-link runbook.
 """
 
 import argparse
@@ -54,19 +54,19 @@ from pathlib import Path
 
 import websockets
 
-logger = logging.getLogger("pieeg.demo_stream")
+logger = logging.getLogger("pieeg.securelink_stream")
 
-# ---- fixed demo parameters ------------------------------------------------ #
-DEFAULT_PORT = 1621            # kiosk stream uses 1620; demo gets its own port
+# ---- fixed secure-link parameters ------------------------------------------------ #
+DEFAULT_PORT = 1621            # kiosk stream uses 1620; secure-link gets its own port
 ETHERNET_IFACE = "eth0"
 WIFI_IFACE = "wlan0"
 # The static IP the Pi uses on the direct Ethernet link to the laptop.
-# scripts/demo/demo_eth_up.sh configures exactly this address.
-DEMO_ETHERNET_IP = "192.168.77.1"
+# scripts/securelink/securelink_eth_up.sh configures exactly this address.
+SECURELINK_ETHERNET_IP = "192.168.77.1"
 
 # Client must present the token within this many seconds of connecting.
 AUTH_TIMEOUT_S = 5.0
-# Refuse weak tokens outright (see docs/DEMO_STREAM.md for generating one).
+# Refuse weak tokens outright (see docs/SECURELINK_STREAM.md for generating one).
 MIN_TOKEN_LEN = 16
 
 # WebSocket close codes we use (4000-4999 is the app-defined range).
@@ -80,6 +80,8 @@ SOURCE_QUEUE_MAX = 2048
 
 # Default on-disk locations (all gitignored; see .gitignore).
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# NOTE: crypto/token artifacts keep their original "demo" paths on purpose, so
+# the laptop's already-trusted cert and existing provisioning keep working.
 TOKEN_FILE = REPO_ROOT / "config" / "demo_token"
 CERT_FILE = REPO_ROOT / "certs" / "demo" / "demo-cert.pem"
 KEY_FILE = REPO_ROOT / "certs" / "demo" / "demo-key.pem"
@@ -120,12 +122,12 @@ def ethernet_carrier_up(iface: str = ETHERNET_IFACE) -> bool:
 def bring_wifi_down() -> bool:
     """Turn the Wi-Fi radio off via NetworkManager. Loud, never silent.
 
-    Called ONLY in Ethernet demo mode, and only AFTER the wss socket is
+    Called ONLY in Ethernet secure-link mode, and only AFTER the wss socket is
     already bound to the Ethernet IP. Restore later with
-    scripts/demo/wifi_restore.sh (or: nmcli radio wifi on).
+    scripts/securelink/wifi_restore.sh (or: nmcli radio wifi on).
     """
-    logger.warning("Ethernet demo link active: bringing Wi-Fi DOWN now "
-                   "(restore with scripts/demo/wifi_restore.sh)")
+    logger.warning("Ethernet secure link active: bringing Wi-Fi DOWN now "
+                   "(restore with scripts/securelink/wifi_restore.sh)")
     try:
         subprocess.run(["nmcli", "radio", "wifi", "off"],
                        check=True, timeout=15)
@@ -140,16 +142,16 @@ def bring_wifi_down() -> bool:
 def choose_mode() -> tuple[str, str]:
     """Decide (mode, bind_ip) from live interface state.
 
-    Returns ("ethernet", <demo eth IP>) or ("wifi", <wlan IP>).
+    Returns ("ethernet", <secure-link eth IP>) or ("wifi", <wlan IP>).
     Exits with a clear message if neither is usable - the server must never
     fall back to a broad bind like 0.0.0.0.
     """
     eth_ip = interface_ipv4(ETHERNET_IFACE)
-    if ethernet_carrier_up() and eth_ip == DEMO_ETHERNET_IP:
+    if ethernet_carrier_up() and eth_ip == SECURELINK_ETHERNET_IP:
         return "ethernet", eth_ip
 
-    if eth_ip == DEMO_ETHERNET_IP and not ethernet_carrier_up():
-        logger.warning("Demo static IP is configured on %s but no cable/link "
+    if eth_ip == SECURELINK_ETHERNET_IP and not ethernet_carrier_up():
+        logger.warning("Secure-link static IP is configured on %s but no cable/link "
                        "is detected - falling back to Wi-Fi mode.",
                        ETHERNET_IFACE)
 
@@ -158,9 +160,9 @@ def choose_mode() -> tuple[str, str]:
         return "wifi", wifi_ip
 
     sys.exit(
-        "demo_stream: refusing to start - no usable interface.\n"
-        f"  Ethernet mode needs carrier + {DEMO_ETHERNET_IP} on "
-        f"{ETHERNET_IFACE} (run scripts/demo/demo_eth_up.sh and plug in "
+        "securelink_stream: refusing to start - no usable interface.\n"
+        f"  Ethernet mode needs carrier + {SECURELINK_ETHERNET_IP} on "
+        f"{ETHERNET_IFACE} (run scripts/securelink/securelink_eth_up.sh and plug in "
         "the laptop),\n"
         f"  Wi-Fi mode needs an IPv4 address on {WIFI_IFACE}.\n"
         "  This server never binds to 0.0.0.0."
@@ -171,7 +173,7 @@ def choose_mode() -> tuple[str, str]:
 def load_token() -> str:
     """Load the shared-secret token: env var first, then the gitignored file.
 
-    The token is the PRIMARY access control for the demo stream. It is never
+    The token is the PRIMARY access control for the secure-link stream. It is never
     logged, never printed, never committed (config/demo_token is gitignored).
     """
     token = os.environ.get("PIEEG_DEMO_TOKEN", "").strip()
@@ -182,14 +184,14 @@ def load_token() -> str:
             source = str(TOKEN_FILE)
         except OSError:
             sys.exit(
-                "demo_stream: refusing to start - no token found.\n"
+                "securelink_stream: refusing to start - no token found.\n"
                 "  Set PIEEG_DEMO_TOKEN or create the file "
                 f"{TOKEN_FILE}\n"
                 "  Generate one with:  python3 -c \"import secrets; "
                 "print(secrets.token_urlsafe(32))\""
             )
     if len(token) < MIN_TOKEN_LEN:
-        sys.exit(f"demo_stream: token in {source} is shorter than "
+        sys.exit(f"securelink_stream: token in {source} is shorter than "
                  f"{MIN_TOKEN_LEN} characters - refusing to start with a "
                  "weak token.")
     return token
@@ -200,10 +202,10 @@ def build_ssl_context(cert_file: Path = CERT_FILE,
     """Server-side TLS context. wss is mandatory; missing files -> exit."""
     if not cert_file.exists() or not key_file.exists():
         sys.exit(
-            "demo_stream: refusing to start - TLS cert/key not found.\n"
+            "securelink_stream: refusing to start - TLS cert/key not found.\n"
             f"  expected cert: {cert_file}\n"
             f"  expected key:  {key_file}\n"
-            "  Generate them with scripts/demo/gen_demo_cert.sh"
+            "  Generate them with scripts/securelink/gen_securelink_cert.sh"
         )
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -212,7 +214,7 @@ def build_ssl_context(cert_file: Path = CERT_FILE,
 
 
 # ---- the server ------------------------------------------------------------ #
-class DemoStreamServer:
+class SecureLinkStreamServer:
     """wss stream of sequence-numbered decoded frames, token-gated.
 
     Frame format is IDENTICAL to ws_server.py so any existing client code
@@ -228,10 +230,10 @@ class DemoStreamServer:
                  mode: str = "wifi", sample_rate: int = 250,
                  max_clients: int = 1):
         if ssl_context is None:
-            raise ValueError("DemoStreamServer requires TLS (wss). "
+            raise ValueError("SecureLinkStreamServer requires TLS (wss). "
                              "Plaintext ws is not supported here.")
         if bind_ip in ("0.0.0.0", "::", ""):
-            raise ValueError("DemoStreamServer must bind a specific "
+            raise ValueError("SecureLinkStreamServer must bind a specific "
                              "interface IP, never a wildcard address.")
         self._acq = acquisition
         self._bind_ip = bind_ip
@@ -263,7 +265,7 @@ class DemoStreamServer:
             self._handle_client, self._bind_ip, self._port, ssl=self._ssl)
         self.bound_port = self._server.sockets[0].getsockname()[1]
         self._ready.set()
-        logger.info("Demo stream: wss://%s:%d (mode=%s, max_clients=%d, "
+        logger.info("Secure-link stream: wss://%s:%d (mode=%s, max_clients=%d, "
                     "token auth required)",
                     self._bind_ip, self.bound_port, self._mode,
                     self._max_clients)
@@ -351,7 +353,7 @@ class DemoStreamServer:
         if self._active >= self._max_clients:
             logger.warning("REJECTED %s: client cap reached (%d already "
                            "connected)", peer, self._max_clients)
-            await ws.close(code=CLOSE_BUSY, reason="demo stream busy")
+            await ws.close(code=CLOSE_BUSY, reason="secure-link stream busy")
             return
         self._active += 1
 
@@ -371,7 +373,7 @@ class DemoStreamServer:
                 await ws.close(code=CLOSE_AUTH_FAILED, reason="auth failed")
                 return
 
-            logger.info("Authenticated demo client %s", peer)
+            logger.info("Authenticated secure-link client %s", peer)
             q: asyncio.Queue = asyncio.Queue(maxsize=CLIENT_QUEUE_MAX)
             self._clients[ws] = q
             self._client_drops[ws] = 0
@@ -399,9 +401,9 @@ class DemoStreamServer:
                                    return_when=asyncio.FIRST_COMPLETED)
                 for t in (send_task, closed_task):
                     t.cancel()
-                logger.info("Demo client %s disconnected", peer)
+                logger.info("Secure-link client %s disconnected", peer)
             except websockets.ConnectionClosed:
-                logger.info("Demo client %s disconnected", peer)
+                logger.info("Secure-link client %s disconnected", peer)
             finally:
                 self._clients.pop(ws, None)
                 self._client_drops.pop(ws, None)
@@ -420,7 +422,7 @@ class DemoStreamServer:
 
 # ---- runnable entry point --------------------------------------------------- #
 async def _amain(args):
-    """Wire hardware + acquisition + demo server; clean shutdown on signals.
+    """Wire hardware + acquisition + secure-link server; clean shutdown on signals.
 
     Mirrors scripts/run_stream_server.py (thin orchestration only); nothing
     here modifies acquisition, hardware, or the kiosk stream.
@@ -445,7 +447,7 @@ async def _amain(args):
     ssl_ctx = build_ssl_context()
     mode, bind_ip = choose_mode()
 
-    server = DemoStreamServer(acq, bind_ip=bind_ip, token=token,
+    server = SecureLinkStreamServer(acq, bind_ip=bind_ip, token=token,
                               ssl_context=ssl_ctx, port=args.port, mode=mode)
 
     stop = asyncio.Event()
@@ -457,13 +459,13 @@ async def _amain(args):
     await server.wait_ready()   # bound to the chosen IP, or run() raised
 
     # Only now, with the socket verifiably bound to the Ethernet IP, do we
-    # drop Wi-Fi (Ethernet demo posture: stream exists on the wire only).
+    # drop Wi-Fi (Ethernet secure-link posture: stream exists on the wire only).
     if mode == "ethernet":
         bring_wifi_down()
 
-    logging.getLogger("pieeg.demo_stream").info(
-        "Demo stream up. Laptop connects to wss://%s:%d "
-        "(auth message first - see docs/DEMO_STREAM.md)",
+    logging.getLogger("pieeg.securelink_stream").info(
+        "Secure-link stream up. Laptop connects to wss://%s:%d "
+        "(auth message first - see docs/SECURELINK_STREAM.md)",
         bind_ip, server.bound_port)
     try:
         await stop.wait()
@@ -480,8 +482,8 @@ async def _amain(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Hardened wss demo stream for PiEEG (token auth, "
-                    "strict interface bind). See docs/DEMO_STREAM.md.")
+        description="Hardened wss secure-link stream for PiEEG (token auth, "
+                    "strict interface bind). See docs/SECURELINK_STREAM.md.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"TCP port to serve on (default {DEFAULT_PORT})")
     parser.add_argument("--mock", action="store_true",

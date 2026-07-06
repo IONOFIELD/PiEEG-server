@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# start_demo_console.sh — operator launcher for the COMBINED demo console:
+# start_securelink_console.sh — operator launcher for the COMBINED secure-link console:
 # the hardened wss stream for the laptop PLUS the local live EEG viewer, in
 # one window session.
 #
-# Like start_demo_stream.sh it first shows a popup with the EXACT connect
+# Like start_securelink_stream.sh it first shows a popup with the EXACT connect
 # target for the laptop. The IP is NOT hard-coded: it comes from
-# demo_stream.choose_mode() — the same function the server binds with — so
+# securelink_stream.choose_mode() — the same function the server binds with — so
 # the display always matches the real bind. Then it hands over to
-# pieeg_server.demo_console, which serves the laptop and opens the viewer.
+# pieeg_server.securelink_console, which serves the laptop and opens the viewer.
 #
 # Closing the viewer window ends the session (stream stops, SPI freed, and
-# Wi-Fi is restored if it had been dropped for an Ethernet demo).
+# Wi-Fi is restored if it had been dropped for an Ethernet secure-link).
 #
 # USAGE
-#   ./start_demo_console.sh            # real hardware
-#   ./start_demo_console.sh --mock     # synthetic data (never drops Wi-Fi)
+#   ./start_securelink_console.sh            # real hardware
+#   ./start_securelink_console.sh --mock     # synthetic data (never drops Wi-Fi)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -23,7 +23,7 @@ PORT=1621
 
 # Ask the server's own mode-selection logic what it will bind.
 if ! MODE_IP="$("$PY" -c \
-      'from pieeg_server.demo_stream import choose_mode; m, ip = choose_mode(); print(m, ip)' \
+      'from pieeg_server.securelink_stream import choose_mode; m, ip = choose_mode(); print(m, ip)' \
       2>&1)"; then
   echo "${MODE_IP}"
   if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
@@ -47,7 +47,7 @@ else
   INFO="Laptop (REACT EEG) connects to:
 ${URL}
 
-Mode: WI-FI fallback (no Ethernet demo link detected).
+Mode: WI-FI fallback (no Ethernet secure link detected).
 The local viewer opens on this screen; close it to end the session."
 fi
 
@@ -60,4 +60,4 @@ if command -v zenity >/dev/null 2>&1 && [ -n "${DISPLAY:-}" ]; then
     --text="${INFO}" &
 fi
 
-exec "$PY" -m pieeg_server.demo_console "$@"
+exec "$PY" -m pieeg_server.securelink_console "$@"
