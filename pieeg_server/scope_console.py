@@ -74,6 +74,9 @@ SCOPE_CHANGELOG = [
             "it's minimised or closed. Version history is collapsed to the "
             "current version and drops down on click. Removed the redundant "
             "\"stays in front to transcribe\" note."),
+    ("1.7", "Version-history dropdown no longer runs off the bottom of the "
+            "screen: it grows only as far as there's room (nudging up if "
+            "needed) and scrolls inside that height."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
