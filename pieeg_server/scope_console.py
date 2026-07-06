@@ -77,6 +77,11 @@ SCOPE_CHANGELOG = [
     ("1.7", "Version-history dropdown no longer runs off the bottom of the "
             "screen: it grows only as far as there's room (nudging up if "
             "needed) and scrolls inside that height."),
+    ("1.8", "Restyled to match the REACT EEG dashboard (Geist design system): "
+            "near-black surfaces, hairline borders, blue accent, monospace data "
+            "labels, the dashboard's canvas-blue trace, and the signature "
+            "blue→green gradient hairline. Added a live signal dot (green = "
+            "frames flowing, yellow = stalled, red = none)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
