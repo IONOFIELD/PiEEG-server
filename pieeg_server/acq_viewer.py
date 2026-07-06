@@ -10,7 +10,8 @@ WHAT THIS IS
       * LFF  (low-frequency filter  -> a high-pass; trims slow sweat/drift)
       * Notch (narrow band-stop at 50 or 60 Hz; kills wall-power mains hum)
       * Sensitivity (microvolts per millimetre -> trace height)
-      * Montage: three bipolar presets you can edit for the session
+      * Montage: three bipolar presets + a Custom montage; right-click a
+        lead to edit, Save to keep your edits across reboots
 
     It is a live VIEW only. Like ws_server.py it is a read-only subscriber on
     the acquisition fan-out, so it never touches acquisition, calibration, the
@@ -21,9 +22,14 @@ MONTAGES (bipolar, built from the 8 PiEEG inputs)
     The 8 inputs map to scalp sites: ch1..ch8 = Fp1 Fp2 C3 C4 T3 T4 O1 O2.
     Each montage row is a DIFFERENCE between two sites (e.g. Fp1-C3), which is
     what "bipolar" means. Three presets ship in code and are READ-ONLY:
-    Double banana, Transverse, Circumferential. You can, for the current
-    session only, click a row to turn it off/on and drag rows to reorder them;
-    those edits live in memory and NEVER overwrite the presets.
+    Double banana, Transverse, Circumferential. Right-click a lead to edit
+    YOUR copy of the current montage (rename / hide / reorder; Custom rows can
+    also be removed). Edits mark the montage dirty — the picker shows a star,
+    e.g. "Transverse*" — and the Save button persists them to
+    ~/.config/pieeg/scope_montages.json so they survive a reboot. Reset always
+    snaps back to the factory preset (never touching the code); if that
+    differs from your saved copy the star returns until you Save again. The
+    preset definitions in code are never overwritten.
 
 RUN IT ALONE (no hardware, to try the UI)
     python -m pieeg_server.acq_viewer --mock
@@ -33,10 +39,13 @@ NORMALLY
 """
 
 import argparse
+import json
+import os
 import queue
 import sys
 import threading
 import time
+from pathlib import Path
 
 import numpy as np
 from scipy import signal
@@ -68,6 +77,10 @@ MONTAGE_PRESETS: dict[str, list[tuple[str, str]]] = {
 }
 DEFAULT_MONTAGE = "Double banana"
 CUSTOM_MONTAGE = "Custom"
+# Where saved montage edits live between sessions (plain JSON, user-writable,
+# no network). One file for the whole scope; montages saved unedited are
+# dropped from it so it only ever holds real customisations.
+STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
 # session-built "Custom" montage you fill from the bipolar picker. Selecting a
 # preset always snaps straight back to it.
@@ -217,10 +230,46 @@ HFF_CHOICES_DEFAULT_HZ = dict(HFF_CHOICES)[DEFAULT_HFF]
 NOTCH_CHOICES_DEFAULT_HZ = dict(NOTCH_CHOICES)[DEFAULT_NOTCH]
 
 
+class MontageStore:
+    """Tiny JSON persistence for saved montage edits.
+
+    Maps montage name -> serialized rows. A corrupt/missing file just means
+    "nothing saved" (the scope must never fail to launch over its montage
+    file). Writes go through a temp file + os.replace so a power cut on the
+    Pi can't leave a half-written store.
+    """
+
+    def __init__(self, path=STORE_PATH):
+        self.path = Path(path)
+        self.data: dict[str, list] = {}
+        try:
+            raw = json.loads(self.path.read_text())
+            montages = raw.get("montages", {}) if isinstance(raw, dict) else {}
+            self.data = {k: v for k, v in montages.items()
+                         if isinstance(k, str) and isinstance(v, list)}
+        except (OSError, ValueError):
+            pass
+
+    def put(self, name, rows):
+        """Save serialized rows under name; rows=None deletes the entry."""
+        if rows is None:
+            self.data.pop(name, None)
+        else:
+            self.data[name] = rows
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({"montages": self.data}, indent=2))
+            os.replace(tmp, self.path)
+            return True
+        except OSError:
+            return False
+
+
 class ViewerModel:
     """Holds rolling data + montage state; no Tk, so it is unit-testable."""
 
-    def __init__(self, num_channels, fs, electrodes):
+    def __init__(self, num_channels, fs, electrodes, store=None):
         self.nch = num_channels
         self.fs = fs
         self.electrodes = list(electrodes)
@@ -233,6 +282,7 @@ class ViewerModel:
         # Per-montage working copies (session edits live here; presets never
         # change). Each row: {"pair": (a,b), "name": "Fp1-C3", "on": True}.
         self.sessions: dict[str, list[dict]] = {}
+        self.store = store          # MontageStore or None (in-memory only)
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
 
@@ -245,21 +295,85 @@ class ViewerModel:
                 rows.append({"pair": (a, b), "name": f"{a}-{b}", "on": True})
         return rows
 
+    def _factory_rows(self, name):
+        """The out-of-the-box rows: a preset's definition, or empty Custom."""
+        return [] if name == CUSTOM_MONTAGE else self._fresh_rows(name)
+
+    def _saved_rows(self, name):
+        """Deserialize the saved copy of a montage, or None if not saved.
+
+        Rows naming sites that aren't in the current electrode map are
+        dropped (the map can change between sessions), as is anything
+        malformed — a bad file must never break the viewer.
+        """
+        if self.store is None or name not in self.store.data:
+            return None
+        rows = []
+        for item in self.store.data[name]:
+            try:
+                a, b = item["pair"]
+            except (TypeError, KeyError, ValueError):
+                continue
+            if a not in self.site_index or b not in self.site_index:
+                continue
+            row = {"pair": (a, b), "name": f"{a}-{b}",
+                   "on": bool(item.get("on", True))}
+            label = str(item.get("label") or "").strip()
+            if label:
+                row["label"] = label
+            rows.append(row)
+        return rows
+
+    @staticmethod
+    def _serialize(rows):
+        out = []
+        for r in rows:
+            item = {"pair": list(r["pair"]), "on": bool(r["on"])}
+            if r.get("label"):
+                item["label"] = r["label"]
+            out.append(item)
+        return out
+
     def load_montage(self, name):
         if name not in self.sessions:
-            # "Custom" starts empty and is filled from the bipolar picker; the
-            # presets seed from their read-only definition.
-            self.sessions[name] = ([] if name == CUSTOM_MONTAGE
-                                   else self._fresh_rows(name))
+            # First touch this session: a saved copy wins; otherwise "Custom"
+            # starts empty (filled from the bipolar picker) and the presets
+            # seed from their read-only definition.
+            saved = self._saved_rows(name)
+            self.sessions[name] = (saved if saved is not None
+                                   else self._factory_rows(name))
         self.current = name
 
     def reset_current_to_preset(self):
-        # Reset the current montage to its default: a preset reloads its rows;
-        # Custom empties so you can rebuild it from scratch.
-        if self.current == CUSTOM_MONTAGE:
-            self.sessions[self.current] = []
-        else:
-            self.sessions[self.current] = self._fresh_rows(self.current)
+        # Reset the current montage to its FACTORY default: a preset reloads
+        # its rows; Custom empties so you can rebuild it from scratch. The
+        # saved copy (if any) is untouched — the montage just goes dirty
+        # against it, and Save persists the factory state (dropping the entry).
+        self.sessions[self.current] = self._factory_rows(self.current)
+
+    def dirty(self, name=None):
+        """True when a montage's rows differ from its saved copy (or, with
+        nothing saved, from its factory default) — i.e. Save would matter."""
+        name = name or self.current
+        if name not in self.sessions:
+            return False
+        baseline = self._saved_rows(name)
+        if baseline is None:
+            baseline = self._factory_rows(name)
+        return self.sessions[name] != baseline
+
+    def save_current(self):
+        """Persist the current montage's rows so they survive a reboot.
+
+        Rows identical to the factory default drop the entry instead, so the
+        store only holds real customisations. Returns True if written.
+        """
+        if self.store is None:
+            return False
+        rows = self.sessions[self.current]
+        ser = (None if rows == self._factory_rows(self.current)
+               else self._serialize(rows))
+        return self.store.put(self.current, ser)
 
     # ---- chip-input (E-number) labelling ---------------------------------- #
     def elabel(self, site):
@@ -318,6 +432,11 @@ class ViewerModel:
         r = self.rows()
         if 0 <= src < len(r) and 0 <= dst < len(r) and src != dst:
             r.insert(dst, r.pop(src))
+
+    def remove_row(self, i):
+        r = self.rows()
+        if 0 <= i < len(r):
+            r.pop(i)
 
     # ---- data handling ---------------------------------------------------- #
     def set_filters(self, lff, hff, notch=None):
@@ -381,7 +500,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     from tkinter import ttk
 
     electrodes = electrodes or DEFAULT_ELECTRODES[:num_channels]
-    model = ViewerModel(num_channels, fs, electrodes)
+    model = ViewerModel(num_channels, fs, electrodes, store=MontageStore())
 
     C = GEIST                               # short alias for the palette
     root = tk.Tk()
@@ -473,11 +592,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                    command=lambda: _show_connect_popup()).pack(side="right",
                                                                padx=(6, 2))
 
-    # Montage chip: [MONTAGE ⌄  Reset]
+    # Montage chip: [MONTAGE ⌄  Save  Reset]. The dropdown label grows a "*"
+    # (e.g. "Transverse*") whenever the montage has edits that Save hasn't
+    # persisted yet; Save writes them to disk so they come back after reboot.
     mchip = _chip(bar2)
     mchip.pack(side="left", padx=(0, 6), pady=1)
     montage_var = _menu(mchip, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
                         lambda v: _switch_montage(v), width=14)
+    ttk.Button(mchip, text="Save",
+               command=lambda: _save_montage()).pack(side="left", padx=(2, 0),
+                                                      pady=2)
     ttk.Button(mchip, text="Reset",
                command=lambda: _reset_montage()).pack(side="left", padx=(2, 4),
                                                        pady=2)
@@ -563,20 +687,43 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # ---- full-width chart (no left column) -------------------------------- #
     canvas = tk.Canvas(root, bg=C["canvas_bg"], highlightthickness=0)
     canvas.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
-    # Right-click a lead to rename it (Custom montage only). Button-3 is the
-    # right button on X11; Button-2 covers the middle/right on some trackpads.
-    canvas.bind("<Button-3>", lambda e: _rename_channel(e))
-    canvas.bind("<Button-2>", lambda e: _rename_channel(e))
+    # Right-click a lead to edit the montage (rename / hide / reorder …).
+    # Button-3 is the right button on X11; Button-2 covers the middle/right
+    # button on some trackpads.
+    canvas.bind("<Button-3>", lambda e: _lead_menu(e))
+    canvas.bind("<Button-2>", lambda e: _lead_menu(e))
 
     # ---- control callbacks ------------------------------------------------ #
+    def _refresh_montage_label():
+        # The picker's face shows the dirty star ("Transverse*") — setting the
+        # var only changes the label; it doesn't fire the switch callback.
+        montage_var.set(model.current + ("*" if model.dirty() else ""))
+
+    def _edited():
+        """After any montage edit: update the dirty star on the picker."""
+        _refresh_montage_label()
+
     def _switch_montage(name):
         model.load_montage(name)
         pick_hint.config(text="")
+        _refresh_montage_label()
+
+    def _save_montage():
+        if not model.dirty():
+            pick_hint.config(text="no changes to save")
+            return
+        if model.save_current():
+            pick_hint.config(text=f"{model.current} saved · loads on startup")
+        else:
+            pick_hint.config(text="save failed (disk?)")
+        _refresh_montage_label()
 
     def _reset_montage():
         model.reset_current_to_preset()
         pick_hint.config(
-            text="Custom cleared" if model.current == CUSTOM_MONTAGE else "")
+            text="Custom cleared" if model.current == CUSTOM_MONTAGE
+            else "factory montage · Save to keep it")
+        _refresh_montage_label()
 
     def _add_bipolar():
         a = _disp_to_site.get(a_var.get())
@@ -585,12 +732,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             pick_hint.config(text="pick two different electrodes")
             return
         added = model.add_bipolar(a, b)        # switches current -> Custom
-        montage_var.set(CUSTOM_MONTAGE)
         if added:
             pick_hint.config(text=f"added {model.epair_name((a, b))}  ·  "
-                                  "right-click a lead to rename")
+                                  "right-click a lead to edit")
         else:
             pick_hint.config(text="already in Custom")
+        _refresh_montage_label()
 
     def _row_at_y(y):
         """The visible row under a canvas y-coordinate, or None."""
@@ -601,14 +748,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         k = int(y // (H / len(rows)))
         return rows[k] if 0 <= k < len(rows) else None
 
-    def _rename_channel(evt):
-        # Rename is a Custom-montage tool: the presets are read-only, so a
-        # right-click there does nothing.
-        if model.current != CUSTOM_MONTAGE:
-            return
-        r = _row_at_y(evt.y)
-        if r is None:
-            return
+    def _rename_channel(r):
         from tkinter import simpledialog
         new = simpledialog.askstring(
             "Rename channel",
@@ -617,6 +757,54 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             initialvalue=model.row_label(r), parent=root)
         if new is not None:
             model.set_row_label(r, new)
+            _edited()
+
+    def _lead_menu(evt):
+        # One context menu edits YOUR copy of the current montage: rename,
+        # hide (prune), reorder, un-hide — and remove, for rows of the Custom
+        # montage you built yourself. Every action marks the montage dirty
+        # (the "*" on the picker) until Save persists it.
+        rows = model.rows()
+        r = _row_at_y(evt.y)
+        menu = tk.Menu(root, tearoff=0, bg=C["raised"], fg=C["text"],
+                       activebackground=C["accent"], activeforeground="#ffffff",
+                       bd=0)
+
+        def _act(fn):
+            return lambda: (fn(), _edited())
+
+        if r is not None:
+            i = next(k for k, row in enumerate(rows) if row is r)
+            vis = [k for k, row in enumerate(rows) if row["on"]]
+            vpos = vis.index(i)
+            menu.add_command(label=f"Rename {model.row_label(r)}…",
+                             command=lambda: _rename_channel(r))
+            menu.add_command(label="Hide channel",
+                             command=_act(lambda: model.toggle_row(i)))
+            menu.add_command(
+                label="Move up",
+                state="normal" if vpos > 0 else "disabled",
+                command=_act(lambda: model.move_row(i, vis[vpos - 1])))
+            menu.add_command(
+                label="Move down",
+                state="normal" if vpos < len(vis) - 1 else "disabled",
+                command=_act(lambda: model.move_row(i, vis[vpos + 1])))
+            if model.current == CUSTOM_MONTAGE:
+                menu.add_command(label="Remove channel",
+                                 command=_act(lambda: model.remove_row(i)))
+        hidden = [k for k, row in enumerate(rows) if not row["on"]]
+        if hidden:
+            if r is not None:
+                menu.add_separator()
+            sub = tk.Menu(menu, tearoff=0, bg=C["raised"], fg=C["text"],
+                          activebackground=C["accent"],
+                          activeforeground="#ffffff", bd=0)
+            for k in hidden:
+                sub.add_command(label=model.row_label(rows[k]),
+                                command=_act(lambda k=k: model.toggle_row(k)))
+            menu.add_cascade(label="Show hidden channel", menu=sub)
+        if menu.index("end") is not None:
+            menu.tk_popup(evt.x_root, evt.y_root)
 
     def _apply_filters():
         lff = dict(LFF_CHOICES)[lff_var.get()]
@@ -935,6 +1123,43 @@ def _selftest():
     assert m.row_label(row) == row["name"]
     m.reset_current_to_preset()                       # clears Custom
     assert m.rows() == []
+    # ---- montage persistence (MontageStore + dirty tracking) -------------- #
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        spath = Path(td) / "scope_montages.json"
+        s = ViewerModel(8, 250, DEFAULT_ELECTRODES, store=MontageStore(spath))
+        assert s.dirty() is False                     # factory = clean
+        s.load_montage("Transverse")
+        s.toggle_row(0)                               # prune a channel
+        rows_after_edit = [dict(r) for r in s.rows()]
+        assert s.dirty() is True                      # edited -> "*"
+        assert s.save_current() is True               # Save
+        assert s.dirty() is False                     # saved -> star clears
+        s.set_row_label(s.rows()[1], "midline")       # rename counts as edit
+        assert s.dirty() is True
+        assert s.save_current() is True
+        # fresh model = "reboot": the saved copy loads instead of the preset
+        s2 = ViewerModel(8, 250, DEFAULT_ELECTRODES, store=MontageStore(spath))
+        s2.load_montage("Transverse")
+        assert s2.dirty() is False
+        assert s2.rows()[0]["on"] is False, "saved prune did not survive"
+        assert s2.row_label(s2.rows()[1]) == "midline"
+        # Reset -> factory rows, dirty vs the saved copy; Save then drops the
+        # entry (factory needs no store) and everything is clean again
+        s2.reset_current_to_preset()
+        assert s2.rows()[0]["on"] is True
+        assert s2.dirty() is True
+        assert s2.save_current() is True
+        assert "Transverse" not in s2.store.data
+        assert s2.dirty() is False
+        # presets in code were never touched
+        assert all(len(p) == 2 for p in MONTAGE_PRESETS["Transverse"])
+        assert rows_after_edit[0]["on"] is False      # sanity on the fixture
+        # a garbage store file must not break loading
+        spath.write_text("{ not json !!")
+        s3 = ViewerModel(8, 250, DEFAULT_ELECTRODES, store=MontageStore(spath))
+        s3.load_montage("Transverse")
+        assert len(s3.rows()) == len(MONTAGE_PRESETS["Transverse"])
     # filter change re-runs cleanly
     m.set_filters(None, None)
     m.set_filters(0.3, 35.0)
