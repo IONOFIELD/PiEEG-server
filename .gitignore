@@ -1,0 +1,13 @@
+# ---- demo-stream secrets: MUST never be committed ----
+# Shared-secret token for the hardened demo WebSocket stream.
+config/demo_token
+# TLS private key + certificate for the demo stream (gen_demo_cert.sh).
+certs/
+
+# ---- local build/run artifacts ----
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+recordings/
+.venv/
