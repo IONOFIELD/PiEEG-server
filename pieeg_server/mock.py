@@ -52,6 +52,9 @@ class MockHardware:
         # Per-channel input mode derived from CHnSET register value
         # 0x00 = normal, 0x01 = shorted, 0x04 = temp, 0x05 = test signal
         self._ch_modes: list[int] = [0x00] * self._num_channels
+        # Lead-off (electrode contact): 1-based channel numbers reported "off".
+        # Empty = every electrode connected. Settable for exercising the path.
+        self._leadoff_off: set[int] = set()
 
     @property
     def num_channels(self) -> int:
@@ -176,3 +179,23 @@ class MockHardware:
     def register_state(self) -> dict[int, int]:
         """Return a copy of the shadow register state."""
         return dict(self._register_state)
+
+    # --- lead-off (electrode contact) — mirrors PiEEGHardware ---
+
+    def set_leadoff_pattern(self, off_channels):
+        """Mark the given 1-based channel numbers as off/floating (test hook)."""
+        self._leadoff_off = {int(c) for c in off_channels}
+
+    def leadoff_status(self) -> list[dict]:
+        """Per-channel lead-off state. Reports every electrode connected unless
+        a pattern was set via set_leadoff_pattern(), so the client-side contact
+        readout can be exercised without hardware."""
+        return [
+            {
+                "ch": ch + 1,
+                "off": (ch + 1) in self._leadoff_off,
+                "p_off": (ch + 1) in self._leadoff_off,
+                "n_off": False,
+            }
+            for ch in range(self._num_channels)
+        ]
