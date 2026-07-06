@@ -12,8 +12,9 @@ WHAT THIS IS
          impedances down, and spot artifact (jaw clench, cable sway, 50/60 Hz
          mains) and fix the signal by hand, in real life, before/while the
          laptop is streaming.
-      2. A red "Shut down" button right in that window that stops the server
-         and quits. No second desktop icon to hunt for.
+      2. One clean exit: closing that viewer window stops the server and quits.
+         No second desktop icon, and no separate shutdown button to hunt for —
+         the obvious gesture (close the scope) is the shutdown.
 
 HOW IT SHARES THE DATA (nothing downstream changes)
     The viewer is a read-only subscriber on the SAME acquisition fan-out the
@@ -24,11 +25,10 @@ HOW IT SHARES THE DATA (nothing downstream changes)
     only wires the existing public pieces together and adds the viewer.
 
 CLEAN EXIT
-    Closing the viewer window — or pressing the red Shut down button — ends
-    the session: it stops the WebSocket server (frees port 1616), stops the
-    dashboard, stops acquisition, and frees the SPI bus. Unlike the demo
-    console this path never touches Wi-Fi (the Scope serves over the normal
-    LAN), so there is nothing to restore.
+    Closing the viewer window ends the session: it stops the WebSocket server
+    (frees port 1616), stops the dashboard, stops acquisition, and frees the
+    SPI bus. Unlike the demo console this path never touches Wi-Fi (the Scope
+    serves over the normal LAN), so there is nothing to restore.
 
 USAGE
     python -m pieeg_server.scope_console                       # PiEEG-8 (Pi 5)
@@ -245,7 +245,7 @@ def main(argv=None):
 
     mode, ip = _connect_target()
     logger.info("Scope up: ws://%s:%d  (mode=%s, %d ch @ %d Hz%s) + local "
-                "viewer. Close the window or press Shut down to stop the server.",
+                "viewer. Close the window to stop the server.",
                 ip, args.port, mode, acq.num_channels, fs,
                 " · MOCK" if args.mock else "")
     title = (f"PiEEG Scope   ·   REACT EEG connects to  ws://{ip}:{args.port}"
@@ -255,7 +255,6 @@ def main(argv=None):
     try:
         run_viewer(tk_q, num_channels=acq.num_channels, fs=fs,
                    electrodes=electrodes, title=title,
-                   show_shutdown=True,
                    connect_popup={"ip": ip, "port": args.port, "mode": mode},
                    auto_close_ms=(int(args.seconds * 1000) if args.seconds else None))
     finally:
