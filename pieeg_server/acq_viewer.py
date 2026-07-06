@@ -646,7 +646,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         pop.title("PiEEG · REACT EEG connection")
         pop.configure(bg="#111318")
         pop.attributes("-topmost", True)     # stay above the scope until minimised
-        _COLLAPSED, _EXPANDED = "460x230", "460x560"
+        _COLLAPSED, _EXPANDED_MAX = "460x230", 560
         pop.geometry(_COLLAPSED)
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
         tk.Label(pop, text=header, bg="#111318", fg="#e6e6e6",
@@ -708,7 +708,20 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     detail.pack(fill="both", expand=True, padx=12, pady=(0, 8),
                                 before=btns)
                     toggle.config(text=f"▾  What's new · {cur}")
-                    pop.geometry(_EXPANDED)
+                    # Grow downward, but never past the bottom of the screen:
+                    # cap the height to the room below the window, and if even
+                    # that is tight, nudge the window up. The list scrolls
+                    # inside whatever height it gets.
+                    pop.update_idletasks()
+                    x, y = pop.winfo_x(), pop.winfo_y()
+                    sh = pop.winfo_screenheight()
+                    margin = 48
+                    h = max(260, min(_EXPANDED_MAX, sh - y - margin))
+                    if y + h + margin > sh:
+                        y = max(20, sh - h - margin)
+                        pop.geometry(f"460x{h}+{x}+{y}")
+                    else:
+                        pop.geometry(f"460x{h}")
                 state["open"] = not state["open"]
             toggle.bind("<Button-1>", _toggle)
 
