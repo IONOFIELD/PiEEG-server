@@ -161,6 +161,21 @@ def _status_sync_ok(raw: list[int]) -> bool:
     return (raw[0] & STATUS_SYNC_MASK) == STATUS_SYNC_VALUE
 
 
+def leadoff_state(p_off: bool, n_off: bool) -> str:
+    """Map a channel's P/N lead-off flags to a green/amber/red contact verdict.
+
+    green = both inputs connected (good contact)
+    amber = exactly one input off (partial contact — one side floating; e.g.
+            a lost shared reference shows every channel as amber)
+    red   = both inputs off (no contact)
+    """
+    if p_off and n_off:
+        return "red"
+    if p_off or n_off:
+        return "amber"
+    return "green"
+
+
 def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
     """Decode one ADS1299 24-bit STATUS word into per-channel lead-off flags.
 
@@ -170,8 +185,9 @@ def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
     (impedance above the comparator threshold). ``channel_offset`` shifts the
     reported channel numbers, e.g. 8 for the second ADS1299 in 16-channel mode.
 
-    Returns a list of 8 dicts: {"ch", "off", "p_off", "n_off"} where "off" is
-    the OR of P and N (i.e. "this electrode has poor/no contact").
+    Returns a list of 8 dicts: {"ch", "off", "p_off", "n_off", "state"} where
+    "off" is the OR of P and N (poor/no contact) and "state" is the
+    green/amber/red verdict from ``leadoff_state`` for a direct client readout.
     """
     word = (status_bytes[0] << 16) | (status_bytes[1] << 8) | status_bytes[2]
     statp = (word >> 12) & 0xFF
@@ -185,6 +201,7 @@ def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
             "off": p_off or n_off,
             "p_off": p_off,
             "n_off": n_off,
+            "state": leadoff_state(p_off, n_off),
         })
     return channels
 

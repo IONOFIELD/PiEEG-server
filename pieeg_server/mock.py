@@ -190,12 +190,16 @@ class MockHardware:
         """Per-channel lead-off state. Reports every electrode connected unless
         a pattern was set via set_leadoff_pattern(), so the client-side contact
         readout can be exercised without hardware."""
-        return [
-            {
+        from .hardware import leadoff_state
+        out = []
+        for ch in range(self._num_channels):
+            p_off = (ch + 1) in self._leadoff_off
+            n_off = False
+            out.append({
                 "ch": ch + 1,
-                "off": (ch + 1) in self._leadoff_off,
-                "p_off": (ch + 1) in self._leadoff_off,
-                "n_off": False,
-            }
-            for ch in range(self._num_channels)
-        ]
+                "off": p_off or n_off,
+                "p_off": p_off,
+                "n_off": n_off,
+                "state": leadoff_state(p_off, n_off),
+            })
+        return out

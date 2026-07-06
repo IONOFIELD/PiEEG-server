@@ -20,7 +20,7 @@ from pieeg_server.hardware import (
     LOFF, LOFF_SENSP, LOFF_SENSN, LOFF_STATP, LOFF_STATN, CONFIG4,
     CONFIG4_PD_LOFF_COMP, LOFF_SENSE_ALL,
     STATUS_SYNC_MASK, STATUS_SYNC_VALUE,
-    parse_leadoff_status, _status_sync_ok,
+    parse_leadoff_status, leadoff_state, _status_sync_ok,
     PiEEGHardware,
 )
 
@@ -474,6 +474,22 @@ class TestLeadOffRegisters:
         assert (EXPECTED_STATUS[0] & STATUS_SYNC_MASK) == STATUS_SYNC_VALUE
 
 
+class TestLeadOffState:
+    """green/amber/red verdict from P/N lead-off flags."""
+
+    def test_both_connected_is_green(self):
+        assert leadoff_state(False, False) == "green"
+
+    def test_p_only_off_is_amber(self):
+        assert leadoff_state(True, False) == "amber"
+
+    def test_n_only_off_is_amber(self):
+        assert leadoff_state(False, True) == "amber"
+
+    def test_both_off_is_red(self):
+        assert leadoff_state(True, True) == "red"
+
+
 class TestLeadOffStatusParsing:
     """Parse a synthetic 24-bit STATUS word into per-channel off flags.
 
@@ -492,12 +508,14 @@ class TestLeadOffStatusParsing:
         assert [c["ch"] for c in chans] == list(range(1, 9))
         assert all(c["off"] is False for c in chans)
         assert all(c["p_off"] is False and c["n_off"] is False for c in chans)
+        assert all(c["state"] == "green" for c in chans)
 
     def test_channel1_positive_off(self):
         chans = parse_leadoff_status(self._status_bytes(statp=0b0000_0001))
         assert chans[0]["p_off"] is True
         assert chans[0]["n_off"] is False
         assert chans[0]["off"] is True
+        assert chans[0]["state"] == "amber"    # only P off
         # Only channel 1 flagged
         assert all(c["off"] is False for c in chans[1:])
 
@@ -507,6 +525,7 @@ class TestLeadOffStatusParsing:
         assert chans[7]["n_off"] is True
         assert chans[7]["p_off"] is False
         assert chans[7]["off"] is True
+        assert chans[7]["state"] == "amber"    # only N off
         assert all(c["off"] is False for c in chans[:7])
 
     def test_mixed_pattern(self):
@@ -517,8 +536,12 @@ class TestLeadOffStatusParsing:
         off = {c["ch"] for c in chans if c["off"]}
         assert off == {2, 3, 5}
         assert chans[2]["p_off"] and chans[2]["n_off"]   # ch3 both
+        assert chans[2]["state"] == "red"                # both off
         assert chans[1]["p_off"] and not chans[1]["n_off"]  # ch2 P only
+        assert chans[1]["state"] == "amber"
         assert chans[4]["n_off"] and not chans[4]["p_off"]  # ch5 N only
+        assert chans[4]["state"] == "amber"
+        assert chans[0]["state"] == "green"              # ch1 untouched
 
     def test_gpio_bits_ignored(self):
         # GPIO nibble must not leak into any channel flag.
@@ -608,8 +631,12 @@ class TestMockLeadOff:
         hw = MockHardware(num_channels=8)
         hw.open()
         hw.set_leadoff_pattern([2, 5])
-        off = {c["ch"] for c in hw.leadoff_status() if c["off"]}
+        status = hw.leadoff_status()
+        off = {c["ch"] for c in status if c["off"]}
         assert off == {2, 5}
+        # Mock only flips P (single-ended), so a flagged channel is amber.
+        assert status[1]["state"] == "amber" and status[4]["state"] == "amber"
+        assert status[0]["state"] == "green"
 
     def test_16ch_reports_all_channels(self):
         from pieeg_server.mock import MockHardware
