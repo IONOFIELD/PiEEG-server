@@ -600,10 +600,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     root.after(REDRAW_MS, _redraw)
 
     # ---- always-on-top "connect REACT to…" popup ------------------------- #
-    # Raised over the scope and kept in front (topmost) so the operator can read
-    # and transcribe the connection target; it is dismissed only by the operator
-    # (Minimise, or its own Close), never auto-hidden when the scope draws.
-    if connect_popup:
+    # Raised OVER the scope AFTER it has drawn (not before — on the Pi's window
+    # manager a Toplevel built before the root maps ends up buried, which looked
+    # like the popup "immediately hiding"). We let the scope load first, then
+    # pop this over it and keep it topmost so the operator can read/transcribe
+    # the connection target. Dismissed only by the operator (Minimise, or its
+    # own Close), never auto-hidden when the scope redraws.
+    def _show_connect_popup():
         ip = connect_popup.get("ip", "127.0.0.1")
         port = connect_popup.get("port", 1616)
         mode = str(connect_popup.get("mode", "offline")).upper()
@@ -632,7 +635,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                    command=lambda: pop.destroy()).pack(side="left", padx=6)
         pop.protocol("WM_DELETE_WINDOW", pop.destroy)
         pop.update_idletasks()
+        # Assert stacking once now and again shortly after the WM finishes
+        # mapping it, so it wins over the just-drawn scope window.
         pop.lift()
+        pop.focus_force()
+        pop.after(120, lambda: (pop.winfo_exists() and (pop.lift(), None)))
+
+    if connect_popup:
+        # ~1.2 s lets the scope map and paint its first frames first.
+        root.after(1200, _show_connect_popup)
 
     if auto_shot or auto_close_ms:
         def _auto():
