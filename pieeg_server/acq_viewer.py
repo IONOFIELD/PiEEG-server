@@ -329,8 +329,6 @@ class ViewerModel:
 def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                electrodes=None, on_close=None, title="PiEEG - REACT EEG",
                auto_shot=None, auto_close_ms=None,
-               show_shutdown=False,
-               shutdown_label="⏻  Shut down  ·  stop server",
                connect_popup=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
@@ -339,20 +337,21 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     auto_shot / auto_close_ms: test hooks — after auto_close_ms, dump the
     canvas to a PostScript file (auto_shot) and close. Used by --shot to
     prove rendering without depending on the monitor being awake.
-    show_shutdown: when True, add a red button to the top bar that ends the
-    session. It closes the window exactly like the window's X, which the
-    launcher (scope_console) treats as "stop the server and quit" — so the
-    operator has one visible control that shuts everything down.
-    shutdown_label: the text on that button.
     connect_popup: optional dict {"ip", "port", "mode"} for the "connect REACT
-    to…" info popup. When given, a small always-on-top window is raised over the
-    scope showing the connection target and STAYS in front until the operator
-    minimises or closes it — so it can be read/transcribed and is never cut off
-    when the scope draws. It is in-process (a Tk Toplevel), so it needs no
-    zenity/window-manager stacking and works fully offline.
+    EEG to…" info popup. When given, a small always-on-top window is raised over
+    the scope showing the connection target and STAYS in front until the
+    operator minimises or closes it — so it can be read/transcribed and is never
+    cut off when the scope draws. It is in-process (a Tk Toplevel), so it needs
+    no zenity/window-manager stacking and works fully offline.
+
+    There is no shutdown button: CLOSING THE WINDOW is the shutdown. The
+    launcher (scope_console) treats the window closing as "stop the server,
+    dashboard, acquisition and free the SPI bus", so the one obvious gesture —
+    closing the scope — cleanly ends everything.
     Blocks until the window is closed (runs the Tk main loop).
     """
     import tkinter as tk
+    from tkinter import font as tkfont
     from tkinter import ttk
 
     electrodes = electrodes or DEFAULT_ELECTRODES[:num_channels]
@@ -362,6 +361,23 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     root.title(title)
     root.geometry("1000x640")
     root.configure(bg="#111318")
+
+    # Shrink every bit of on-screen text ~10% for more room. Scaling the Tk
+    # named fonts covers all the un-fonted widgets (labels, dropdowns, buttons);
+    # the few widgets that pin an explicit size are set from _fs() below so they
+    # scale by the same 10%.
+    def _fs(pts):
+        return max(1, int(round(pts * 0.9)))
+    for _fname in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+                   "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont",
+                   "TkTooltipFont"):
+        try:
+            _f = tkfont.nametofont(_fname)
+            _sz = _f.cget("size")
+            if _sz:
+                _f.configure(size=_fs(_sz) if _sz > 0 else -_fs(-_sz))
+        except tk.TclError:
+            pass
 
     # dark ttk styling to match the demo popups
     style = ttk.Style(root)
@@ -373,9 +389,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     style.configure("TButton", background="#22262e", foreground="#e6e6e6")
     style.configure("TMenubutton", background="#22262e", foreground="#e6e6e6")
 
-    # Two compact control rows so everything fits on one screen: row 1 is the
-    # signal filters (+ the shutdown button / status), row 2 is the montage
-    # controls. Labels, padding and dropdown widths are kept tight on purpose.
+    # Two compact control rows so everything fits on one screen. The montage
+    # controls are the TOP row, the signal filters the row below it. There is
+    # no shutdown button — closing the window is the shutdown. Labels, padding
+    # and dropdown widths are kept tight on purpose.
     def _menu(parent, label, values, initial, cb, width=None):
         tk.Label(parent, text=label, bg="#111318",
                  fg="#9aa4b2").pack(side="left", padx=(8, 2))
@@ -387,41 +404,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         om.pack(side="left")
         return var
 
-    # ---- row 1: signal filters (+ shutdown / status) --------------------- #
-    bar = tk.Frame(root, bg="#111318")
-    bar.pack(side="top", fill="x", padx=8, pady=(6, 2))
-
-    lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
-                    lambda v: _apply_filters(), width=6)
-    hff_var = _menu(bar, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
-                    lambda v: _apply_filters(), width=6)
-    notch_var = _menu(bar, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
-                      lambda v: _apply_filters(), width=6)
-    sens_var = _menu(bar, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
-                     str(DEFAULT_SENS), lambda v: None, width=5)
-
-    # Optional operator shutdown control. Closing the window already ends the
-    # session; this is the same action as a labelled, hard-to-miss red button
-    # so nobody has to hunt for the window's X to stop the server.
-    if show_shutdown:
-        style.configure("Shutdown.TButton", background="#7a1620",
-                        foreground="#ffffff", font=("TkDefaultFont", 10, "bold"))
-        style.map("Shutdown.TButton",
-                  background=[("active", "#9c1c2a")],
-                  foreground=[("active", "#ffffff")])
-        ttk.Button(bar, text=shutdown_label, style="Shutdown.TButton",
-                   command=lambda: _on_close()).pack(side="right", padx=(6, 8))
-
-    status = tk.Label(bar, text="starting...", bg="#111318", fg="#9aa4b2")
-    status.pack(side="right", padx=8)
-
-    # ---- row 2: montage controls (parallel to the filter row) ------------- #
+    # ---- row 1 (top): montage controls ----------------------------------- #
     # The montage picker + Reset, then the bipolar channel builder: pick any two
     # electrodes and Add them as a bipolar channel, which builds the "Custom"
     # montage and selects it; switch the Montage dropdown back to any preset at
     # any time to snap to it.
     bar2 = tk.Frame(root, bg="#111318")
-    bar2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+    bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
     montage_var = _menu(bar2, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
                         lambda v: _switch_montage(v), width=14)
@@ -446,6 +435,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                command=lambda: _add_bipolar()).pack(side="left", padx=8)
     pick_hint = tk.Label(bar2, text="", bg="#111318", fg="#9aa4b2")
     pick_hint.pack(side="left", padx=6)
+
+    # ---- row 2 (below): signal filters (+ status) ------------------------- #
+    bar = tk.Frame(root, bg="#111318")
+    bar.pack(side="top", fill="x", padx=8, pady=(0, 4))
+
+    lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
+                    lambda v: _apply_filters(), width=6)
+    hff_var = _menu(bar, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
+                    lambda v: _apply_filters(), width=6)
+    notch_var = _menu(bar, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
+                      lambda v: _apply_filters(), width=6)
+    sens_var = _menu(bar, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
+                     str(DEFAULT_SENS), lambda v: None, width=5)
+
+    status = tk.Label(bar, text="starting...", bg="#111318", fg="#9aa4b2")
+    status.pack(side="right", padx=8)
 
     # ---- full-width chart (no left column) -------------------------------- #
     canvas = tk.Canvas(root, bg="#0b0d11", highlightthickness=0)
@@ -580,9 +585,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 # in colour so they read as one label, told apart by weight and
                 # a slight brightness step rather than a big colour jump.
                 canvas.create_text(cx, base - 5, text=e_name, fill="#dbe1ea",
-                                   font=("TkDefaultFont", 8, "bold"), tags="trace")
+                                   font=("TkDefaultFont", _fs(8), "bold"),
+                                   tags="trace")
                 canvas.create_text(cx, base + 6, text=s_name, fill="#bcc4d1",
-                                   font=("TkDefaultFont", 8), tags="trace")
+                                   font=("TkDefaultFont", _fs(8)), tags="trace")
             # calibration marker: 100 uV vertical, 1 s horizontal
             cal_uv = 100.0 / sens * PX_PER_MM
             cal_s = W / WINDOW_SECONDS
@@ -624,11 +630,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         pop.attributes("-topmost", True)     # stay above the scope until minimised
         pop.geometry("420x210")
         tk.Label(pop, text="Connect REACT EEG to", bg="#111318", fg="#9aa4b2",
-                 font=("TkDefaultFont", 11)).pack(pady=(18, 2))
+                 font=("TkDefaultFont", _fs(11))).pack(pady=(18, 2))
         tk.Label(pop, text=f"ws://{ip}:{port}", bg="#111318", fg="#7fd1ff",
-                 font=("TkDefaultFont", 16, "bold")).pack()
+                 font=("TkDefaultFont", _fs(16), "bold")).pack()
         tk.Label(pop, text=f"({mode})", bg="#111318", fg="#e6e6e6",
-                 font=("TkDefaultFont", 10)).pack(pady=(0, 10))
+                 font=("TkDefaultFont", _fs(10))).pack(pady=(0, 10))
         tk.Label(pop, text="This stays in front so you can transcribe it.\n"
                            "Minimise it when you're done — the live scope is "
                            "running behind it.",
