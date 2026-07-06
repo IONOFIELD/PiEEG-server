@@ -202,6 +202,7 @@ async def test_valid_token_gets_hello_and_contiguous_seq(
             hello = await _auth(ws)
             assert hello["type"] == "hello"
             assert hello["channels"] == 8
+            assert hello["mock"] is False   # FakeSource has no _mock -> real
 
             async def feed():
                 for i in range(N):
@@ -221,6 +222,22 @@ async def test_valid_token_gets_hello_and_contiguous_seq(
 
     assert seqs == list(range(N))      # zero loss, contiguous seq
     assert ns == list(range(N))        # original sample indices preserved
+
+
+@pytest.mark.asyncio
+async def test_hello_advertises_mock_true_for_synthetic_source(
+        server_ssl, client_ssl):
+    # A --mock demo (MockHardware + AcquisitionLoop(mock=True)) must self-label
+    # so REACT-EEG refuses to record synthetic data as a real patient.
+    src, srv = _make(server_ssl)
+    src._mock = True
+    task = await _start(srv)
+    try:
+        async with websockets.connect(_uri(srv), ssl=client_ssl) as ws:
+            hello = await _auth(ws)
+            assert hello["mock"] is True
+    finally:
+        await _shutdown(srv, task)
 
 
 # ---- client cap -------------------------------------------------------------- #

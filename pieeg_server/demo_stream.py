@@ -382,6 +382,10 @@ class DemoStreamServer:
                 "effective_rate": float(self._sample_rate),
                 "channels": self._num_channels,
                 "mode": self._mode,
+                # Self-label synthetic feeds so REACT-EEG refuses to record them
+                # as real patient data. Mirrors server.py's welcome; getattr
+                # guards sources (e.g. test FakeSource) that have no _mock.
+                "mock": bool(getattr(self._acq, "_mock", False)),
             }
             try:
                 await ws.send(json.dumps(hello))
