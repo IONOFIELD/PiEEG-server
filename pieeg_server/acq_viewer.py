@@ -412,6 +412,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     bar2 = tk.Frame(root, bg="#111318")
     bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
+    # Corner "IP" button: re-open the connection popup on demand (after it has
+    # been minimised or closed). Only meaningful when there's a popup to show.
+    if connect_popup:
+        ttk.Button(bar2, text="IP", width=3,
+                   command=lambda: _show_connect_popup()).pack(side="right",
+                                                               padx=(6, 2))
+
     montage_var = _menu(bar2, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
                         lambda v: _switch_montage(v), width=14)
     ttk.Button(bar2, text="Reset",
@@ -613,25 +620,34 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     root.protocol("WM_DELETE_WINDOW", _on_close)
     root.after(REDRAW_MS, _redraw)
 
-    # ---- always-on-top "connect REACT to…" popup ------------------------- #
+    # ---- always-on-top "connect REACT EEG to…" popup --------------------- #
     # Raised OVER the scope AFTER it has drawn (not before — on the Pi's window
     # manager a Toplevel built before the root maps ends up buried, which looked
-    # like the popup "immediately hiding"). We let the scope load first, then
-    # pop this over it and keep it topmost so the operator can read/transcribe
-    # the connection target. Dismissed only by the operator (Minimise, or its
-    # own Close), never auto-hidden when the scope redraws.
+    # like the popup "immediately hiding"). Kept topmost. Only one instance
+    # exists: reopening (the corner "IP" button) just re-raises the live one,
+    # or rebuilds it if it was closed.
+    _popup_ref = {"win": None}
+
     def _show_connect_popup():
+        # Already open? Un-minimise, raise, done — don't stack a second copy.
+        win = _popup_ref["win"]
+        if win is not None and win.winfo_exists():
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+            return
         ip = connect_popup.get("ip", "127.0.0.1")
         port = connect_popup.get("port", 1616)
         mode = str(connect_popup.get("mode", "offline")).upper()
         version = connect_popup.get("version")
         changelog = connect_popup.get("changelog") or []
         pop = tk.Toplevel(root)
+        _popup_ref["win"] = pop
         pop.title("PiEEG · REACT EEG connection")
         pop.configure(bg="#111318")
         pop.attributes("-topmost", True)     # stay above the scope until minimised
-        # Taller when a changelog is shown so the version history fits.
-        pop.geometry("460x540" if changelog else "420x210")
+        _COLLAPSED, _EXPANDED = "460x230", "460x560"
+        pop.geometry(_COLLAPSED)
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
         tk.Label(pop, text=header, bg="#111318", fg="#e6e6e6",
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(14, 2))
@@ -641,20 +657,32 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                  font=("TkDefaultFont", _fs(16), "bold")).pack()
         tk.Label(pop, text=f"({mode})", bg="#111318", fg="#e6e6e6",
                  font=("TkDefaultFont", _fs(10))).pack(pady=(0, 8))
-        tk.Label(pop, text="This stays in front so you can transcribe it.\n"
-                           "Minimise it when you're done — the live scope is "
-                           "running behind it.",
-                 bg="#111318", fg="#9aa4b2", justify="center").pack(pady=(0, 8))
 
-        # ---- version history (newest first) ------------------------------- #
+        btns = tk.Frame(pop, bg="#111318")
+        btns.pack(side="bottom", pady=(0, 10))
+        # iconify() minimises rather than closing, so it can be re-raised from
+        # the taskbar or the corner "IP" button; Close destroys it (the button
+        # rebuilds it on demand).
+        ttk.Button(btns, text="Minimise",
+                   command=lambda: pop.iconify()).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close",
+                   command=lambda: pop.destroy()).pack(side="left", padx=6)
+
+        # ---- collapsible version history --------------------------------- #
+        # Collapsed by default: just the current version title, clickable. Click
+        # to drop down the full, scrollable list of versions + details.
         if changelog:
-            tk.Label(pop, text="Version history", bg="#111318", fg="#9aa4b2",
-                     font=("TkDefaultFont", _fs(10), "bold")).pack(pady=(2, 2))
-            wrap = tk.Frame(pop, bg="#111318")
-            wrap.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-            sb = tk.Scrollbar(wrap)
+            state = {"open": False}
+            cur = f"v{version}  (current)" if version else "version history"
+            toggle = tk.Label(pop, text=f"▸  What's new · {cur}",
+                              bg="#111318", fg="#7fd1ff", cursor="hand2",
+                              font=("TkDefaultFont", _fs(10), "bold"))
+            toggle.pack(pady=(2, 2))
+
+            detail = tk.Frame(pop, bg="#111318")
+            sb = tk.Scrollbar(detail)
             sb.pack(side="right", fill="y")
-            txt = tk.Text(wrap, bg="#0b0d11", fg="#dbe1ea", bd=0,
+            txt = tk.Text(detail, bg="#0b0d11", fg="#dbe1ea", bd=0,
                           highlightthickness=0, wrap="word",
                           yscrollcommand=sb.set,
                           font=("TkDefaultFont", _fs(9)))
@@ -671,14 +699,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 txt.insert("end", note + "\n", ("note",))
             txt.configure(state="disabled")     # read-only
 
-        btns = tk.Frame(pop, bg="#111318")
-        btns.pack(pady=(0, 10))
-        # iconify() minimises rather than closing, so the info can be re-opened
-        # from the taskbar if the operator needs a second look.
-        ttk.Button(btns, text="Minimise",
-                   command=lambda: pop.iconify()).pack(side="left", padx=6)
-        ttk.Button(btns, text="Close",
-                   command=lambda: pop.destroy()).pack(side="left", padx=6)
+            def _toggle(_evt=None):
+                if state["open"]:
+                    detail.pack_forget()
+                    toggle.config(text=f"▸  What's new · {cur}")
+                    pop.geometry(_COLLAPSED)
+                else:
+                    detail.pack(fill="both", expand=True, padx=12, pady=(0, 8),
+                                before=btns)
+                    toggle.config(text=f"▾  What's new · {cur}")
+                    pop.geometry(_EXPANDED)
+                state["open"] = not state["open"]
+            toggle.bind("<Button-1>", _toggle)
+
         pop.protocol("WM_DELETE_WINDOW", pop.destroy)
         pop.update_idletasks()
         # Assert stacking once now and again shortly after the WM finishes
