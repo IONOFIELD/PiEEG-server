@@ -248,7 +248,7 @@ def main(argv=None):
                 "viewer. Close the window or press Shut down to stop the server.",
                 ip, args.port, mode, acq.num_channels, fs,
                 " · MOCK" if args.mock else "")
-    title = (f"PiEEG Scope   ·   REACT connects to  ws://{ip}:{args.port}"
+    title = (f"PiEEG Scope   ·   REACT EEG connects to  ws://{ip}:{args.port}"
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
     # ---- viewer (blocks in the main thread until the window closes) -------- #

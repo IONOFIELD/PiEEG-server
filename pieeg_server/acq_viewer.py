@@ -373,30 +373,32 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     style.configure("TButton", background="#22262e", foreground="#e6e6e6")
     style.configure("TMenubutton", background="#22262e", foreground="#e6e6e6")
 
-    # ---- top control bar -------------------------------------------------- #
-    bar = tk.Frame(root, bg="#111318")
-    bar.pack(side="top", fill="x", padx=8, pady=6)
-
-    def _menu(parent, label, values, initial, cb):
-        tk.Label(parent, text=label, bg="#111318", fg="#9aa4b2").pack(side="left", padx=(10, 2))
+    # Two compact control rows so everything fits on one screen: row 1 is the
+    # signal filters (+ the shutdown button / status), row 2 is the montage
+    # controls. Labels, padding and dropdown widths are kept tight on purpose.
+    def _menu(parent, label, values, initial, cb, width=None):
+        tk.Label(parent, text=label, bg="#111318",
+                 fg="#9aa4b2").pack(side="left", padx=(8, 2))
         var = tk.StringVar(value=initial)
-        om = ttk.OptionMenu(parent, var, initial, *values, command=lambda _v: cb(var.get()))
+        om = ttk.OptionMenu(parent, var, initial, *values,
+                            command=lambda _v: cb(var.get()))
+        if width:
+            om.configure(width=width)
         om.pack(side="left")
         return var
 
-    montage_var = _menu(bar, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
-                        lambda v: _switch_montage(v))
-    lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
-                    lambda v: _apply_filters())
-    hff_var = _menu(bar, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
-                    lambda v: _apply_filters())
-    notch_var = _menu(bar, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
-                      lambda v: _apply_filters())
-    sens_var = _menu(bar, "Sensitivity (uV/mm)", [str(s) for s in SENS_CHOICES],
-                     str(DEFAULT_SENS), lambda v: None)
+    # ---- row 1: signal filters (+ shutdown / status) --------------------- #
+    bar = tk.Frame(root, bg="#111318")
+    bar.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
-    ttk.Button(bar, text="Reset montage",
-               command=lambda: _reset_montage()).pack(side="left", padx=12)
+    lff_var = _menu(bar, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
+                    lambda v: _apply_filters(), width=6)
+    hff_var = _menu(bar, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
+                    lambda v: _apply_filters(), width=6)
+    notch_var = _menu(bar, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
+                      lambda v: _apply_filters(), width=6)
+    sens_var = _menu(bar, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
+                     str(DEFAULT_SENS), lambda v: None, width=5)
 
     # Optional operator shutdown control. Closing the window already ends the
     # session; this is the same action as a labelled, hard-to-miss red button
@@ -413,12 +415,18 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     status = tk.Label(bar, text="starting...", bg="#111318", fg="#9aa4b2")
     status.pack(side="right", padx=8)
 
-    # ---- bipolar channel picker (replaces the old click/drag list) -------- #
-    # Pick any two electrodes and Add them as a bipolar channel. Doing so
-    # builds the "Custom" montage and selects it; switch the Montage dropdown
-    # back to any preset at any time to snap to it.
+    # ---- row 2: montage controls (parallel to the filter row) ------------- #
+    # The montage picker + Reset, then the bipolar channel builder: pick any two
+    # electrodes and Add them as a bipolar channel, which builds the "Custom"
+    # montage and selects it; switch the Montage dropdown back to any preset at
+    # any time to snap to it.
     bar2 = tk.Frame(root, bg="#111318")
     bar2.pack(side="top", fill="x", padx=8, pady=(0, 4))
+
+    montage_var = _menu(bar2, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
+                        lambda v: _switch_montage(v), width=14)
+    ttk.Button(bar2, text="Reset",
+               command=lambda: _reset_montage()).pack(side="left", padx=(8, 14))
 
     # Each electrode is shown as "E1  Fp1" — the chip input AND its scalp site —
     # so you select by the physical electrode you seated on the head.
@@ -427,14 +435,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _disp_to_site = dict(elec_choices)
     _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
 
-    tk.Label(bar2, text="Bipolar channel:", bg="#111318",
-             fg="#9aa4b2").pack(side="left", padx=(10, 4))
+    tk.Label(bar2, text="Bipolar:", bg="#111318",
+             fg="#9aa4b2").pack(side="left", padx=(6, 4))
     a_var = tk.StringVar(value=elec_display[0])
     ttk.OptionMenu(bar2, a_var, elec_display[0], *elec_display).pack(side="left")
     tk.Label(bar2, text="–", bg="#111318", fg="#e6e6e6").pack(side="left", padx=4)
     b_var = tk.StringVar(value=_b_default)
     ttk.OptionMenu(bar2, b_var, _b_default, *elec_display).pack(side="left")
-    ttk.Button(bar2, text="+ Add channel",
+    ttk.Button(bar2, text="+ Add",
                command=lambda: _add_bipolar()).pack(side="left", padx=8)
     pick_hint = tk.Label(bar2, text="", bg="#111318", fg="#9aa4b2")
     pick_hint.pack(side="left", padx=6)
@@ -615,7 +623,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         pop.configure(bg="#111318")
         pop.attributes("-topmost", True)     # stay above the scope until minimised
         pop.geometry("420x210")
-        tk.Label(pop, text="Connect REACT to", bg="#111318", fg="#9aa4b2",
+        tk.Label(pop, text="Connect REACT EEG to", bg="#111318", fg="#9aa4b2",
                  font=("TkDefaultFont", 11)).pack(pady=(18, 2))
         tk.Label(pop, text=f"ws://{ip}:{port}", bg="#111318", fg="#7fd1ff",
                  font=("TkDefaultFont", 16, "bold")).pack()
