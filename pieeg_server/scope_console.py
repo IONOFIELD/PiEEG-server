@@ -93,6 +93,9 @@ SCOPE_CHANGELOG = [
             "group. The connection popup is sized to hug its content and only "
             "grows when you open the patch notes. Version numbering kept to a "
             "single decimal from here on."),
+    ("2.1", "Connection popup now carries its own top navigation bar with "
+            "Minimise and Close, since the Pi's window manager doesn't draw "
+            "title-bar controls on it."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
