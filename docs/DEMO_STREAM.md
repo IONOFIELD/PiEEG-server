@@ -1,71 +1,85 @@
-# Demo stream runbook — live EEG to one laptop, hardened
+# PiEEG demo-day runbook (printable — works with NO internet)
 
-This is the step-by-step guide for **demo mode**: the Pi (battery powered,
-electrodes on a person) streams live EEG to **one laptop** over an encrypted,
-token-authenticated WebSocket (`wss`).
+**Print this page.** Once the demo starts, the Pi's Wi-Fi goes down: no
+internet, no Claude Code, no online help. Every command below runs in a plain
+terminal on the Pi (or the laptop where marked). Commands are shown one per
+line — type them exactly.
 
-It is a **separate, additive path**. The local kiosk
-(`launch_pieeg.sh` + `ws_server.py` on `ws://127.0.0.1:1620`) is untouched and
-still works exactly as before. The demo streamer runs independently on its own
-port (**1621**) and only *reads* frames via `acquisition.subscribe()` — same
-microvolt payload, same `seq` numbering.
+**The link:** Pi `192.168.77.1` ⇄ Ethernet cable ⇄ laptop `192.168.77.2`,
+stream on `wss://192.168.77.1:1621`. (192.168.77.x is used because the house
+Wi-Fi already occupies 10.0.0.x — reusing that range on the cable would clash
+with the router.)
 
-## Security model, in one paragraph
+**Security model in one paragraph:** the shared-secret **token** is the real
+access control — a client that doesn't present it as its first message is
+disconnected before any EEG flows, and rejections are logged (the token itself
+is never logged). TLS (`wss`) encrypts the wire. The server binds **only** to
+192.168.77.1 (never 0.0.0.0) and refuses to start if that IP is absent. After
+binding, it turns **Wi-Fi off** so the stream exists only on the cable. A
+firewall rule (step 8) additionally limits the port to the laptop's IP.
+One client at a time.
 
-The **token is the access control**: a client that does not present the shared
-secret as its very first message is disconnected before any EEG is sent, and
-the rejection is logged (the token itself is never logged or printed).
-Everything else is defence in depth: TLS (`wss`) encrypts the wire; the server
-binds to **one specific interface IP, never 0.0.0.0**, and refuses to start if
-that IP is missing; on Wi-Fi a **single-client cap** applies; and an optional
-firewall rule limits the port to the laptop's IP.
+> Logging caution: pieeg code never logs the token, but the `websockets`
+> library traces raw payloads if its loggers are set to DEBUG. Never enable
+> DEBUG logging during a real demo (the default INFO setup is safe).
 
-> **Logging caution:** pieeg code never logs the token, but the `websockets`
-> *library* traces raw message payloads when its loggers are set to DEBUG.
-> Never run a real demo with `websockets` DEBUG logging enabled (the default
-> INFO setup in `demo_stream.py` is safe).
+---
 
-## Network modes (decided at startup, printed loudly)
+## PART A — days before, while you still have internet
 
-| Condition on startup | Mode | What happens |
-|---|---|---|
-| `eth0` carrier UP **and** has 192.168.77.1 | **Ethernet** (preferred demo posture) | Binds `wss://192.168.77.1:1621`, then turns **Wi-Fi OFF** so the stream exists only on the wire. |
-| Otherwise, `wlan0` has an IPv4 | **Wi-Fi** | Binds `wss://<wifi-ip>:1621`. Token required as always; max 1 client. |
-| Neither | — | **Refuses to start.** Never falls back to a broad bind. |
+### A1. One-time Pi setup (skip any step already done)
 
-Wi-Fi does **not** come back by itself after an Ethernet demo — run
-`scripts/demo/wifi_restore.sh`.
-
-## One-time setup (on the Pi)
-
-```bash
+```
 cd ~/PiEEG-server
+```
 
-# 1. Create the shared-secret token (gitignored; never commit, never paste in chat)
+- Create the token (a random secret; gitignored; never commit or paste it anywhere):
+```
 mkdir -p config
 python3 -c "import secrets; print(secrets.token_urlsafe(32))" > config/demo_token
 chmod 600 config/demo_token
+```
 
-# 2. Generate the TLS certificate (covers 192.168.77.1 + current Wi-Fi IP)
+- Generate the TLS certificate (covers 192.168.77.1 automatically):
+```
 ./scripts/demo/gen_demo_cert.sh
 ```
 
-Alternatively the token can live in the environment instead of the file:
-`export PIEEG_DEMO_TOKEN=...` (the env var wins if both exist).
+- Configure the Ethernet demo IP. After this, plugging the cable in gives
+  eth0 the address 192.168.77.1 **automatically**; with no cable, Wi-Fi and
+  everything else behave exactly as before:
+```
+./scripts/demo/demo_eth_up.sh
+```
 
-## One-time setup (on the laptop)
+  - To undo later: `./scripts/demo/demo_eth_down.sh` (add `--delete` to
+    remove the profile completely).
 
-1. Copy the **certificate** (not the key!) to the laptop:
-   `scp pi:~/PiEEG-server/certs/demo/demo-cert.pem .`
-2. Copy the token to the laptop by a private channel (e.g. the same `scp`).
-3. Point the client at the cert. Python example:
+### A2. One-time laptop setup
+
+- Copy the certificate and token from the Pi (over Wi-Fi, while it's still up;
+  replace `<pi-wifi-ip>` — find it on the Pi with `hostname -I`):
+```
+scp ionofield@<pi-wifi-ip>:~/PiEEG-server/certs/demo/demo-cert.pem .
+scp ionofield@<pi-wifi-ip>:~/PiEEG-server/config/demo_token .
+```
+  Never move the token by chat, email, or anything cloud-synced.
+
+- Set the laptop's **wired** interface to a static address:
+  IP `192.168.77.2`, netmask `255.255.255.0`, **no gateway** — so the laptop
+  keeps using its own Wi-Fi for internet while the cable carries only EEG.
+  (macOS: System Settings → Network → the USB-Ethernet adapter → Details →
+  TCP/IP → Configure IPv4: Manually. Windows: Adapter settings → IPv4
+  Properties.)
+
+- Test client (Python; needs `pip install websockets`). Save as `eeg_client.py`
+  next to the two copied files:
 
 ```python
 import asyncio, json, ssl, websockets
 
-PI = "192.168.77.1"          # or the Pi's Wi-Fi IP in Wi-Fi mode
+PI = "192.168.77.1"
 TOKEN = open("demo_token").read().strip()
-
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.load_verify_locations("demo-cert.pem")   # trust exactly this Pi
 
@@ -81,71 +95,121 @@ async def main():
 asyncio.run(main())
 ```
 
-For a browser client, import `demo-cert.pem` into the OS/browser trust store
-(macOS: Keychain Access → System → import, set "Always Trust"; the page can
-then open `wss://192.168.77.1:1621`). For the direct Ethernet link, set the
-laptop's wired interface to a static IP `192.168.77.2`, netmask `255.255.255.0`,
-no gateway.
+  For a browser client instead: import `demo-cert.pem` into the OS trust
+  store (macOS: Keychain Access → System → import → set "Always Trust").
 
-## Demo day — Ethernet (preferred)
+### A3. Dress rehearsal (STRONGLY recommended, same room, no electrodes)
 
-```bash
-# On the Pi:
-./scripts/demo/demo_eth_up.sh          # static 192.168.77.1 on eth0
-# plug in the cable to the laptop (laptop wired IP = 192.168.77.2)
+Run PART B end-to-end once with the actual cable and laptop. Everything in
+PART B is offline-safe, and PART C brings Wi-Fi back.
 
-# optional but recommended — firewall the port to the laptop only:
+---
+
+## PART B — demo day, in order
+
+### B1. Physical setup
+
+- Pi on battery, PiEEG hat on, electrodes connected.
+- Ethernet cable: Pi ⇄ laptop. Laptop lid open/awake.
+
+### B2. Confirm the link is ready (Pi terminal)
+
+```
+cd ~/PiEEG-server
+./scripts/demo/demo_preflight.sh
+```
+
+Expected: four `[ OK ]` lines and `RESULT: READY`. Each possible failure is
+printed with its fix. Do not continue until it says READY.
+
+(Manual equivalents, if you ever want them:
+`cat /sys/class/net/eth0/carrier` should print `1`, and
+`ip -brief addr show dev eth0` should show `192.168.77.1/24`.)
+
+### B3. (Recommended) firewall: restrict the port to the laptop only
+
+```
 sudo ./scripts/demo/demo_firewall.sh apply 192.168.77.2
+```
 
-# start the stream (this will turn Wi-Fi OFF once the socket is bound):
+### B4. Start the stream (Pi terminal, or the "PiEEG Demo Stream" desktop icon)
+
+```
 cd ~/PiEEG-server
-.venv/bin/python -m pieeg_server.demo_stream
+./scripts/demo/start_demo_stream.sh
 ```
 
-The laptop connects to `wss://192.168.77.1:1621`, sends the auth message,
-gets the hello, then frames.
+This first shows a popup + terminal banner with the exact connect target
+(`wss://192.168.77.1:1621` in Ethernet mode) — the address comes from the
+server's own interface detection, never a hard-coded value — then starts the
+stream. (Running `.venv/bin/python -m pieeg_server.demo_stream` directly is
+equivalent, just without the popup.)
 
-## Demo day — Wi-Fi fallback (no cable)
+Watch the startup lines. You must see, in this order:
+- `Demo stream: wss://192.168.77.1:1621 (mode=ethernet, ...)`
+- `... bringing Wi-Fi DOWN now ...`   ← Wi-Fi drops **only after** the bind
 
-```bash
-# optional firewall, using the LAPTOP's Wi-Fi IP:
-sudo ./scripts/demo/demo_firewall.sh apply <laptop-wifi-ip>
+If instead it says `mode=wifi` → the cable/IP wasn't ready; press Ctrl-C,
+redo B2. If it says `refusing to start` → read its message; it names the fix.
 
-cd ~/PiEEG-server
-.venv/bin/python -m pieeg_server.demo_stream
+### B5. Verify the exposure is closed (second Pi terminal)
+
+- Socket is on the Ethernet IP only (expect exactly one line, showing
+  `192.168.77.1:1621` — NOT `0.0.0.0` and NOT a `10.0.0.x` address):
+```
+ss -tlnp | grep 1621
+```
+- Wi-Fi is really down (expect `enabled` for WWAN column irrelevant; the
+  WIFI column must say `disabled`):
+```
+nmcli radio wifi
 ```
 
-The startup log prints the exact `wss://<wifi-ip>:1621` address. Only one
-client may be connected at a time; the token is still required.
+### B6. Connect the laptop
 
-## Tear-down (after the demo)
-
-```bash
-# stop the streamer with Ctrl-C, then:
-./scripts/demo/wifi_restore.sh                 # Wi-Fi back on (Ethernet demos)
-sudo ./scripts/demo/demo_firewall.sh remove    # remove the port restriction
-./scripts/demo/demo_eth_down.sh                # release the demo static IP
+```
+python3 eeg_client.py
 ```
 
-## Rehearsal without hardware
+Expected: one `hello` line, then a continuous stream of frames. On the Pi
+you'll see `Authenticated demo client ('192.168.77.2', ...)`.
 
-`--mock` streams synthetic data through the identical network/auth path —
-use it to verify the laptop's cert + token setup before electrodes go on:
+Quick auth check (optional): run the client once with a wrong token in
+`demo_token` — it must be disconnected with close code 4401, and the Pi log
+shows `REJECTED ... invalid auth`. Restore the correct token file afterwards.
 
-```bash
-.venv/bin/python -m pieeg_server.demo_stream --mock
+---
+
+## PART C — tear-down (after the demo)
+
+- Stop the stream: **Ctrl-C** in its terminal.
+- Wi-Fi back on (it does NOT return by itself):
+```
+./scripts/demo/wifi_restore.sh
+```
+- Remove the firewall rule:
+```
+sudo ./scripts/demo/demo_firewall.sh remove
+```
+- (Optional) release the demo Ethernet config until next time:
+```
+./scripts/demo/demo_eth_down.sh
 ```
 
-## Troubleshooting
+---
 
-- **"refusing to start — no token found"** → do step 1 of one-time setup.
-- **"refusing to start — TLS cert/key not found"** → run `gen_demo_cert.sh`.
-- **"refusing to start — no usable interface"** → this is deliberate: the
-  server never binds broadly. Bring up Ethernet (`demo_eth_up.sh` + cable)
-  or Wi-Fi first.
-- **Laptop gets `certificate verify failed`** → the cert doesn't list the IP
-  you dialed. Re-run `gen_demo_cert.sh` (it embeds the current Wi-Fi IP) and
-  copy the new `demo-cert.pem` over.
-- **Client closes with code 4401** → missing/wrong token. Check
-  `config/demo_token` on the Pi vs. the copy on the laptop.
-- **Client closes with code 4409** → another client is already connected.
+## Offline troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| preflight: `no cable link` | Reseat both cable ends; try another cable/port; laptop must be awake. |
+| preflight: `demo IP ... NOT on eth0` | `./scripts/demo/demo_eth_up.sh`, then unplug/replug the cable. |
+| Startup says `mode=wifi` with cable in | Cable came up after the check — Ctrl-C, run preflight, start again. |
+| `refusing to start — no token found` | PART A step A1 (token). |
+| `refusing to start — TLS cert/key not found` | PART A step A1 (cert). |
+| Laptop: `certificate verify failed` | Laptop's `demo-cert.pem` is stale — recopy it from the Pi. |
+| Laptop: closed with code 4401 | Token mismatch: laptop `demo_token` ≠ Pi `config/demo_token`. |
+| Laptop: closed with code 4409 | Another client is connected — only one allowed. Close it first. |
+| Laptop: connection refused/timeout | Laptop wired IP must be exactly 192.168.77.2 (B6 needs A2's static IP); firewall applied with a different IP? `sudo ./scripts/demo/demo_firewall.sh status` |
+| Need Wi-Fi back mid-demo | `nmcli radio wifi on` (or `./scripts/demo/wifi_restore.sh`). |
+| Stream died and won't restart ("resource busy") | Wait 5 s and retry — the SPI device frees on clean exit. If stuck: `pkill -f demo_stream`, wait, retry. |
