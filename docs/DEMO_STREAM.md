@@ -132,18 +132,34 @@ printed with its fix. Do not continue until it says READY.
 sudo ./scripts/demo/demo_firewall.sh apply 192.168.77.2
 ```
 
-### B4. Start the stream (Pi terminal, or the "PiEEG Demo Stream" desktop icon)
+### B4. Start the console (Pi terminal, or the "PiEEG - REACT EEG" desktop icon)
 
 ```
 cd ~/PiEEG-server
-./scripts/demo/start_demo_stream.sh
+./scripts/demo/start_demo_console.sh
 ```
 
-This first shows a popup + terminal banner with the exact connect target
-(`wss://192.168.77.1:1621` in Ethernet mode) — the address comes from the
-server's own interface detection, never a hard-coded value — then starts the
-stream. (Running `.venv/bin/python -m pieeg_server.demo_stream` directly is
-equivalent, just without the popup.)
+This does BOTH demo jobs in one launch:
+- serves the laptop over `wss://192.168.77.1:1621` (token auth, one client),
+- opens a **local live EEG viewer** on the Pi's screen so you can watch the
+  electrodes yourself.
+
+It first shows a popup + terminal banner with the exact connect target — the
+address comes from the server's own interface detection, never a hard-coded
+value. **Closing the viewer window ends the whole session** (stream stops, SPI
+freed, Wi-Fi turned back on if it had been dropped).
+
+Using the local viewer:
+- **HFF / LFF / Sensitivity** dropdowns — the usual EEG review filters and
+  trace height.
+- **Montage** dropdown — Double banana / Transverse / Circumferential
+  (bipolar, from the 8 inputs Fp1 Fp2 C3 C4 T3 T4 O1 O2).
+- **Leads column (left)** — *click* a lead to turn it off/on; *drag* to
+  reorder. Session-only; never overwrites the three presets. "Reset montage"
+  restores the current preset.
+
+(Stream only, no viewer: `./scripts/demo/start_demo_stream.sh`. Viewer only,
+no hardware: `.venv/bin/python -m pieeg_server.acq_viewer --mock`.)
 
 Watch the startup lines. You must see, in this order:
 - `Demo stream: wss://192.168.77.1:1621 (mode=ethernet, ...)`
@@ -182,8 +198,21 @@ shows `REJECTED ... invalid auth`. Restore the correct token file afterwards.
 
 ## PART C — tear-down (after the demo)
 
-- Stop the stream: **Ctrl-C** in its terminal.
-- Wi-Fi back on (it does NOT return by itself):
+**Easiest:** just close the viewer window. The console stops the stream,
+frees the SPI bus, and turns Wi-Fi back on for you.
+
+**If Wi-Fi did not come back** (console was killed hard, or you used the
+stream-only launcher) — run the **"PiEEG Shutdown (restore Wi-Fi)"** desktop
+icon, or:
+```
+./scripts/demo/shutdown_demo.sh
+```
+This stops any stream/console process, turns Wi-Fi back on, and removes the
+firewall rule if present.
+
+Manual equivalents, if you prefer them:
+- Stop the stream: **Ctrl-C** in its terminal (or close the viewer).
+- Wi-Fi back on:
 ```
 ./scripts/demo/wifi_restore.sh
 ```
