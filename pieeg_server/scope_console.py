@@ -48,11 +48,12 @@ logger = logging.getLogger("pieeg.scope_console")
 
 # ── PiEEG Scope version history ──────────────────────────────────────────────
 # The Scope's own product version (separate from the repo's git tags). It starts
-# at 1.0 and every shipped update bumps it by 0.1; SCOPE_VERSION below is always
-# the last entry. The connect popup shows this whole chain and the window title
-# shows the current version. When you ship the next Scope update, append one
-# ("1.6", "…") line here — that keeps the version, the title and the popup notes
-# in lockstep from a single source.
+# at 1.0 and every shipped update bumps it by 0.1, kept to a SINGLE decimal
+# place (…1.9 → 2.0 → 2.1 … 2.9 → 3.0). SCOPE_VERSION below is always the last
+# entry. The connect popup shows this whole chain and the window title shows the
+# current version. When you ship the next Scope update, append one ("2.1", "…")
+# line here — that keeps the version, the title and the popup notes in lockstep
+# from a single source.
 SCOPE_CHANGELOG = [
     ("1.0", "Consolidated PiEEG Scope: one launch = ws://<ip>:1616 server + web "
             "dashboard + webhooks + an in-process live 10-second lead viewer "
@@ -86,6 +87,12 @@ SCOPE_CHANGELOG = [
             "so Add clearly belongs to the channel it builds. The corner \"IP\" "
             "button gets a black outline. Removed the connection popup's in-"
             "window Minimise/Close buttons — its title bar already has both."),
+    ("2.0", "Milestone: the Scope now matches the REACT EEG dashboard end to "
+            "end. Every control cluster (montage, bipolar builder, filters, "
+            "sensitivity) is a bordered chip, so related controls read as one "
+            "group. The connection popup is sized to hug its content and only "
+            "grows when you open the patch notes. Version numbering kept to a "
+            "single decimal from here on."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
