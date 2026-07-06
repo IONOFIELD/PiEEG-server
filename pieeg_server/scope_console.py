@@ -82,6 +82,10 @@ SCOPE_CHANGELOG = [
             "labels, the dashboard's canvas-blue trace, and the signature "
             "blue→green gradient hairline. Added a live signal dot (green = "
             "frames flowing, yellow = stalled, red = none)."),
+    ("1.9", "Bipolar picker and its \"+ Add\" button are now one bordered group "
+            "so Add clearly belongs to the channel it builds. The corner \"IP\" "
+            "button gets a black outline. Removed the connection popup's in-"
+            "window Minimise/Close buttons — its title bar already has both."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
