@@ -718,7 +718,18 @@ class PiEEGHardware:
 
         # Register configuration (matches original PiEEG scripts)
         self._write_register(chip_num, 0x14, 0x80)  # GPIO
-        self._write_register(chip_num, CONFIG1, 0x96)
+        # CONFIG1 selects the sample rate. 0x96 is 250 SPS, the board default
+        # and an EEG choice; low three bits are the data-rate divider
+        # (0x95=500, 0x94=1000, 0x93=2000, 0x92=4000). Surface EMG carries power
+        # to ~450 Hz, so 250 SPS discards everything above 125 Hz.
+        #
+        # Read from the environment so this stays opt-in and reversible: unset,
+        # the board behaves exactly as it always has. The register API refuses
+        # CONFIG1 writes on purpose, because changing the rate under a running
+        # filter chain is silent and destructive, so it has to happen here.
+        config1 = int(os.environ.get("PIEEG_CONFIG1", "0x96"), 0)
+        logger.info("WREG CONFIG1 <- 0x%02X (sample rate)", config1)
+        self._write_register(chip_num, CONFIG1, config1)
         self._write_register(chip_num, CONFIG2, 0xD4)
         self._write_register(chip_num, CONFIG3, 0xFF)
         self._write_register(chip_num, LOFF, LOFF_DC_95_5)  # DC lead-off, 95%/5%
