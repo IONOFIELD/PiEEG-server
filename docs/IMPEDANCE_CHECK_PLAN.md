@@ -1,8 +1,9 @@
 # Impedance check for the PiEEG Scope: plan
 
-Status: **plan only, not implemented.** Scope v2.7 already has the display slots it
-will fill: the `GND` dot and the `AVG IMP —` box in the status bar, and the
-per-electrode contact dots on each lead.
+Status: **phase 1 built** (`pieeg_server/impedance.py` + a bench tool, AC lead-off in
+the mock, tests); ran on the board with nothing attached (registers switch and restore).
+**Next: bench calibration (§7).** The Scope UI comes after that; v2.7 already has the
+display slots it will fill: the `GND` dot, the `AVG IMP —` box, and the contact dots.
 
 ## 1. The hardware this is for (read off the board, 2026-09-16)
 
@@ -135,6 +136,22 @@ therefore be a **short, explicit, operator-started mode, never a background task
 **Parts:** 1% metal-film resistors (1k, 4.7k, 10k, 22k, 47k, 100k, 220k, 470k, 1M),
 jumper wires.
 
+**Tool** (close the Scope first; it needs the SPI bus):
+
+```
+cd /mnt/pieeg128/PiEEG-server
+.venv/bin/python -m pieeg_server.impedance measure               # table of all readings
+.venv/bin/python -m pieeg_server.impedance bench --ohms 10000    # record: resistor on leads 1-8
+.venv/bin/python -m pieeg_server.impedance bench --ohms 47000 --channels 1,3
+.venv/bin/python -m pieeg_server.impedance bench --ohms 10000 --ref   # resistor on REF
+.venv/bin/python -m pieeg_server.impedance fit --dry-run         # show the fit
+.venv/bin/python -m pieeg_server.impedance fit                   # save it
+```
+
+Readings accumulate in `~/.config/pieeg/impedance_bench.json`; `fit` writes
+`~/.config/pieeg/impedance_cal.json`, which every later check loads. `measure` ends
+with a register readback, which is step 5 below.
+
 **Test rig:** make a "body" node. Wire GND straight to it, REF to it through 1 kΩ, and
 each lead through its test resistor.
 
@@ -175,7 +192,7 @@ each lead through its test resistor.
   - GND and AVG IMP display slots; REF shown live
   - Interrupt acquisition plus the restart fix
   - Real sample rate
-- **Phase 1:** `impedance.py`, mock simulation and tests (no hardware needed).
+- **Phase 1 (done):** `impedance.py`, mock simulation, tests, bench CLI.
 - **Phase 2:** bench calibration and validation (§7).
 - **Phase 3:** the Scope's Z check and overlay; fill AVG IMP and GND; server pause and
   status messages.

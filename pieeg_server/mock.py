@@ -27,6 +27,17 @@ CH7SET = 0x0B
 CH8SET = 0x0C
 CH_REGS = (CH1SET, CH2SET, CH3SET, CH4SET, CH5SET, CH6SET, CH7SET, CH8SET)
 
+# Lead-off registers (mirrors hardware.py) for the impedance-check simulation
+LOFF = 0x04
+LOFF_SENSP = 0x0F
+LOFF_SENSN = 0x10
+LEADOFF_EXCITATION_HZ = 2_048_000 / 2 ** 16      # FLEAD_OFF = 10: 31.25 Hz
+LEADOFF_CURRENT_A = (6e-9, 24e-9, 6e-6, 24e-6)   # ILEAD_OFF[1:0]
+FULL_SCALE_UV = 4.5e6 / 24                       # ±187.5 mV at gain x24
+# Plausible wet-gel electrode impedances (ohms), repeated for 16 channels.
+DEFAULT_LEAD_OHMS = (4700, 6800, 9100, 12000, 18000, 8200, 5600, 33000)
+DEFAULT_REF_OHMS = 5100
+
 
 class MockHardware:
     """Drop-in replacement for PiEEGHardware that generates synthetic data."""
@@ -55,6 +66,10 @@ class MockHardware:
         # Lead-off (electrode contact): 1-based channel numbers reported "off".
         # Empty = every electrode connected. Settable for exercising the path.
         self._leadoff_off: set[int] = set()
+        # Simulated electrode impedances for AC lead-off (impedance check).
+        self._lead_ohms = [DEFAULT_LEAD_OHMS[i % len(DEFAULT_LEAD_OHMS)]
+                           for i in range(self._num_channels)]
+        self._ref_ohms = DEFAULT_REF_OHMS
 
     @property
     def num_channels(self) -> int:
@@ -136,7 +151,43 @@ class MockHardware:
                     blink = random.uniform(100, 300)
                 channels.append(round(alpha + drift + noise + blink, 2))
 
-        return channels
+        return self._apply_ac_leadoff(channels, t)
+
+    # --- AC lead-off (impedance check) simulation ---
+
+    def set_impedances(self, lead_ohms=None, ref_ohms=None):
+        """Set the simulated per-channel lead and REF impedances (ohms)."""
+        if lead_ohms is not None:
+            self._lead_ohms = [float(z) for z in lead_ohms]
+        if ref_ohms is not None:
+            self._ref_ohms = float(ref_ohms)
+
+    def _apply_ac_leadoff(self, channels, t):
+        """Add the AC lead-off carrier when LOFF selects AC at 31.25 Hz.
+
+        Each sensed lead (LOFF_SENSP) carries I·Z_lead; each sensed N input
+        (LOFF_SENSN, all tied to SRB1/REF) adds -I·Z_ref to every channel.
+        The square wave is band-limited to what the ADC passes (fundamental
+        and 3rd harmonic), so its fundamental is exactly (4/pi)·I·Z. Leads in
+        the lead-off pattern float and rail, as they do on the real board.
+        """
+        loff = self._register_state.get(LOFF, 0x00)
+        if (loff & 0x03) != 0x02:
+            return channels
+        current = LEADOFF_CURRENT_A[(loff >> 2) & 0x03]
+        sensp = self._register_state.get(LOFF_SENSP, 0xFF)
+        n_sources = bin(self._register_state.get(LOFF_SENSN, 0xFF) & 0xFF).count("1")
+        w = 2 * math.pi * LEADOFF_EXCITATION_HZ * t
+        shape = (4 / math.pi) * (math.sin(w) + math.sin(3 * w) / 3)
+        out = []
+        for ch, v in enumerate(channels):
+            if (ch + 1) in self._leadoff_off:
+                out.append(FULL_SCALE_UV)
+                continue
+            z = self._lead_ohms[ch] if sensp & (1 << (ch % 8)) else 0.0
+            z -= n_sources * self._ref_ohms
+            out.append(round(v + shape * current * z * 1e6, 2))
+        return out
 
     def __enter__(self):
         self.open()
