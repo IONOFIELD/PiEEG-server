@@ -875,9 +875,10 @@ class PiEEGServer:
         """Push the latest per-channel electrode-contact readout to clients.
 
         Message: {"status":"leadoff","channels":[{"ch","off","p_off","n_off",
-        "state"}],"ts":<unix>}. "off" is true when floating/high-impedance;
-        "state" is a green/amber/red verdict (both/one/neither input off) for a
-        direct client readout. Low rate, additive to the sample stream.
+        "state"}],"ts":<unix>}. "off" is true when the electrode is floating /
+        high-impedance and "state" is its green/red verdict. n_off is raw and
+        not meaningful on the PiEEG-8 (see hardware.leadoff_state). Low rate,
+        additive to the sample stream.
         """
         if not self._clients or not self._leadoff_supported():
             return
