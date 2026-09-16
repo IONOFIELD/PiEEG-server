@@ -231,7 +231,10 @@ class AcquisitionLoop:
                 self._drdy_events += 1
                 if self._first_event_ns is None:
                     self._first_event_ns = ts_ns
-                else:
+                if prev_ns is not None:
+                    # prev_ns is None on the first edge of every run, including
+                    # after restart_with_config(): the deliberate pause for the
+                    # register write is not an interval, and not a drop.
                     interval = ts_ns - prev_ns
                     if interval > self._max_interval_ns:
                         self._max_interval_ns = interval

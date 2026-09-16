@@ -668,3 +668,67 @@ class TestAcquisitionRestartWithConfig:
 
         acq.stop()
         loop.close()
+
+
+class TestInterruptLoopRestart:
+    """The interrupt acquisition loop must survive restart_with_config()."""
+
+    class _EdgeHardware:
+        """Fake SPI hardware: DRDY edges every 4 ms of kernel time."""
+
+        num_channels = 8
+        sample_rate = 250
+        spike_threshold = -1
+
+        def __init__(self):
+            import threading
+            self._ts = 1_000_000_000
+            self._lock = threading.Lock()
+            self.registers = {}
+
+        def enable_drdy_events(self):
+            pass
+
+        def disable_drdy_events(self):
+            pass
+
+        def stop_streaming(self):
+            pass
+
+        def wait_drdy_event(self, timeout=0.5):
+            import time
+            time.sleep(0.004)
+            with self._lock:
+                self._ts += 4_000_000
+                return self._ts
+
+        def read_sample(self):
+            return [0.0] * 8
+
+        def configure_registers(self, reg_map):
+            with self._lock:
+                self._ts += 500_000_000   # the write pauses the edge stream
+            self.registers.update(reg_map)
+
+    def test_frames_keep_flowing_after_restart(self):
+        import asyncio
+        import time
+        from pieeg_server.acquisition import AcquisitionLoop
+
+        loop = asyncio.new_event_loop()
+        hw = self._EdgeHardware()
+        acq = AcquisitionLoop(hw, loop, interrupt=True)
+        acq.start()
+        time.sleep(0.2)
+        acq.restart_with_config({0x05: 0x61})
+        before = acq.capture_stats()["frames_read"]
+        time.sleep(0.4)
+        stats = acq.capture_stats()
+        acq.stop()
+        loop.close()
+
+        assert acq._thread is not None and not acq._thread.is_alive()
+        assert stats["frames_read"] > before, "acquisition died after restart"
+        # The register-write pause is not counted as dropped samples.
+        assert stats["dropped_frames"] == 0
+        assert hw.registers == {0x05: 0x61}
