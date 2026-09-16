@@ -36,6 +36,15 @@ class TestRegisters:
     def test_ref_pass_uses_one_n_source(self):
         assert imp.REF_PASS == {LOFF: 0x02, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01}
 
+    def test_lead_pass_mask_excites_only_given_leads(self):
+        assert imp.lead_pass(0x7E)[LOFF_SENSP] == 0x7E
+
+    def test_excitation_mask_follows_connected_leads(self):
+        contact = {"leads": ["red"] + ["green"] * 6 + ["red"],
+                   "ref": "green", "gnd": "green"}
+        assert imp.excitation_mask(contact) == 0x7E
+        assert imp.excitation_mask(None) == 0xFF
+
     def test_restore_matches_dc_lead_off_boot_config(self):
         assert imp.DC_RESTORE == {LOFF: 0x00, LOFF_SENSP: 0xFF, LOFF_SENSN: 0xFF}
 
@@ -99,6 +108,39 @@ class TestCalibration:
         assert cal.lead_ohms(50) == pytest.approx(2800)
         assert cal.lead_ohms(1) == 0.0
 
+    def test_per_lead_zero_is_subtracted(self):
+        cal = imp.Calibration(lead_gain=100.0, lead_zero_uv=[33.0, 35.0])
+        assert cal.lead_ohms(43.0, 0) == pytest.approx(1000)
+        assert cal.lead_ohms(43.0, 1) == pytest.approx(800)
+        assert cal.lead_ohms(30.0, 0) == 0.0          # below zero clamps
+        assert cal.lead_ohms(43.0) == pytest.approx(4300)   # no index: raw
+
+    @staticmethod
+    def _bench(ohms, carriers):
+        return [{"pass": "lead", "name": f"E{i}", "ohms": ohms, "carrier_uv": c}
+                for i, c in enumerate(carriers, 1)]
+
+    def test_fit_with_shorts_only_records_zeros(self):
+        zeros = [31.9, 33.4, 33.0, 32.7, 34.1, 32.4, 33.6, 35.6]
+        pts = self._bench(0, zeros) + self._bench(0, [z + 0.1 for z in zeros])
+        cal, report = imp.fit_calibration(pts)
+        assert cal.source == "zeroed"
+        assert cal.lead_zero_uv == pytest.approx([z + 0.05 for z in zeros])
+        assert cal.lead_gain == imp.THEORY_GAIN_OHM_PER_UV
+        assert any("no resistor readings" in line for line in report)
+
+    def test_fit_with_shorts_and_resistors_fits_gain_on_zeroed_carrier(self):
+        zeros = [30.0 + i for i in range(8)]
+        gain = 120.0
+        pts = self._bench(0, zeros)
+        for ohms in (4700, 10000, 47000):
+            pts += self._bench(ohms, [z + ohms / gain for z in zeros])
+        cal, _ = imp.fit_calibration(pts)
+        assert cal.source == "bench"
+        assert cal.lead_gain == pytest.approx(gain)
+        assert cal.lead_offset == pytest.approx(0.0, abs=1e-6)
+        assert cal.lead_ohms(zeros[3] + 10000 / gain, 3) == pytest.approx(10000)
+
     def test_fit_recovers_gain_and_offset(self):
         pts = [((z + 2200) / 125.0, z) for z in (1000, 4700, 10000, 47000, 100000)]
         gain, offset, r2, err = imp.fit_line(pts)
@@ -106,6 +148,13 @@ class TestCalibration:
         assert offset == pytest.approx(2200.0)
         assert r2 == pytest.approx(1.0)
         assert err < 1e-9
+
+    def test_fit_error_is_within_10pct_or_1k(self):
+        # a 0 Ω short read as 900 Ω and 100 kΩ read as 109 kΩ both pass
+        pts = [(0.0, 0), (900 / 130.9, 0), (109_000 / 130.9, 100_000),
+               (100_000 / 130.9, 100_000)]
+        *_, err = imp.fit_line(pts)
+        assert err <= 0.1
 
     def test_fit_needs_two_values(self):
         with pytest.raises(ValueError):
@@ -151,8 +200,7 @@ class TestResult:
     def _result(self):
         leads = [_reading(f"E{i}", z) for i, z in
                  enumerate([5000, 7000, 9000, None, 20000, 3e6, 1000, 2000], 1)]
-        return imp.ImpedanceResult(leads, _reading("REF", 4000), "green",
-                                   250.0, "theory")
+        return imp.ImpedanceResult(leads, "green", "green", 250.0, "theory")
 
     def test_average_over_montage_channels(self):
         assert self._result().average_ohms([1, 2, 3]) == pytest.approx(7000)
@@ -168,45 +216,66 @@ class TestResult:
         import json
         d = self._result().to_dict()
         json.dumps(d)
-        assert d["leads"][3]["band"] == "red" and d["ref"]["ohms"] == 4000
+        assert d["leads"][3]["band"] == "red" and d["ref"] == "green"
 
-
-class TestGndInference:
-    def test_in_range_reading_means_gnd_is_carrying_current(self):
-        leads = [_reading("E1", 5000)] + [_reading(f"E{i}", None, True)
-                                          for i in range(2, 9)]
-        assert imp.infer_gnd(leads, _reading("REF", None, True), _dc()) == "green"
-
-    def test_dc_on_but_everything_railed_blames_gnd(self):
-        leads = [_reading(f"E{i}", None, True) for i in range(1, 9)]
-        assert imp.infer_gnd(leads, _reading("REF", None, True), _dc()) == "red"
-
-    def test_unknown_when_dc_says_ref_is_off(self):
-        leads = [_reading(f"E{i}", None, True) for i in range(1, 9)]
-        dc = _dc(n_off=set(range(1, 9)))
-        assert imp.infer_gnd(leads, _reading("REF", None, True), dc) is None
-
-    def test_unknown_when_every_lead_is_off(self):
-        leads = [_reading(f"E{i}", None, True) for i in range(1, 9)]
-        dc = _dc(p_off=set(range(1, 9)))
-        assert imp.infer_gnd(leads, _reading("REF", None, True), dc) is None
-
-    def test_unknown_without_dc_status(self):
-        assert imp.infer_gnd([], _reading("REF", 1000), None) is None
+    def test_no_average_when_readings_were_withheld(self):
+        r = self._result()
+        r.problem = "GND (BIO) isn't connected"
+        assert r.average_ohms([1, 2, 3]) is None
 
 
 class TestAnalyze:
-    def test_railed_lead_is_off_and_ref_uses_unrailed_channels(self):
+    """Readings are trusted only when the DC wiring says GND and REF are in."""
+
+    I = imp.LEAD_OFF_CURRENT_A * 1e6
+
+    def _lead_block(self, ohms_list):
         n = imp.block_length(FS)
         s = (4 / np.pi) * np.sin(2 * np.pi * imp.EXCITATION_HZ * _t(n))
-        i = imp.LEAD_OFF_CURRENT_A * 1e6
-        lead = np.column_stack([s * i * 5000, np.full(n, FULL_SCALE)])
-        ref = np.column_stack([-s * i * 8000, np.full(n, FULL_SCALE)])
-        r = imp.analyze(lead, ref, FS, FULL_SCALE, imp.Calibration(), _dc())
+        cols = [np.full(n, FULL_SCALE) if z is None else s * self.I * z
+                for z in ohms_list]
+        return np.column_stack(cols)
+
+    @staticmethod
+    def _contact(leads=("green", "green"), ref="green", gnd="green"):
+        return {"leads": list(leads), "ref": ref, "gnd": gnd}
+
+    def test_connected_leads_read_and_railed_lead_is_off(self):
+        r = imp.analyze(self._lead_block([5000, None]), FS, FULL_SCALE,
+                        imp.Calibration(), self._contact())
         assert r.leads[0].ohms == pytest.approx(5000, rel=1e-6)
         assert r.leads[1].ohms is None and r.leads[1].railed
-        assert r.ref.ohms == pytest.approx(8000, rel=1e-6)
-        assert r.gnd == "green"
+        assert (r.ref, r.gnd, r.problem) == ("green", "green", None)
+
+    def test_gnd_off_withholds_plausible_looking_values(self):
+        # bench: BIO out still gave steady ~9-12 kΩ readings
+        block = self._lead_block([9000, 11000])
+        contact = self._contact(("red", "red"), ref=None, gnd="red")
+        r = imp.analyze(block, FS, FULL_SCALE, imp.Calibration(), contact)
+        assert all(x.ohms is None for x in r.leads)
+        assert r.gnd == "red" and "GND" in r.problem
+
+    def test_ref_off_withholds_values(self):
+        contact = self._contact(ref="red")
+        r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE,
+                        imp.Calibration(), contact)
+        assert all(x.ohms is None for x in r.leads) and "REF" in r.problem
+
+    def test_lead_flagged_off_by_dc_reads_off_even_if_in_range(self):
+        # bench: loose E3/E4/E6 gave an identical bogus 43 kΩ
+        contact = self._contact(("green", "red"))
+        r = imp.analyze(self._lead_block([5000, 43000]), FS, FULL_SCALE,
+                        imp.Calibration(), contact)
+        assert r.leads[0].ohms == pytest.approx(5000, rel=1e-6)
+        assert r.leads[1].ohms is None
+
+    def test_ref_pass_carrier_is_reported_for_bench_use(self):
+        n = imp.block_length(FS)
+        ref = np.column_stack([np.sin(2 * np.pi * imp.EXCITATION_HZ * _t(n)) * 3.0,
+                               np.full(n, FULL_SCALE)])
+        r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE,
+                        imp.Calibration(), self._contact(), ref_block=ref)
+        assert r.ref_carrier_uv == pytest.approx(3.0, rel=1e-6)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -252,8 +321,41 @@ class TestMockEndToEnd:
         for want, got in zip(leads[:7], r.leads[:7]):
             assert got.ohms == pytest.approx(want, rel=0.08), got
         assert r.leads[7].ohms is None and r.leads[7].band == "red"
-        assert r.ref.ohms == pytest.approx(6800, rel=0.08)
-        assert r.gnd == "green"
+        assert (r.ref, r.gnd, r.problem) == ("green", "green", None)
+        assert r.ref_carrier_uv is None                # REF pass not run
+
+    def test_ref_pass_measures_the_mock_reference(self):
+        hw, acq, r = _run_mock_check(lambda hw: hw.set_impedances(ref_ohms=6800),
+                                     {"ref_pass": True})
+        want = (4 / math.pi) * imp.LEAD_OFF_CURRENT_A * 6800 * 1e6
+        assert r.ref_carrier_uv == pytest.approx(want, rel=0.08)
+
+    def test_floating_leads_get_no_current(self):
+        written = []
+
+        def setup(hw):
+            hw.set_leadoff_pattern([1, 8])
+            real = hw.configure_registers
+            hw.configure_registers = lambda m: (written.append(dict(m)), real(m))
+
+        _, _, r = _run_mock_check(setup)
+        passes = [m for m in written if m.get(LOFF) == 0x02]
+        assert passes and all(m[LOFF_SENSP] == 0x7E for m in passes)
+        assert r.leads[0].ohms is None and r.leads[7].ohms is None
+        assert r.leads[3].ohms is not None
+
+    def test_nothing_connected_switches_nothing(self):
+        written = []
+
+        def setup(hw):
+            hw.set_leadoff_pattern(range(1, 9))
+            real = hw.configure_registers
+            hw.configure_registers = lambda m: (written.append(dict(m)), real(m))
+
+        _, _, r = _run_mock_check(setup)
+        assert written == []
+        assert all(x.ohms is None for x in r.leads)
+        assert r.problem
 
     def test_registers_and_hampel_restored(self):
         hw, acq, _ = _run_mock_check()
@@ -303,3 +405,26 @@ class TestSupport:
         class Bare:
             num_channels = 8
         assert imp.unsupported_reason(self._Acq(Bare()))
+
+
+class TestShieldOwnerDetection:
+    @pytest.mark.parametrize("argv", [
+        ["/mnt/pieeg128/PiEEG-server/.venv/bin/python", "-m",
+         "pieeg_server.scope_console", "--profile", "pi5"],
+        ["python3", "-m", "pieeg_server.securelink_console"],
+        ["/home/ionofield/PiEEG-server/.venv/bin/python",
+         "/home/ionofield/PiEEG-server/.venv/bin/pieeg-server", "--device", "pieeg8"],
+        ["/home/ionofield/PiEEG-server/.venv/bin/pieeg-server"],
+    ])
+    def test_servers_and_scope_hold_the_shield(self, argv):
+        assert imp._holds_shield(argv)
+
+    @pytest.mark.parametrize("argv", [
+        ["/bin/bash", "-c", "pgrep -af 'scope_console|pieeg-server'"],
+        ["nano", "pieeg_server/scope_console.py"],
+        ["tail", "-f", "/home/ionofield/.pieeg/scope.log"],
+        ["python", "-m", "pieeg_server.impedance", "measure"],
+        ["python", "-m", "pytest", "tests/test_scope_console.py"],
+    ])
+    def test_mentions_are_not_owners(self, argv):
+        assert not imp._holds_shield(argv)

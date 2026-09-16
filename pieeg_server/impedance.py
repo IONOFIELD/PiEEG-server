@@ -10,10 +10,12 @@ WHAT THIS MEASURES
       * Lead pass: current into all 8 lead (P) inputs at once. Every channel
         reads V(P) - V(SRB1); the body potential cancels, so each channel
         carries its own lead's impedance.
-      * REF pass: current into ONE N input. All N inputs share SRB1 (MISC1),
-        so it flows through the REF electrode and every channel reads it.
-      * GND (the bias lead) is the return path for both and can't be measured
-        directly; it is inferred (see infer_gnd).
+      * REF pass (bench only, --ref-pass): current into ONE N input, meant to
+        flow through REF via the shared SRB1. Unverified on the PiEEG-8: it
+        read ~0.4 µV with GND in or out.
+      * Before switching, the DC wiring is classified (hardware.contact_from_signal):
+        GND (BIO) or REF missing withholds the values, because on the bench a
+        missing GND still produced steady, plausible-looking kΩ readings.
 
     The carrier sits in the beta/gamma band on every channel, so a check is a
     short explicit mode, never a background task. Registers are always restored
@@ -43,7 +45,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .hardware import LOFF, LOFF_DC_95_5, LOFF_SENSE_ALL, LOFF_SENSN, LOFF_SENSP, VREF_UV
+from .hardware import (LOFF, LOFF_DC_95_5, LOFF_SENSE_ALL, LOFF_SENSN,
+                       LOFF_SENSP, VREF_UV, contact_from_signal)
 
 logger = logging.getLogger("pieeg.impedance")
 
@@ -55,7 +58,18 @@ EXCITATION_HZ = 2_048_000 / 2 ** 16          # 31.25 Hz
 LEAD_OFF_CURRENT_A = 6e-9                    # ILEAD_OFF = 00
 LOFF_AC_6NA_31HZ = 0x02                      # COMP_TH 000 | ILEAD 00 | FLEAD 10
 
-LEAD_PASS = {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: LOFF_SENSE_ALL, LOFF_SENSN: 0x00}
+def lead_pass(mask=LOFF_SENSE_ALL):
+    """AC lead-pass registers exciting only the leads in `mask` (bit 0 = E1).
+
+    Only connected leads may be excited: on the PiEEG-8 bench one floating
+    lead carrying the AC current pulled every other lead's reading from
+    ~33 µV down to ~4.5 µV. Leads without current read ~0.2 µV (no crosstalk
+    worth counting), and a lead reads the same alone or with all the others.
+    """
+    return {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: mask & 0xFF, LOFF_SENSN: 0x00}
+
+
+LEAD_PASS = lead_pass()
 REF_PASS = {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01}
 DC_RESTORE = {LOFF: LOFF_DC_95_5, LOFF_SENSP: LOFF_SENSE_ALL,
               LOFF_SENSN: LOFF_SENSE_ALL}
@@ -74,6 +88,15 @@ BENCH_PATH = Path.home() / ".config" / "pieeg" / "impedance_bench.json"
 # ─────────────────────────────────────────────────────────────────────────────
 #  signal processing
 # ─────────────────────────────────────────────────────────────────────────────
+def excitation_mask(contact, num_channels=8):
+    """LOFF_SENSP bits for the leads classify_contact() calls connected
+    (all leads when there's no contact information)."""
+    if not contact:
+        return (1 << num_channels) - 1
+    return sum(1 << i for i, v in enumerate(contact["leads"][:num_channels])
+               if v == "green")
+
+
 def block_length(fs, seconds=2.0, f0=EXCITATION_HZ):
     """Samples in a measurement block: a whole number of excitation cycles
     (so the lock-in is exact), about `seconds` long."""
@@ -122,11 +145,15 @@ THEORY_GAIN_OHM_PER_UV = math.pi / (4 * LEAD_OFF_CURRENT_A) * 1e-6
 
 @dataclass
 class Calibration:
-    """ohms = gain * carrier_uV - offset, separately for leads and REF.
+    """ohms = gain * (carrier_uV - zero_uV[lead]) - offset.
 
     Theory: a ±I square-wave current through Z has a fundamental of
-    (4/pi)·I·Z, so gain = pi / (4·I) and offset (series input resistance) 0.
-    The bench fit replaces both.
+    (4/pi)·I·Z, so gain = pi / (4·I) and offset 0.
+    lead_zero_uv: each lead's carrier with its input shorted (0 Ω). The
+    PiEEG-8 reads ~32-36 µV per lead through a dead short (the board's own
+    input path), which would otherwise add ~4 kΩ to every reading.
+    source: "theory", "zeroed" (shorts recorded, gain still theory) or
+    "bench" (gain fitted from resistors).
     """
 
     lead_gain: float = THEORY_GAIN_OHM_PER_UV
@@ -135,9 +162,14 @@ class Calibration:
     ref_offset: float = 0.0
     source: str = "theory"
     fitted_at: str | None = None
+    lead_zero_uv: list[float] | None = None
 
-    def lead_ohms(self, carrier_uv):
-        return max(0.0, self.lead_gain * float(carrier_uv) - self.lead_offset)
+    def lead_ohms(self, carrier_uv, index=None):
+        uv = float(carrier_uv)
+        if self.lead_zero_uv and index is not None \
+                and 0 <= index < len(self.lead_zero_uv):
+            uv = max(0.0, uv - self.lead_zero_uv[index])
+        return max(0.0, self.lead_gain * uv - self.lead_offset)
 
     def ref_ohms(self, carrier_uv):
         return max(0.0, self.ref_gain * float(carrier_uv) - self.ref_offset)
@@ -164,8 +196,10 @@ def save_calibration(cal, path=CAL_PATH):
 def fit_line(points):
     """Least-squares ohms = gain*uv - offset over [(uv, ohms), ...].
 
-    Returns (gain, offset, r2, max_rel_err). Needs at least two distinct
-    resistor values.
+    Returns (gain, offset, r2, worst_err). worst_err is the largest error
+    relative to max(ohms, 10 kΩ), so a value ≤ 0.1 meets the plan's "within
+    10% or 1 kΩ, whichever is larger" (and 0 Ω shorts don't blow it up).
+    Needs at least two distinct resistor values.
     """
     uv = np.array([p[0] for p in points], dtype=float)
     ohms = np.array([p[1] for p in points], dtype=float)
@@ -176,7 +210,7 @@ def fit_line(points):
     ss_res = float(np.sum((ohms - pred) ** 2))
     ss_tot = float(np.sum((ohms - ohms.mean()) ** 2))
     r2 = 1.0 - ss_res / ss_tot if ss_tot else 1.0
-    rel = np.abs(pred - ohms) / np.maximum(ohms, 1.0)
+    rel = np.abs(pred - ohms) / np.maximum(ohms, 10_000.0)
     return float(gain), float(-intercept), r2, float(rel.max())
 
 
@@ -204,7 +238,8 @@ def format_ohms(ohms):
 
 @dataclass
 class Reading:
-    """One electrode's result. ohms is None when the input railed (off)."""
+    """One electrode's result. ohms is None when the lead is off or its
+    reading can't be trusted (railed, or GND/REF missing)."""
 
     name: str
     ohms: float | None
@@ -224,18 +259,24 @@ class Reading:
 @dataclass
 class ImpedanceResult:
     leads: list[Reading]
-    ref: Reading
-    gnd: str | None                  # "green" / "red" / None (can't tell)
+    ref: str | None                  # REF contact: "green" / "red" / None
+    gnd: str | None                  # GND (BIO) contact: same
     fs: float
     calibration: str
+    problem: str | None = None       # why lead values are withheld, if they are
+    ref_carrier_uv: float | None = None   # REF pass (bench only; unverified)
     timestamp: float = field(default_factory=time.time)
 
     def average_ohms(self, channels):
         """Mean lead impedance over 1-based `channels` (e.g. the montage's
         electrodes). Off or railed leads count as CAP_OHMS so a lifted lead
-        shows in the average. None if no channels are given."""
+        shows in the average. None if no channels are given, or if the
+        readings were withheld (GND/REF missing)."""
+        if self.problem:
+            return None
+        wanted = set(channels)
         vals = [min(r.ohms, CAP_OHMS) if r.ohms is not None else CAP_OHMS
-                for i, r in enumerate(self.leads, start=1) if i in set(channels)]
+                for i, r in enumerate(self.leads, start=1) if i in wanted]
         return float(np.mean(vals)) if vals else None
 
     def to_dict(self):
@@ -244,62 +285,56 @@ class ImpedanceResult:
                     "carrier_uv": round(r.carrier_uv, 3),
                     "noise_uv": round(r.noise_uv, 3), "railed": r.railed,
                     "noisy": r.noisy}
-        return {"leads": [one(r) for r in self.leads], "ref": one(self.ref),
-                "gnd": self.gnd, "fs": self.fs,
+        return {"leads": [one(r) for r in self.leads], "ref": self.ref,
+                "gnd": self.gnd, "problem": self.problem, "fs": self.fs,
                 "calibration": self.calibration, "ts": self.timestamp}
 
 
-def infer_gnd(leads, ref, dc_status):
-    """GND (bias) verdict from the check plus the DC contact state before it.
+def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
+            ref_block=None):
+    """Turn the lead pass (N x channels, µV) into a result.
 
-    DC lead-off currents run P -> body -> REF and never need GND, but both AC
-    passes return through GND. So if DC said REF and at least one lead were
-    on, yet nothing gave an in-range AC reading, GND is the missing return
-    path. None when DC shows REF or every lead off (can't tell).
+    contact: classify_contact() of the DC wiring just before the check. The
+    AC readings are only trusted when it shows GND and REF connected: with
+    GND out the bench still gave steady, plausible 9-12 kΩ values, and with
+    REF out the connected leads rail. Leads the DC flags call off read off.
+    ref_block: optional REF pass; its carrier is reported for bench work only
+    (on the PiEEG-8 it read ~0.4 µV with GND in or out, so it isn't a proven
+    REF measurement).
     """
-    if not dc_status:
-        return None
-    n_flags = [bool(c.get("n_off")) for c in dc_status]
-    ref_on = sum(n_flags) * 2 <= len(n_flags)
-    leads_on = {int(c["ch"]) for c in dc_status if not c.get("p_off")}
-    if not ref_on or not leads_on:
-        return None
-    in_range = [r for i, r in enumerate(leads, start=1)
-                if i in leads_on and r.ohms is not None and r.ohms < CAP_OHMS]
-    if in_range or (ref.ohms is not None and ref.ohms < CAP_OHMS):
-        return "green"
-    return "red"
-
-
-def analyze(lead_block, ref_block, fs, full_scale_uv, calibration,
-            dc_status=None):
-    """Turn the two passes' sample blocks (N x channels, µV) into a result."""
     lead_block = np.asarray(lead_block, dtype=float)
-    ref_block = np.asarray(ref_block, dtype=float)
     rail = RAIL_FRACTION * full_scale_uv
-    lead_amp, lead_noise = carrier_amplitudes(lead_block, fs)
-    lead_railed = np.max(np.abs(lead_block), axis=0) >= rail
+    amp, noise = carrier_amplitudes(lead_block, fs)
+    at_rail = np.max(np.abs(lead_block), axis=0) >= rail
+    lead_verdicts = (contact or {}).get("leads") or []
+    ref = (contact or {}).get("ref")
+    gnd = (contact or {}).get("gnd")
+    problem = None
+    if gnd == "red":
+        problem = "GND (BIO) isn't connected: fix ground before reading impedance"
+    elif ref == "red":
+        problem = "REF isn't connected: fix the reference before reading impedance"
+    elif lead_verdicts and "green" not in lead_verdicts:
+        problem = "no electrodes are connected"
     leads = []
     for i in range(lead_block.shape[1]):
-        railed = bool(lead_railed[i])
+        dc_off = i < len(lead_verdicts) and lead_verdicts[i] == "red"
+        trusted = not (problem or dc_off or at_rail[i])
         leads.append(Reading(
             name=f"E{i + 1}",
-            ohms=None if railed else calibration.lead_ohms(lead_amp[i]),
-            carrier_uv=float(lead_amp[i]), noise_uv=float(lead_noise[i]),
-            railed=railed))
-
-    # REF shows on every channel whose input didn't rail; take the median.
-    ref_amp, ref_noise = carrier_amplitudes(ref_block, fs)
-    usable = np.max(np.abs(ref_block), axis=0) < rail
-    if usable.any():
-        carrier = float(np.median(ref_amp[usable]))
-        ref = Reading("REF", calibration.ref_ohms(carrier), carrier,
-                      float(np.median(ref_noise[usable])), False)
-    else:
-        ref = Reading("REF", None, 0.0, 0.0, True)
-    return ImpedanceResult(leads=leads, ref=ref,
-                           gnd=infer_gnd(leads, ref, dc_status), fs=float(fs),
-                           calibration=calibration.source)
+            ohms=calibration.lead_ohms(amp[i], i) if trusted else None,
+            carrier_uv=float(amp[i]), noise_uv=float(noise[i]),
+            railed=bool(at_rail[i])))
+    ref_carrier = None
+    if ref_block is not None:
+        ref_block = np.asarray(ref_block, dtype=float)
+        ref_amp, _ = carrier_amplitudes(ref_block, fs)
+        usable = np.max(np.abs(ref_block), axis=0) < rail
+        if usable.any():
+            ref_carrier = float(np.median(ref_amp[usable]))
+    return ImpedanceResult(leads=leads, ref=ref, gnd=gnd, fs=float(fs),
+                           calibration=calibration.source, problem=problem,
+                           ref_carrier_uv=ref_carrier)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +357,8 @@ def unsupported_reason(acq):
 
 
 class ImpedanceCheck:
-    """Runs the lead and REF passes on a live AcquisitionLoop.
+    """Runs the check on a live AcquisitionLoop: classify the DC wiring, then
+    the AC lead pass (and optionally the REF pass).
 
     Async: run it on the acquisition's event loop. Register writes go through
     acq.restart_with_config() in an executor; samples come from its own
@@ -330,11 +366,13 @@ class ImpedanceCheck:
     state are restored in a finally, whatever happens.
     """
 
-    def __init__(self, acq, calibration=None, seconds=2.0, settle_seconds=0.5):
+    def __init__(self, acq, calibration=None, seconds=2.0, settle_seconds=0.5,
+                 ref_pass=False):
         self._acq = acq
         self._cal = calibration or load_calibration()
         self._seconds = seconds
         self._settle = settle_seconds
+        self._ref_pass = ref_pass           # bench only, see analyze()
 
     def _fs(self):
         return getattr(self._acq._hw, "sample_rate", None) or 250
@@ -345,6 +383,7 @@ class ImpedanceCheck:
         return 0
 
     async def _restart(self, reg_map):
+        self._switched = True
         await asyncio.get_running_loop().run_in_executor(
             None, self._acq.restart_with_config, dict(reg_map))
 
@@ -386,64 +425,116 @@ class ImpedanceCheck:
         raise ImpedanceCheckError("samples were dropped during the impedance "
                                   "check; try again")
 
+    async def _dc_contact(self, q, fs, full_scale):
+        """contact_from_signal() over the DC flags and ~0.25 s of DC-mode
+        signal. None without lead-off support."""
+        leadoff = getattr(self._acq._hw, "leadoff_status", None)
+        status = leadoff() if callable(leadoff) else None
+        if not status:
+            return None
+        need = max(1, int(fs / 4))
+        rows = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while len(rows) < need and loop.time() < deadline:
+            try:
+                frame = await asyncio.wait_for(q.get(), deadline - loop.time())
+            except asyncio.TimeoutError:
+                break
+            rows.append(frame["channels"])
+        if not rows:
+            return None
+        return contact_from_signal(status, rows, full_scale)
+
     async def run(self):
         reason = unsupported_reason(self._acq)
         if reason:
             raise ImpedanceCheckError(reason)
-        hw = self._acq._hw
         fs = self._fs()
         n = block_length(fs, self._seconds)
-        leadoff = getattr(hw, "leadoff_status", None)
-        dc_status = leadoff() if callable(leadoff) else None
         full_scale = VREF_UV / (self._acq.pga_gain or 24)
+        q = self._acq.subscribe(maxsize=4 * n)
         hampel = self._acq.hampel
         hampel_was = hampel.enabled
-        hampel.enabled = False              # it would clip the carrier
-        q = self._acq.subscribe(maxsize=4 * n)
+        ref = None
+        self._switched = False
         try:
-            logger.info("impedance check: lead pass (%d samples @ %s Hz)", n, fs)
-            lead = await self._pass(q, LEAD_PASS, n, fs)
-            logger.info("impedance check: REF pass")
-            ref = await self._pass(q, REF_PASS, n, fs)
+            contact = await self._dc_contact(q, fs, full_scale)
+            mask = excitation_mask(contact, self._acq.num_channels)
+            if not mask:
+                # Nothing connected (or GND out): no lead to excite.
+                return analyze(np.zeros((n, self._acq.num_channels)), fs,
+                               full_scale, self._cal, contact)
+            hampel.enabled = False          # it would clip the carrier
+            logger.info("impedance check: lead pass (%d samples @ %s Hz, "
+                        "SENSP 0x%02X)", n, fs, mask)
+            lead = await self._pass(q, lead_pass(mask), n, fs)
+            if self._ref_pass:
+                logger.info("impedance check: REF pass")
+                ref = await self._pass(q, REF_PASS, n, fs)
         finally:
             try:
-                await self._restart(DC_RESTORE)
+                if self._switched:
+                    await self._restart(DC_RESTORE)
+                    logger.info("impedance check: DC lead-off restored")
             finally:
                 hampel.enabled = hampel_was
                 self._acq.unsubscribe(q)
-            logger.info("impedance check: DC lead-off restored")
-        return analyze(lead, ref, fs, full_scale, self._cal, dc_status)
+        return analyze(lead, fs, full_scale, self._cal, contact, ref_block=ref)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  command line (bench use; close the Scope first — one SPI bus)
 # ─────────────────────────────────────────────────────────────────────────────
+_SPI_MODULES = {"pieeg_server.scope_console", "pieeg_server.securelink_console",
+                "pieeg_server"}
+
+
+def _holds_shield(argv):
+    """True if a process argv is a PiEEG server/Scope (which owns the SPI
+    bus): `python -m <one of _SPI_MODULES>` or the `pieeg-server` script.
+    Matches argv tokens, not substrings, so shells, editors or log tails
+    that merely mention those names don't count."""
+    for i, arg in enumerate(argv):
+        if arg == "-m" and i + 1 < len(argv) and argv[i + 1] in _SPI_MODULES:
+            return True
+    return any(os.path.basename(a) == "pieeg-server" for a in argv[:2])
+
+
 def _other_pieeg_running():
     me = os.getpid()
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit() or int(proc.name) == me:
             continue
         try:
-            cmd = (proc / "cmdline").read_bytes().replace(b"\0", b" ")
+            raw = (proc / "cmdline").read_bytes()
         except OSError:
             continue
-        if b"scope_console" in cmd or b"pieeg-server" in cmd \
-                or b"securelink_console" in cmd:
-            return cmd.decode(errors="replace").strip()
+        argv = [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+        if _holds_shield(argv):
+            return " ".join(argv)
     return None
 
 
 def _print_result(result, restore=None):
     print(f"\nImpedance check · {result.fs:.0f} SPS · calibration: "
           f"{result.calibration}"
-          + ("  (theory only, not bench-fitted)"
-             if result.calibration == "theory" else ""))
+          + {"theory": "  (theory only, not bench-fitted)",
+             "zeroed": "  (board offset removed; gain still theory)"}.get(
+                 result.calibration, ""))
     print(f"  {'':4} {'carrier µV':>11} {'noise µV':>9}  {'impedance':>10}  band")
-    for r in result.leads + [result.ref]:
-        flag = "  noisy" if r.noisy else ""
+    for r in result.leads:
+        flag = "  noisy" if r.noisy and r.ohms is not None else ""
+        shown = "—" if result.problem else format_ohms(r.ohms)
+        verdict = "—" if result.problem else r.band
         print(f"  {r.name:4} {r.carrier_uv:11.2f} {r.noise_uv:9.2f}  "
-              f"{format_ohms(r.ohms):>10}  {r.band}{flag}")
-    print(f"  GND  {result.gnd or 'unknown'} (inferred)")
+              f"{shown:>10}  {verdict}{flag}")
+    print(f"  REF  contact {result.ref or 'unknown'}"
+          + (f"   (REF pass carrier {result.ref_carrier_uv:.2f} µV, unverified)"
+             if result.ref_carrier_uv is not None else ""))
+    print(f"  GND  contact {result.gnd or 'unknown'}")
+    if result.problem:
+        print(f"  !!   {result.problem}")
     if restore is not None:
         ok = restore == {"LOFF": 0x00, "LOFF_SENSP": 0xFF, "LOFF_SENSN": 0xFF}
         print("  restore: " + " ".join(f"{k}=0x{v:02X}" for k, v in restore.items())
@@ -467,7 +558,9 @@ async def _run_cli(args):
     results = []
     try:
         await asyncio.sleep(1.0)            # let DC lead-off settle first
-        check = ImpedanceCheck(acq, seconds=args.seconds)
+        check = ImpedanceCheck(acq, seconds=args.seconds,
+                               ref_pass=args.ref_pass
+                               or getattr(args, "ref", False))
         for _ in range(args.repeat):
             results.append(await check.run())
     finally:
@@ -500,6 +593,8 @@ def main(argv=None):
         s.add_argument("--seconds", type=float, default=2.0,
                        help="length of each pass (default 2)")
         s.add_argument("--repeat", type=int, default=1)
+        s.add_argument("--ref-pass", action="store_true",
+                       help="also run the REF pass (unverified on the PiEEG-8)")
         if name == "bench":
             s.add_argument("--ohms", type=float, required=True,
                            help="resistor value on the inputs being recorded")
@@ -546,15 +641,18 @@ def _record_bench(args, results):
         points = []
     added = 0
     for r in results:
+        if r.problem:
+            print(f"not recorded: {r.problem}")
+            continue
         if args.ref:
-            if not r.ref.railed:
+            if r.ref_carrier_uv is not None:
                 points.append({"pass": "ref", "name": "REF", "ohms": args.ohms,
-                               "carrier_uv": r.ref.carrier_uv})
+                               "carrier_uv": r.ref_carrier_uv})
                 added += 1
             continue
         for ch in _parse_channels(args.channels):
             lead = r.leads[ch - 1]
-            if not lead.railed:
+            if lead.ohms is not None:
                 points.append({"pass": "lead", "name": lead.name,
                                "ohms": args.ohms,
                                "carrier_uv": lead.carrier_uv})
@@ -565,6 +663,61 @@ def _record_bench(args, results):
           f"-> {BENCH_PATH} ({len(points)} total)")
 
 
+def fit_calibration(points, cal=None):
+    """Fit a Calibration from bench points; returns (calibration, report).
+
+    points: [{"pass": "lead"|"ref", "name": "E1"|"REF", "ohms", "carrier_uv"}].
+    0 Ω lead points (inputs shorted) set each lead's zero; resistor points
+    then fit gain and offset on the zero-corrected carrier. With shorts only,
+    the gain stays theory and the source becomes "zeroed".
+    """
+    cal = cal or Calibration()
+    report = []
+    leads = [q for q in points if q["pass"] == "lead"]
+    shorts = {}
+    for q in leads:
+        if q["ohms"] == 0:
+            shorts.setdefault(q["name"], []).append(q["carrier_uv"])
+    if shorts:
+        cal.lead_zero_uv = [float(np.mean(shorts.get(f"E{i}", [0.0])))
+                            for i in range(1, 9)]
+        report.append("lead zeros (µV, 0 Ω): " + "  ".join(
+            f"E{i} {z:.2f}" for i, z in enumerate(cal.lead_zero_uv, 1)))
+        missing = [f"E{i}" for i in range(1, 9) if f"E{i}" not in shorts]
+        if missing:
+            report.append(f"  no short recorded for {', '.join(missing)} "
+                          "(zero left at 0)")
+        cal.source = "zeroed"
+
+    def zeroed(q):
+        uv = q["carrier_uv"]
+        if q["pass"] == "lead" and cal.lead_zero_uv:
+            idx = int(q["name"][1:]) - 1
+            if 0 <= idx < len(cal.lead_zero_uv):
+                uv -= cal.lead_zero_uv[idx]
+        return uv
+
+    for kind in ("lead", "ref"):
+        pts = [(zeroed(q), q["ohms"]) for q in points if q["pass"] == kind]
+        if not any(o > 0 for _, o in pts):
+            report.append(f"{kind}: no resistor readings; gain stays "
+                          f"{getattr(cal, kind + '_gain'):.2f} Ω/µV")
+            continue
+        try:
+            gain, offset, r2, err = fit_line(pts)
+        except ValueError as e:
+            report.append(f"{kind}: {e}")
+            continue
+        report.append(f"{kind}: {len(pts)} readings  gain {gain:.2f} Ω/µV "
+                      f"(theory {THEORY_GAIN_OHM_PER_UV:.2f})  offset "
+                      f"{offset:.0f} Ω  R² {r2:.4f}  worst error {err:.1%}")
+        setattr(cal, f"{kind}_gain", gain)
+        setattr(cal, f"{kind}_offset", offset)
+        cal.source = "bench"
+    cal.fitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    return cal, report
+
+
 def _fit_cli(args):
     try:
         points = json.loads(BENCH_PATH.read_text())
@@ -572,29 +725,13 @@ def _fit_cli(args):
         print(f"no bench readings in {BENCH_PATH}; record some with "
               "`bench --ohms <value>` first", file=sys.stderr)
         return 1
-    cal = load_calibration()
-    for kind in ("lead", "ref"):
-        pts = [(q["carrier_uv"], q["ohms"]) for q in points if q["pass"] == kind]
-        if not pts:
-            print(f"{kind}: no readings, keeping the current values")
-            continue
-        try:
-            gain, offset, r2, err = fit_line(pts)
-        except ValueError as e:
-            print(f"{kind}: {e}")
-            continue
-        print(f"{kind}: {len(pts)} readings  gain {gain:.2f} Ω/µV "
-              f"(theory {THEORY_GAIN_OHM_PER_UV:.2f})  offset {offset:.0f} Ω  "
-              f"R² {r2:.4f}  worst error {err:.1%}")
-        setattr(cal, f"{kind}_gain", gain)
-        setattr(cal, f"{kind}_offset", offset)
-    cal.source = "bench"
-    cal.fitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    cal, report = fit_calibration(points, Calibration())
+    print("\n".join(report))
     if args.dry_run:
         print("dry run: calibration not saved")
     else:
         save_calibration(cal)
-        print(f"saved {CAL_PATH}")
+        print(f"saved {CAL_PATH} (source: {cal.source})")
     return 0
 
 
