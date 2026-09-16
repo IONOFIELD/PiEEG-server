@@ -171,19 +171,87 @@ def config1_sample_rate(config1: int) -> int | None:
     return None if dr == 0x07 else 16000 >> dr
 
 
-def leadoff_state(p_off: bool, n_off: bool) -> str:
-    """Map a channel's P/N lead-off flags to a green/amber/red contact verdict.
+def leadoff_state(p_off: bool, n_off: bool = False) -> str:
+    """Green/red electrode contact verdict from a channel's lead-off flags.
 
-    green = both inputs connected (good contact)
-    amber = exactly one input off (partial contact — one side floating; e.g.
-            a lost shared reference shows every channel as amber)
-    red   = both inputs off (no contact)
+    Only the P (electrode) flag counts. On the PiEEG-8 every N input is tied
+    to SRB1, and on the bench (2026-09-16) the N flags read "off" on every
+    channel whether REF was connected or not, so they say nothing about
+    contact. A missing REF or GND shows up in the signal instead; see
+    classify_contact(). n_off is accepted for call compatibility and ignored.
     """
-    if p_off and n_off:
-        return "red"
-    if p_off or n_off:
-        return "amber"
-    return "green"
+    return "red" if p_off else "green"
+
+
+# A channel whose recent samples reach this share of full scale is "at the
+# rail" for contact purposes (a floating input with GND present reads ~94-100%).
+CONTACT_RAIL_FRACTION = 0.9
+# A floating REF puts one shared, drifting signal under every channel. When
+# the connected leads' signals are this share identical and at least this
+# large (µV std, per-channel DC removed), REF is taken as off. Bench: REF out
+# gave 1222 µV identical on all 8; REF in gave 0.2-0.4 µV.
+REF_FLOAT_COMMON_UV = 500.0
+REF_FLOAT_COMMON_SHARE = 0.9
+
+
+def classify_contact(status, railed, common_uv=0.0):
+    """Lead, REF and GND (BIO) contact from lead-off flags plus signal rails.
+
+    Signatures measured on the PiEEG-8 with the leads, REF and BIO wires
+    joined and then pulled one at a time (2026-09-16):
+
+      all connected -> every lead flags on, signals in range
+      one lead off  -> that lead flags off and its signal rails
+      REF off       -> connected leads flag on, but their signals rail or all
+                       carry one large identical signal (a floating REF
+                       drifts; it doesn't always reach the rail)
+      GND off       -> every lead flags off, yet the signals stay in range
+                       (the DC test currents return through GND)
+
+    status: leadoff_status() list. railed: per-channel bools, True when that
+    channel's recent signal is at the rail (see CONTACT_RAIL_FRACTION).
+    common_uv: size of the signal shared by the connected leads (see
+    contact_from_signal); REF_FLOAT_COMMON_UV or more means REF is floating.
+    Returns {"leads": [...], "ref": v, "gnd": v}; leads are "green"/"red",
+    ref and gnd are "green"/"red" or None when the wiring can't tell.
+    """
+    p_off = [bool(c.get("p_off")) for c in status]
+    n = len(p_off)
+    at_rail = [bool(railed[i]) if i < len(railed) else False for i in range(n)]
+    leads = ["red" if off else "green" for off in p_off]
+    on = [i for i in range(n) if not p_off[i]]
+    if not on:
+        in_range = sum(1 for i in range(n) if not at_rail[i])
+        return {"leads": leads, "ref": None,
+                "gnd": "red" if n and in_range * 2 > n else None}
+    ref_off = (sum(1 for i in on if at_rail[i]) * 2 > len(on)
+               or common_uv >= REF_FLOAT_COMMON_UV)
+    return {"leads": leads, "ref": "red" if ref_off else "green", "gnd": "green"}
+
+
+def contact_from_signal(status, block, full_scale_uv):
+    """classify_contact() from a recent DC-mode signal block.
+
+    block: (N samples x channels) µV, a fraction of a second is enough.
+    Works out which channels are at the rail and how large the signal shared
+    by the connected leads is (their mean after removing each channel's DC,
+    counted only when it is REF_FLOAT_COMMON_SHARE of their own signal).
+    """
+    import numpy as np
+
+    x = np.asarray(block, dtype=float)
+    railed = (np.max(np.abs(x), axis=0)
+              >= CONTACT_RAIL_FRACTION * full_scale_uv).tolist()
+    on = [i for i, c in enumerate(status)
+          if not c.get("p_off") and i < x.shape[1]]
+    common = 0.0
+    if len(on) >= 2:
+        y = x[:, on] - x[:, on].mean(axis=0)
+        own = float(y.std(axis=0).mean())
+        shared = float(y.mean(axis=1).std())
+        if own > 0 and shared / own >= REF_FLOAT_COMMON_SHARE:
+            common = shared
+    return classify_contact(status, railed, common)
 
 
 def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
@@ -196,8 +264,9 @@ def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
     reported channel numbers, e.g. 8 for the second ADS1299 in 16-channel mode.
 
     Returns a list of 8 dicts: {"ch", "off", "p_off", "n_off", "state"} where
-    "off" is the OR of P and N (poor/no contact) and "state" is the
-    green/amber/red verdict from ``leadoff_state`` for a direct client readout.
+    "off" is the electrode (P) flag and "state" its green/red verdict from
+    ``leadoff_state``. n_off is passed through raw but is not meaningful on
+    the PiEEG-8 (see leadoff_state).
     """
     word = (status_bytes[0] << 16) | (status_bytes[1] << 8) | status_bytes[2]
     statp = (word >> 12) & 0xFF
@@ -208,10 +277,10 @@ def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
         n_off = bool(statn & (1 << i))
         channels.append({
             "ch": channel_offset + i + 1,
-            "off": p_off or n_off,
+            "off": p_off,
             "p_off": p_off,
             "n_off": n_off,
-            "state": leadoff_state(p_off, n_off),
+            "state": leadoff_state(p_off),
         })
     return channels
 

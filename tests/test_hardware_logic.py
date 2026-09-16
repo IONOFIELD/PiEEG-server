@@ -21,7 +21,7 @@ from pieeg_server.hardware import (
     CONFIG4_PD_LOFF_COMP, LOFF_SENSE_ALL,
     STATUS_SYNC_MASK, STATUS_SYNC_VALUE,
     parse_leadoff_status, leadoff_state, _status_sync_ok,
-    config1_sample_rate,
+    config1_sample_rate, classify_contact, contact_from_signal,
     PiEEGHardware,
 )
 
@@ -501,19 +501,94 @@ class TestLeadOffRegisters:
 
 
 class TestLeadOffState:
-    """green/amber/red verdict from P/N lead-off flags."""
+    """green/red verdict from the electrode (P) flag; N is ignored because
+    it reads off on every PiEEG-8 channel regardless of REF."""
 
-    def test_both_connected_is_green(self):
-        assert leadoff_state(False, False) == "green"
+    def test_connected_is_green(self):
+        assert leadoff_state(False) == "green"
+        assert leadoff_state(False, True) == "green"   # stuck N flag ignored
 
-    def test_p_only_off_is_amber(self):
-        assert leadoff_state(True, False) == "amber"
+    def test_electrode_off_is_red(self):
+        assert leadoff_state(True) == "red"
+        assert leadoff_state(True, False) == "red"
 
-    def test_n_only_off_is_amber(self):
-        assert leadoff_state(False, True) == "amber"
 
-    def test_both_off_is_red(self):
-        assert leadoff_state(True, True) == "red"
+class TestClassifyContact:
+    """The wiring signatures measured on the bench (leads/REF/BIO joined,
+    then pulled one at a time)."""
+
+    @staticmethod
+    def _status(p_off=()):
+        return [{"ch": c, "p_off": c in p_off, "n_off": True} for c in range(1, 9)]
+
+    def test_all_connected(self):
+        r = classify_contact(self._status(), [False] * 8)
+        assert r == {"leads": ["green"] * 8, "ref": "green", "gnd": "green"}
+
+    def test_one_lead_off_rails_alone(self):
+        railed = [True] + [False] * 7
+        r = classify_contact(self._status(p_off={1}), railed)
+        assert r["leads"][0] == "red" and r["leads"][1:] == ["green"] * 7
+        assert (r["ref"], r["gnd"]) == ("green", "green")
+
+    def test_ref_off_rails_the_connected_leads(self):
+        # bench: E3/E4/E6 loose (flag off, in range), the rest on but railed
+        loose = {3, 4, 6}
+        railed = [c not in loose for c in range(1, 9)]
+        r = classify_contact(self._status(p_off=loose), railed)
+        assert r["ref"] == "red" and r["gnd"] == "green"
+
+    def test_gnd_off_flags_everything_off_without_rails(self):
+        r = classify_contact(self._status(p_off=set(range(1, 9))), [False] * 8)
+        assert r["gnd"] == "red" and r["ref"] is None
+        assert r["leads"] == ["red"] * 8
+
+    def test_nothing_attached_is_unknown(self):
+        r = classify_contact(self._status(p_off=set(range(1, 9))), [True] * 8)
+        assert r["gnd"] is None and r["ref"] is None
+
+    def test_large_shared_signal_means_ref_floating(self):
+        r = classify_contact(self._status(), [False] * 8, common_uv=1222.0)
+        assert r["ref"] == "red" and r["gnd"] == "green"
+
+
+class TestContactFromSignal:
+    """Signal features measured on the bench, synthesised."""
+
+    FS = 4.5e6 / 24
+
+    @staticmethod
+    def _status(p_off=()):
+        return [{"ch": c, "p_off": c in p_off, "n_off": True} for c in range(1, 9)]
+
+    def _t(self):
+        import numpy as np
+        return np.arange(62) / 250
+
+    def test_ref_floating_without_railing(self):
+        import numpy as np
+        rng = np.random.default_rng(0)
+        shared = -67600 + 1700 * np.sin(2 * np.pi * 60 * self._t())
+        block = shared[:, None] + rng.normal(0, 1, (62, 8))
+        r = contact_from_signal(self._status(), block, self.FS)
+        assert r["ref"] == "red"
+
+    def test_quiet_short_is_ref_on(self):
+        import numpy as np
+        block = np.random.default_rng(0).normal(5, 0.3, (62, 8))
+        assert contact_from_signal(self._status(), block, self.FS)["ref"] == "green"
+
+    def test_big_but_independent_signals_are_not_ref_floating(self):
+        import numpy as np
+        block = np.random.default_rng(0).normal(0, 1500, (62, 8))
+        assert contact_from_signal(self._status(), block, self.FS)["ref"] == "green"
+
+    def test_railed_lead_and_loose_lead(self):
+        import numpy as np
+        block = np.random.default_rng(0).normal(0, 0.3, (62, 8))
+        block[:, 0] = self.FS
+        r = contact_from_signal(self._status(p_off={1}), block, self.FS)
+        assert r["leads"][0] == "red" and r["ref"] == "green" and r["gnd"] == "green"
 
 
 class TestLeadOffStatusParsing:
@@ -541,17 +616,17 @@ class TestLeadOffStatusParsing:
         assert chans[0]["p_off"] is True
         assert chans[0]["n_off"] is False
         assert chans[0]["off"] is True
-        assert chans[0]["state"] == "amber"    # only P off
+        assert chans[0]["state"] == "red"
         # Only channel 1 flagged
         assert all(c["off"] is False for c in chans[1:])
 
     def test_channel8_negative_off(self):
         chans = parse_leadoff_status(self._status_bytes(statn=0b1000_0000))
         assert chans[7]["ch"] == 8
-        assert chans[7]["n_off"] is True
+        assert chans[7]["n_off"] is True           # passed through raw
         assert chans[7]["p_off"] is False
-        assert chans[7]["off"] is True
-        assert chans[7]["state"] == "amber"    # only N off
+        assert chans[7]["off"] is False            # N alone isn't contact loss
+        assert chans[7]["state"] == "green"
         assert all(c["off"] is False for c in chans[:7])
 
     def test_mixed_pattern(self):
@@ -560,13 +635,13 @@ class TestLeadOffStatusParsing:
         statn = (1 << 4) | (1 << 2)          # channels 5, 3 (N)
         chans = parse_leadoff_status(self._status_bytes(statp=statp, statn=statn))
         off = {c["ch"] for c in chans if c["off"]}
-        assert off == {2, 3, 5}
+        assert off == {2, 3}                             # electrode (P) flags
         assert chans[2]["p_off"] and chans[2]["n_off"]   # ch3 both
-        assert chans[2]["state"] == "red"                # both off
+        assert chans[2]["state"] == "red"
         assert chans[1]["p_off"] and not chans[1]["n_off"]  # ch2 P only
-        assert chans[1]["state"] == "amber"
+        assert chans[1]["state"] == "red"
         assert chans[4]["n_off"] and not chans[4]["p_off"]  # ch5 N only
-        assert chans[4]["state"] == "amber"
+        assert chans[4]["state"] == "green"
         assert chans[0]["state"] == "green"              # ch1 untouched
 
     def test_gpio_bits_ignored(self):
@@ -660,8 +735,8 @@ class TestMockLeadOff:
         status = hw.leadoff_status()
         off = {c["ch"] for c in status if c["off"]}
         assert off == {2, 5}
-        # Mock only flips P (single-ended), so a flagged channel is amber.
-        assert status[1]["state"] == "amber" and status[4]["state"] == "amber"
+        # A flagged electrode is red; its neighbours stay green.
+        assert status[1]["state"] == "red" and status[4]["state"] == "red"
         assert status[0]["state"] == "green"
 
     def test_16ch_reports_all_channels(self):

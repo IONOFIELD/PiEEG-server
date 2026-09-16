@@ -248,9 +248,9 @@ class MockHardware:
             n_off = False
             out.append({
                 "ch": ch + 1,
-                "off": p_off or n_off,
+                "off": p_off,
                 "p_off": p_off,
                 "n_off": n_off,
-                "state": leadoff_state(p_off, n_off),
+                "state": leadoff_state(p_off),
             })
         return out
