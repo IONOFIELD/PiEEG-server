@@ -54,6 +54,8 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
+from .hardware import VREF_UV, contact_from_signal
+
 # ── electrode map: chip input (E1..) -> scalp label ──────────────────────────
 # The PiEEG chip streams its inputs in order, and we call them E1, E2, E3 …
 # ("E" = electrode, as marked on the board / your harness). Their position in
@@ -116,7 +118,7 @@ WINDOW_W, WINDOW_H = 1000, 640
 # flag that flickers within the window reads as intermittent (amber).
 CONTACT_WINDOW = 8
 
-# ── REACT EEG (Geist) palette, adapted for the Tk scope ──────────────────────
+# ── dashboard (Geist) palette, adapted for the Tk scope ──────────────────────
 # Mirrors the dashboard's design tokens (dashboard/src/index.css): near-black
 # surfaces, hairline borders, blue accent, and the signal colours green=live /
 # yellow=paused / red=stop, with the EEG curve in the dashboard's canvas blue.
@@ -277,42 +279,53 @@ class MontageStore:
 
 
 class ContactTracker:
-    """Debounced per-electrode contact from the ADS1299 DC lead-off flags.
+    """Debounced lead, REF and GND (BIO) contact.
 
-    The chip re-judges lead-off on every sample, so a marginal electrode can
-    flip between on and off many times a second. The viewer feeds the latest
-    flags in once per redraw and each electrode is judged over the last
-    CONTACT_WINDOW polls: green = on throughout, red = off throughout,
-    amber = flickering (intermittent contact). Electrodes are the P inputs;
-    every N input shares the one SRB1 reference electrode, so REF is judged
-    the same way from a majority vote of the N flags.
+    Each redraw feeds the chip's lead-off flags plus the last moment of
+    signal; hardware.contact_from_signal() turns that into green/red verdicts
+    using the wiring signatures measured on the PiEEG-8 (GND out: every lead
+    flags off without railing; REF out: the connected leads rail or share one
+    large identical signal). Verdicts are judged over the last CONTACT_WINDOW
+    polls: green throughout, red throughout, amber = flickering. The chip's
+    N-side flags are ignored — on this board they read off regardless of REF.
     """
 
     def __init__(self, num_channels, window=CONTACT_WINDOW):
         self._hist = [deque(maxlen=window) for _ in range(num_channels)]
         self._ref = deque(maxlen=window)
+        self._gnd = deque(maxlen=window)
 
-    def update(self, status):
-        """Feed one leadoff_status() readout (list of per-channel dicts)."""
+    def update(self, status, recent=None, full_scale_uv=VREF_UV / 24):
+        """Feed one leadoff_status() readout and the recent signal block
+        (N x channels µV). Without a signal block (nothing buffered yet) only
+        the leads update; REF and GND need the signal to be told apart.
+        """
         if not status:
+            # No readout (e.g. channels on an internal signal): no verdicts.
+            for hist in (*self._hist, self._ref, self._gnd):
+                hist.clear()
             return
-        n_votes = []
         for c in status:
             i = int(c.get("ch", 0)) - 1
             if 0 <= i < len(self._hist):
                 self._hist[i].append(bool(c.get("p_off")))
-                n_votes.append(bool(c.get("n_off")))
-        if n_votes:
-            self._ref.append(sum(n_votes) * 2 > len(n_votes))
+        if recent is None:
+            return
+        verdict = contact_from_signal(status, recent, full_scale_uv)
+        self._ref.append(verdict["ref"])
+        self._gnd.append(verdict["gnd"])
 
     @staticmethod
     def _verdict(hist):
-        if not hist:
+        """green/red/amber over a history of off-flags (True/False) or
+        verdict strings; None entries (can't tell) are skipped."""
+        seen = [h for h in hist if h is not None]
+        if not seen:
             return None
-        off = sum(hist)
+        off = sum(1 for h in seen if h is True or h == "red")
         if off == 0:
             return "green"
-        return "red" if off == len(hist) else "amber"
+        return "red" if off == len(seen) else "amber"
 
     def electrode(self, index):
         """Verdict for the electrode at input index (0 = E1), or None."""
@@ -323,6 +336,10 @@ class ContactTracker:
     def ref(self):
         """Verdict for the shared reference electrode, or None."""
         return self._verdict(self._ref)
+
+    def gnd(self):
+        """Verdict for the GND (BIO / bias) electrode, or None."""
+        return self._verdict(self._gnd)
 
 
 class ViewerModel:
@@ -586,10 +603,10 @@ def show_error_window(title, headline, detail, log_path=None,
     return True
 
 def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
-               electrodes=None, on_close=None, title="PiEEG - REACT EEG",
+               electrodes=None, on_close=None, title="PiEEG Scope",
                auto_shot=None, auto_close_ms=None,
                connect_popup=None, contact_source=None,
-               record_control=None):
+               record_control=None, full_scale_uv=VREF_UV / 24):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -599,15 +616,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     prove rendering without depending on the monitor being awake.
     contact_source: optional zero-arg callable returning the hardware's
     leadoff_status() list (or None). Polled once per redraw, in-process; when
-    given, each lead shows a contact dot per electrode and the status bar a
-    REF dot.
+    given, each lead shows a contact dot per electrode and the status bar
+    REF and GND dots. full_scale_uv: the ADC rail in µV (gain-dependent), used
+    to spot railed channels for the REF/GND verdicts.
     record_control: optional dict {"status": () -> {"recording", "elapsed"},
     "toggle": () -> concurrent Future}. When given, one Rec/Stop button drives
     the server's recorder; the Future's result dict ({"started": session} or
     {"stopped": session, "saved": [suffixes], "seconds", "dir"}) is reported in a
-    toast. Status is polled each redraw, so a recording REACT starts shows too.
+    toast. Status is polled each redraw, so a recording a client starts shows too.
     connect_popup: optional dict {"ip", "port", "mode", "targets"} for the
-    "connect REACT EEG to…" info popup; "targets" lists every reachable
+    "connect to…" info popup; "targets" lists every reachable
     (mode, ip), primary first. When given, a small always-on-top window is raised over
     the scope showing the connection target and STAYS in front until the
     operator minimises or closes it — so it can be read/transcribed and is never
@@ -802,10 +820,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         rec_btn.pack(side="left", padx=(6, 0), pady=1)
 
     # Electrode cluster, right of the filters: REF ●  GND ●  [AVG IMP —].
-    # REF is live from the DC lead-off comparators. GND (the bias electrode)
-    # and the average impedance in kΩ can't come from the live stream — the
-    # DC comparators never see the bias lead and only say on/off — so both
-    # stay grey/"—" until an impedance check measures them
+    # REF and GND are live, from the lead-off flags plus which channels sit at
+    # the rail (ContactTracker). The average impedance in kΩ needs the AC
+    # impedance check, so it stays "—" until that is wired into the Scope
     # (docs/IMPEDANCE_CHECK_PLAN.md).
     ref_dot = gnd_dot = imp_lbl = None
     if contact_source is not None:
@@ -1041,30 +1058,42 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     # ---- draw loop -------------------------------------------------------- #
     def _drain_queue():
-        batch = []
+        # Items are single frame dicts (standalone mock) or (m x nch) sample
+        # chunks (the Scope's viewer process receives batches).
+        rows, chunks = [], []
         try:
             while True:
-                batch.append(frame_queue.get_nowait())
+                item = frame_queue.get_nowait()
+                if isinstance(item, dict):
+                    rows.append(item["channels"])
+                else:
+                    chunks.append(np.asarray(item, dtype=np.float64))
         except queue.Empty:
             pass
-        if batch:
-            arr = np.array([f["channels"] for f in batch], dtype=np.float64)
-            model.push(arr)
-        return len(batch)
+        if rows:
+            chunks.append(np.asarray(rows, dtype=np.float64))
+        if not chunks:
+            return 0
+        arr = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        model.push(arr)
+        return arr.shape[0]
 
     _CONTACT_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
     # Measured sample rate: frames drained per second, re-estimated ~1 Hz.
     _rate = {"t": time.monotonic(), "n": 0, "sps": None}
 
+    _rail_n = max(1, int(fs / 4))           # ~0.25 s of signal per verdict
+
     def _poll_contact():
         if contact_source is None:
             return
+        recent = model.raw[-_rail_n:] if model.filled >= _rail_n else None
         try:
-            model.contact.update(contact_source())
+            model.contact.update(contact_source(), recent, full_scale_uv)
         except Exception:                   # noqa: BLE001 - display only
             return
-        verdict = model.contact.ref()
-        ref_dot.config(fg=_CONTACT_FG.get(verdict, C["text_dim"]))
+        ref_dot.config(fg=_CONTACT_FG.get(model.contact.ref(), C["text_dim"]))
+        gnd_dot.config(fg=_CONTACT_FG.get(model.contact.gnd(), C["text_dim"]))
 
     def _redraw():
         got = _drain_queue()
@@ -1196,7 +1225,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     root.protocol("WM_DELETE_WINDOW", _on_close)
     root.after(REDRAW_MS, _redraw)
 
-    # ---- always-on-top "connect REACT EEG to…" popup --------------------- #
+    # ---- always-on-top "connect to…" popup -------------------------------- #
     # Raised OVER the scope AFTER it has drawn (not before — on the Pi's window
     # manager a Toplevel built before the root maps ends up buried, which looked
     # like the popup "immediately hiding"). Kept topmost. Only one instance
@@ -1219,7 +1248,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         changelog = connect_popup.get("changelog") or []
         pop = tk.Toplevel(root)
         _popup_ref["win"] = pop
-        pop.title("PiEEG · REACT EEG connection")
+        pop.title("PiEEG Scope · connection")
         pop.configure(bg=C["bg"])
         pop.attributes("-topmost", True)     # stay above the scope until minimised
         # geo holds the framed collapsed size (computed once the content is
@@ -1231,7 +1260,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         header = f"PiEEG Scope v{version}" if version else "PiEEG Scope"
         tk.Label(pop, text=header, bg=C["bg"], fg=C["text"],
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(10, 2))
-        tk.Label(pop, text="CONNECT REACT EEG TO", bg=C["bg"], fg=C["text_dim"],
+        tk.Label(pop, text="CONNECT TO", bg=C["bg"], fg=C["text_dim"],
                  font=("TkDefaultFont", _fs(10))).pack(pady=(4, 2))
         # Every address the server is reachable on (Wi-Fi AND the Ethernet
         # cable when both are up), primary first — the laptop uses whichever
@@ -1352,6 +1381,109 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 # ─────────────────────────────────────────────────────────────────────────────
 #  standalone entry points
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  the Scope's viewer process
+# ─────────────────────────────────────────────────────────────────────────────
+class _RemoteFuture:
+    """Future-like handle for a request answered by the parent process."""
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._payload = None
+
+    def set(self, payload):
+        self._payload = payload
+        self._event.set()
+
+    def done(self):
+        return self._event.is_set()
+
+    def result(self):
+        if "error" in self._payload:
+            raise RuntimeError(self._payload["error"])
+        return self._payload["result"]
+
+
+def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
+    """Entry point of the Scope's viewer process (multiprocessing, spawn).
+
+    The Tk viewer runs in its own process so its drawing never holds the GIL
+    of the process reading the chip: in-process it made the acquisition
+    thread wake late, skipping ~2-3% of samples (and, before the torn-read
+    fix, corrupting them). The parent sends ("tick", {"frames": (m x nch)
+    array or None, "leadoff": leadoff_status() or None, "record": {"recording",
+    "started"}}) about 20 times a second, and ("record_result", id, payload)
+    answers. This process sends ("toggle_record", id) and, if the viewer
+    crashes, ("error", traceback). Closing the window ends the process, which
+    the parent treats as the shutdown gesture.
+    """
+    import itertools
+    import traceback
+
+    frames: queue.Queue = queue.Queue()
+    state = {"leadoff": None, "record": {"recording": False, "started": None}}
+    pending: dict = {}
+    send_lock = threading.Lock()
+
+    def send(msg):
+        with send_lock:
+            try:
+                conn.send(msg)
+            except (OSError, ValueError):
+                pass                        # parent gone: nothing to tell
+
+    def receive():
+        while True:
+            try:
+                kind, *rest = conn.recv()
+            except (EOFError, OSError):
+                return
+            if kind == "tick":
+                msg = rest[0]
+                if msg.get("frames") is not None:
+                    frames.put(msg["frames"])
+                state["leadoff"] = msg.get("leadoff")
+                state["record"] = msg.get("record") or state["record"]
+            elif kind == "record_result":
+                fut = pending.pop(rest[0], None)
+                if fut is not None:
+                    fut.set(rest[1])
+
+    threading.Thread(target=receive, name="viewer-rx", daemon=True).start()
+
+    ids = itertools.count()
+
+    def toggle():
+        req = next(ids)
+        fut = _RemoteFuture()
+        pending[req] = fut
+        send(("toggle_record", req))
+        return fut
+
+    def status():
+        rec = state["record"]
+        started = rec.get("started")
+        recording = bool(rec.get("recording"))
+        return {"recording": recording,
+                "elapsed": time.time() - started if recording and started
+                else None}
+
+    if contact:
+        viewer_kwargs["contact_source"] = lambda: state["leadoff"]
+    if record:
+        viewer_kwargs["record_control"] = {"status": status, "toggle": toggle}
+    try:
+        run_viewer(frames, **viewer_kwargs)
+    except Exception:
+        send(("error", traceback.format_exc()))
+        raise
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
 def _mock_feed(q: "queue.Queue", nch=8, fs=250, stop=None):
     """Synthetic EEG-ish frames so the UI can be tried without hardware."""
     t = 0.0
@@ -1476,28 +1608,40 @@ def _selftest():
     m.set_filters(0.3, 35.0, 60.0)
     assert m.filt.shape == m.raw.shape
     m.set_filters(0.3, 35.0, None)
-    # ---- electrode contact (debounced DC lead-off) ------------------------ #
+    # ---- electrode, REF and GND contact (debounced) ---------------------- #
+    fs_uv = VREF_UV / 24
     ct = ContactTracker(8, window=4)
-    assert ct.electrode(0) is None and ct.ref() is None   # nothing read yet
+    assert ct.electrode(0) is None and ct.ref() is None and ct.gnd() is None
     ct.update(None)                                       # no readout: ignored
     assert ct.electrode(0) is None
 
-    def _st(p_off=(), n_off=()):
-        return [{"ch": c, "p_off": c in p_off, "n_off": c in n_off}
-                for c in range(1, 9)]
+    def _st(p_off=()):
+        return [{"ch": c, "p_off": c in p_off, "n_off": True}   # N stuck, as on
+                for c in range(1, 9)]                          # the PiEEG-8
+    rng = np.random.default_rng(1)
+    quiet = rng.normal(0, 0.3, (60, 8))                   # REF+GND in: tiny
+    rail2 = quiet.copy()
+    rail2[:, 1] = fs_uv                                   # E2 floating: rails
     for _ in range(4):
-        ct.update(_st(p_off={2}))
+        ct.update(_st(p_off={2}), rail2, fs_uv)
     assert ct.electrode(0) == "green" and ct.electrode(1) == "red"
-    ct.update(_st())                                      # E2 flickers back on
+    assert ct.ref() == "green" and ct.gnd() == "green"   # stuck N ignored
+    ct.update(_st(), quiet, fs_uv)                       # E2 flickers back on
     assert ct.electrode(1) == "amber"
-    assert ct.ref() == "green"
-    for _ in range(4):
-        ct.update(_st(n_off=set(range(1, 9))))            # reference lifted
-    assert ct.ref() == "red"
-    ct.update(_st(n_off={1}))                             # 1 of 8 N flags: on
-    assert ct.ref() == "amber"
+    t = np.arange(60) / 250
+    floating = (-67600 + 1700 * np.sin(2 * np.pi * 60 * t))[:, None] \
+        + rng.normal(0, 1, (60, 8))                      # REF out: one shared
+    for _ in range(4):                                   # signal, not railed
+        ct.update(_st(), floating, fs_uv)
+    assert ct.ref() == "red" and ct.gnd() == "green"
+    for _ in range(4):                                   # BIO out: all flag off,
+        ct.update(_st(p_off=set(range(1, 9))), rng.normal(0, 150, (60, 8)),
+                  fs_uv)                                 # nothing railed
+    assert ct.gnd() == "red"
+    ct.update(_st(), None)                               # no signal yet: leads
+    assert ct.gnd() == "red"                             # only, REF/GND unchanged
     assert ct.electrode(99) is None
-    m.contact.update(_st(p_off={1}))
+    m.contact.update(_st(p_off={1}), quiet, fs_uv)
     assert m.site_contact("Fp1") == "red" and m.site_contact("Fp2") == "green"
     print("acq_viewer selftest OK "
           f"(win={m.win}, rows={[r['name'] for r in m.rows()]})")
