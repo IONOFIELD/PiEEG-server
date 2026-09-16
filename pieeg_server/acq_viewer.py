@@ -12,6 +12,8 @@ WHAT THIS IS
       * Sensitivity (microvolts per millimetre -> trace height)
       * Montage: three bipolar presets + a Custom montage; right-click a
         lead to edit, Save to keep your edits across reboots
+      * Electrode contact: a green/amber/red dot beside each electrode of a
+        lead, plus a REF dot, from the chip's DC lead-off comparators
 
     It is a live VIEW only. Like ws_server.py it is a read-only subscriber on
     the acquisition fan-out, so it never touches acquisition, calibration, the
@@ -35,7 +37,8 @@ RUN IT ALONE (no hardware, to try the UI)
     python -m pieeg_server.acq_viewer --mock
 
 NORMALLY
-    Launched by pieeg_server/securelink_console.py, which feeds it live frames.
+    Launched by pieeg_server/scope_console.py, which feeds it live frames and
+    the hardware's lead-off readout.
 """
 
 import argparse
@@ -45,6 +48,7 @@ import queue
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +109,12 @@ DEFAULT_SENS = 7          # microvolts per millimetre
 WINDOW_SECONDS = 10.0     # width of the strip-chart
 PX_PER_MM = 4.0           # screen pixels per "millimetre" for sensitivity
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
+# Preferred window size. Smaller screens (the Pi's 7" 800x480 DSI panel) get
+# the window maximised to fit instead.
+WINDOW_W, WINDOW_H = 1000, 640
+# Electrode contact is judged over this many redraws (~0.5 s): a lead-off
+# flag that flickers within the window reads as intermittent (amber).
+CONTACT_WINDOW = 8
 
 # ── REACT EEG (Geist) palette, adapted for the Tk scope ──────────────────────
 # Mirrors the dashboard's design tokens (dashboard/src/index.css): near-black
@@ -266,6 +276,55 @@ class MontageStore:
             return False
 
 
+class ContactTracker:
+    """Debounced per-electrode contact from the ADS1299 DC lead-off flags.
+
+    The chip re-judges lead-off on every sample, so a marginal electrode can
+    flip between on and off many times a second. The viewer feeds the latest
+    flags in once per redraw and each electrode is judged over the last
+    CONTACT_WINDOW polls: green = on throughout, red = off throughout,
+    amber = flickering (intermittent contact). Electrodes are the P inputs;
+    every N input shares the one SRB1 reference electrode, so REF is judged
+    the same way from a majority vote of the N flags.
+    """
+
+    def __init__(self, num_channels, window=CONTACT_WINDOW):
+        self._hist = [deque(maxlen=window) for _ in range(num_channels)]
+        self._ref = deque(maxlen=window)
+
+    def update(self, status):
+        """Feed one leadoff_status() readout (list of per-channel dicts)."""
+        if not status:
+            return
+        n_votes = []
+        for c in status:
+            i = int(c.get("ch", 0)) - 1
+            if 0 <= i < len(self._hist):
+                self._hist[i].append(bool(c.get("p_off")))
+                n_votes.append(bool(c.get("n_off")))
+        if n_votes:
+            self._ref.append(sum(n_votes) * 2 > len(n_votes))
+
+    @staticmethod
+    def _verdict(hist):
+        if not hist:
+            return None
+        off = sum(hist)
+        if off == 0:
+            return "green"
+        return "red" if off == len(hist) else "amber"
+
+    def electrode(self, index):
+        """Verdict for the electrode at input index (0 = E1), or None."""
+        if 0 <= index < len(self._hist):
+            return self._verdict(self._hist[index])
+        return None
+
+    def ref(self):
+        """Verdict for the shared reference electrode, or None."""
+        return self._verdict(self._ref)
+
+
 class ViewerModel:
     """Holds rolling data + montage state; no Tk, so it is unit-testable."""
 
@@ -279,6 +338,7 @@ class ViewerModel:
         self.filt = np.zeros((self.win, num_channels), dtype=np.float64)
         self.filled = 0
         self.filter = StreamingFilter(num_channels, fs)
+        self.contact = ContactTracker(num_channels)
         # Per-montage working copies (session edits live here; presets never
         # change). Each row: {"pair": (a,b), "name": "Fp1-C3", "on": True}.
         self.sessions: dict[str, list[dict]] = {}
@@ -384,6 +444,10 @@ class ViewerModel:
         """
         return f"E{self.site_index[site] + 1}"
 
+    def site_contact(self, site):
+        """Contact verdict (green/amber/red/None) for a scalp site's electrode."""
+        return self.contact.electrode(self.site_index[site])
+
     def epair_name(self, pair):
         """'E1-E3' style name for a bipolar (upper, lower) site pair."""
         a, b = pair
@@ -471,10 +535,61 @@ class ViewerModel:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Tk UI  (imported lazily so the model/tests don't need a display)
 # ─────────────────────────────────────────────────────────────────────────────
+def _mode_label(mode):
+    """Operator-facing network name for a connect-target mode."""
+    return {"wifi": "WI-FI", "ethernet": "ETHERNET"}.get(str(mode),
+                                                        str(mode).upper())
+
+
+def show_error_window(title, headline, detail, log_path=None,
+                      auto_close_ms=None):
+    """A small Geist-styled window explaining why the Scope couldn't start.
+
+    The desktop launcher has no terminal, so without this a failed launch
+    looks like the icon doing nothing. Blocks until closed. Returns False if
+    there is no display to show it on (the reason is still in the log).
+    """
+    import tkinter as tk
+    from tkinter import font as tkfont
+    C = GEIST
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        return False
+    mono = tkfont.nametofont("TkFixedFont").actual("family")
+    root.title(title)
+    root.configure(bg=C["bg"], padx=20, pady=16)
+    root.attributes("-topmost", True)
+    wrap = min(460, root.winfo_screenwidth() - 80)
+    tk.Label(root, text=headline, bg=C["bg"], fg=C["red"], justify="left",
+             wraplength=wrap, font=("TkDefaultFont", 11, "bold")
+             ).pack(anchor="w")
+    tk.Label(root, text=detail, bg=C["bg"], fg=C["text"], justify="left",
+             wraplength=wrap, font=("TkDefaultFont", 9)
+             ).pack(anchor="w", pady=(8, 0))
+    if log_path:
+        tk.Label(root, text=f"Full log: {log_path}", bg=C["bg"],
+                 fg=C["text_dim"], font=(mono, 8)
+                 ).pack(anchor="w", pady=(10, 0))
+    tk.Button(root, text="Close", command=root.destroy, bg=C["surface"],
+              fg=C["text"], activebackground=C["raised"],
+              activeforeground=C["text"], relief="flat",
+              highlightbackground=C["border_hi"], padx=14
+              ).pack(anchor="e", pady=(14, 0))
+    root.update_idletasks()
+    x = max(0, (root.winfo_screenwidth() - root.winfo_reqwidth()) // 2)
+    y = max(0, (root.winfo_screenheight() - root.winfo_reqheight()) // 2)
+    root.geometry(f"+{x}+{y}")
+    if auto_close_ms:
+        root.after(auto_close_ms, root.destroy)
+    root.mainloop()
+    return True
+
 def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                electrodes=None, on_close=None, title="PiEEG - REACT EEG",
                auto_shot=None, auto_close_ms=None,
-               connect_popup=None):
+               connect_popup=None, contact_source=None,
+               record_control=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -482,8 +597,18 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     auto_shot / auto_close_ms: test hooks — after auto_close_ms, dump the
     canvas to a PostScript file (auto_shot) and close. Used by --shot to
     prove rendering without depending on the monitor being awake.
-    connect_popup: optional dict {"ip", "port", "mode"} for the "connect REACT
-    EEG to…" info popup. When given, a small always-on-top window is raised over
+    contact_source: optional zero-arg callable returning the hardware's
+    leadoff_status() list (or None). Polled once per redraw, in-process; when
+    given, each lead shows a contact dot per electrode and the status bar a
+    REF dot.
+    record_control: optional dict {"status": () -> {"recording", "elapsed"},
+    "toggle": () -> concurrent Future}. When given, one Rec/Stop button drives
+    the server's recorder; the Future's result dict ({"started": session} or
+    {"stopped": session, "saved": [suffixes], "seconds", "dir"}) is reported in a
+    toast. Status is polled each redraw, so a recording REACT starts shows too.
+    connect_popup: optional dict {"ip", "port", "mode", "targets"} for the
+    "connect REACT EEG to…" info popup; "targets" lists every reachable
+    (mode, ip), primary first. When given, a small always-on-top window is raised over
     the scope showing the connection target and STAYS in front until the
     operator minimises or closes it — so it can be read/transcribed and is never
     cut off when the scope draws. It is in-process (a Tk Toplevel), so it needs
@@ -505,8 +630,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     C = GEIST                               # short alias for the palette
     root = tk.Tk()
     root.title(title)
-    root.geometry("1000x640")
     root.configure(bg=C["bg"])
+    # Never open larger than the screen: on the Pi's 7" 800x480 panel the
+    # preferred size would spill off the bottom, so maximise into the usable
+    # area (the window manager keeps the taskbar clear) instead.
+    _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    if _sw <= WINDOW_W or _sh <= WINDOW_H:
+        root.geometry(f"{_sw}x{_sh}+0+0")
+        try:
+            root.attributes("-zoomed", True)
+        except tk.TclError:
+            pass
+    else:
+        root.geometry(f"{WINDOW_W}x{WINDOW_H}")
 
     # Shrink every bit of on-screen text ~10% for more room. Scaling the Tk
     # named fonts covers all the un-fonted widgets (labels, dropdowns, buttons);
@@ -553,6 +689,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     bordercolor="#000000", darkcolor="#000000",
                     lightcolor="#000000", relief="solid", borderwidth=1)
     style.map("IP.TButton", background=[("active", C["raised"])])
+    # Record toggle: red text while a recording is running.
+    style.configure("RecOn.TButton", background=C["surface"],
+                    foreground=C["red"], bordercolor=C["red"], relief="flat")
+    style.map("RecOn.TButton", background=[("active", C["raised"])])
 
     # Two compact control rows so everything fits on one screen. The montage
     # controls are the TOP row, the signal filters the row below it. There is
@@ -561,8 +701,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _menu(parent, label, values, initial, cb, width=None):
         # Uppercase micro-label in dim text — the Geist toolbar-label convention.
         # Label bg matches its parent so it blends inside a chip or on a bar.
-        tk.Label(parent, text=label.upper(), bg=parent["bg"], fg=C["text_dim"],
-                 font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 3))
+        # (µ is kept: str.upper() turns it into Greek capital Mu, which reads
+        # as "MV" — millivolts.)
+        tk.Label(parent, text=label.upper().replace("\u039c", "µ"),
+                 bg=parent["bg"], fg=C["text_dim"],
+                 font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(6, 2))
         var = tk.StringVar(value=initial)
         om = ttk.OptionMenu(parent, var, initial, *values,
                             command=lambda _v: cb(var.get()))
@@ -599,10 +742,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     mchip.pack(side="left", padx=(0, 6), pady=1)
     montage_var = _menu(mchip, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
                         lambda v: _switch_montage(v), width=14)
-    ttk.Button(mchip, text="Save",
+    ttk.Button(mchip, text="Save", width=5,
                command=lambda: _save_montage()).pack(side="left", padx=(2, 0),
                                                       pady=2)
-    ttk.Button(mchip, text="Reset",
+    ttk.Button(mchip, text="Reset", width=5,
                command=lambda: _reset_montage()).pack(side="left", padx=(2, 4),
                                                        pady=2)
 
@@ -613,8 +756,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _disp_to_site = dict(elec_choices)
     _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
 
-    # Bipolar chip: [BIPOLAR A – B  + Add] — Add reads as part of the channel it
-    # builds rather than a loose button beside it.
+    # Bipolar chip: [BIPOLAR A – B  +] — "+" adds the selected pair to the
+    # Custom montage and reads as part of the channel it builds. Kept compact
+    # so the whole row fits the 800 px panel beside the IP button.
     grp = _chip(bar2)
     grp.pack(side="left", padx=(0, 0), pady=1)
     tk.Label(grp, text="BIPOLAR", bg=C["raised"], fg=C["text_dim"],
@@ -625,12 +769,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                                                    padx=4)
     b_var = tk.StringVar(value=_b_default)
     ttk.OptionMenu(grp, b_var, _b_default, *elec_display).pack(side="left")
-    ttk.Button(grp, text="+ Add",
+    ttk.Button(grp, text="+", width=2,
                command=lambda: _add_bipolar()).pack(side="left", padx=(6, 4),
                                                      pady=2)
-    pick_hint = tk.Label(bar2, text="", bg=C["surface"], fg=C["text_dim"],
-                         font=(_MONO, _fs(9)))
-    pick_hint.pack(side="left", padx=8)
 
     # ---- row 2 (below): signal filters (+ live status) -------------------- #
     bar = tk.Frame(root, bg=C["surface"])
@@ -645,21 +786,53 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     lambda v: _apply_filters(), width=6)
     notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
                       lambda v: _apply_filters(), width=6)
-    # Sensitivity chip (display gain, kept separate from the frequency filters)
+    # Sensitivity chip (display gain, kept separate from the frequency filters;
+    # labelled by its unit alone to fit the 800 px panel)
     schip = _chip(bar)
     schip.pack(side="left", pady=1)
-    sens_var = _menu(schip, "Sens µV/mm", [str(s) for s in SENS_CHOICES],
+    sens_var = _menu(schip, "µV/mm", [str(s) for s in SENS_CHOICES],
                      str(DEFAULT_SENS), lambda v: None, width=5)
 
-    # Live status with a Geist-style signal dot: green = frames flowing (live),
-    # yellow = buffered but stalled this tick, red = no data yet.
-    status_wrap = tk.Frame(bar, bg=C["surface"])
-    status_wrap.pack(side="right", padx=8)
-    status_dot = tk.Label(status_wrap, text="●", bg=C["surface"], fg=C["yellow"])
-    status_dot.pack(side="left", padx=(0, 5))
-    status = tk.Label(status_wrap, text="starting…", bg=C["surface"],
-                      fg=C["text_sec"], font=(_MONO, _fs(9)))
-    status.pack(side="left")
+    # One Rec/Stop toggle (saves space): starts the server's crash-safe
+    # recording; pressing again stops it and exports the BDF+ file.
+    rec_btn = None
+    if record_control is not None:
+        rec_btn = ttk.Button(bar, text="● Rec", width=7,
+                             command=lambda: _toggle_record())
+        rec_btn.pack(side="left", padx=(6, 0), pady=1)
+
+    # Electrode cluster, right of the filters: REF ●  GND ●  [AVG IMP —].
+    # REF is live from the DC lead-off comparators. GND (the bias electrode)
+    # and the average impedance in kΩ can't come from the live stream — the
+    # DC comparators never see the bias lead and only say on/off — so both
+    # stay grey/"—" until an impedance check measures them
+    # (docs/IMPEDANCE_CHECK_PLAN.md).
+    ref_dot = gnd_dot = imp_lbl = None
+    if contact_source is not None:
+        ewrap = tk.Frame(bar, bg=C["surface"])
+        ewrap.pack(side="right", padx=(0, 2))
+
+        def _elec_dot(text):
+            tk.Label(ewrap, text=text, bg=C["surface"], fg=C["text_dim"],
+                     font=("TkDefaultFont", _fs(9))).pack(side="left",
+                                                           padx=(5, 2))
+            dot = tk.Label(ewrap, text="●", bg=C["surface"], fg=C["text_dim"])
+            dot.pack(side="left")
+            return dot
+        ref_dot = _elec_dot("REF")
+        gnd_dot = _elec_dot("GND")
+        ibox = _chip(ewrap)
+        ibox.pack(side="left", padx=(6, 0), pady=1)
+        # Fixed width, sized for the longest reading ("AVG IMP 99.9 kΩ"), so
+        # the row doesn't shift once values arrive.
+        imp_lbl = tk.Label(ibox, text="AVG IMP —", width=15, bg=C["raised"],
+                           fg=C["text_dim"], font=(_MONO, _fs(10), "bold"))
+        imp_lbl.pack(padx=4, pady=2)
+
+    # Stream health (signal dot + measured sample rate) is drawn on the chart's
+    # bottom-right corner, not the toolbar, so no unlabelled dot sits by REF.
+    # Dot: green = frames flowing, yellow = buffered but stalled, red = none.
+    _stream = {"text": "starting…", "fg": C["yellow"]}
 
     # ---- signature blue→green gradient hairline (Geist header motif) ------ #
     def _lerp(c1, c2, t):
@@ -703,41 +876,92 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         """After any montage edit: update the dirty star on the picker."""
         _refresh_montage_label()
 
+    # Short feedback ("added E1-E3", "saved …") as a toast drawn at the top
+    # right of the chart, so it has room even on the 800 px panel.
+    _toast = {"text": "", "until": 0.0, "fg": C["text_sec"]}
+
+    def _hint(text, seconds=4.0, fg=None):
+        _toast.update(text=text, until=time.monotonic() + seconds,
+                      fg=fg or C["text_sec"])
+
     def _switch_montage(name):
         model.load_montage(name)
-        pick_hint.config(text="")
+        _toast["until"] = 0.0
         _refresh_montage_label()
 
     def _save_montage():
         if not model.dirty():
-            pick_hint.config(text="no changes to save")
+            _hint("no changes to save")
             return
         if model.save_current():
-            pick_hint.config(text=f"{model.current} saved · loads on startup")
+            _hint(f"{model.current} saved · loads on startup")
         else:
-            pick_hint.config(text="save failed (disk?)")
+            _hint("save failed (disk?)", fg=C["red"])
         _refresh_montage_label()
 
     def _reset_montage():
         model.reset_current_to_preset()
-        pick_hint.config(
-            text="Custom cleared" if model.current == CUSTOM_MONTAGE
-            else "factory montage · Save to keep it")
+        _hint("Custom cleared" if model.current == CUSTOM_MONTAGE
+              else "factory montage · Save to keep it")
         _refresh_montage_label()
 
     def _add_bipolar():
         a = _disp_to_site.get(a_var.get())
         b = _disp_to_site.get(b_var.get())
         if not a or not b or a == b:
-            pick_hint.config(text="pick two different electrodes")
+            _hint("pick two different electrodes")
             return
         added = model.add_bipolar(a, b)        # switches current -> Custom
         if added:
-            pick_hint.config(text=f"added {model.epair_name((a, b))}  ·  "
-                                  "right-click a lead to edit")
+            _hint(f"added {model.epair_name((a, b))} to Custom  ·  "
+                  "right-click a lead to edit")
         else:
-            pick_hint.config(text="already in Custom")
+            _hint("already in Custom")
         _refresh_montage_label()
+
+    _rec = {"future": None}
+
+    def _toggle_record():
+        if _rec["future"] is not None:
+            return                          # a start/stop is still finishing
+        try:
+            _rec["future"] = record_control["toggle"]()
+        except Exception as e:              # noqa: BLE001 - report, don't crash
+            _hint(f"recording failed: {e}", seconds=8, fg=C["red"])
+
+    def _poll_record():
+        if rec_btn is None:
+            return
+        fut = _rec["future"]
+        if fut is not None and fut.done():
+            _rec["future"] = None
+            try:
+                res = fut.result()
+            except Exception as e:          # noqa: BLE001
+                _hint(f"recording failed: {e}", seconds=8, fg=C["red"])
+            else:
+                if "started" in res:
+                    _hint(f"recording {res['started']}", fg=C["red"])
+                elif res.get("saved"):
+                    _hint(f"saved {res['stopped']} ({res.get('seconds', 0):.0f} s)"
+                          f"  {' '.join(res['saved'])}  →  {res['dir']}",
+                          seconds=10, fg=C["green"])
+                else:
+                    _hint("recording stopped (no files found)", seconds=8,
+                          fg=C["yellow"])
+        try:
+            st = record_control["status"]()
+        except Exception:                   # noqa: BLE001 - display only
+            return
+        if _rec["future"] is not None:
+            rec_btn.configure(text="saving…" if st.get("recording")
+                              else "starting…", style="TButton")
+        elif st.get("recording"):
+            secs = int(st.get("elapsed") or 0)
+            rec_btn.configure(text=f"■ {secs // 60:02d}:{secs % 60:02d}",
+                              style="RecOn.TButton")
+        else:
+            rec_btn.configure(text="● Rec", style="TButton")
 
     def _row_at_y(y):
         """The visible row under a canvas y-coordinate, or None."""
@@ -828,8 +1052,29 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             model.push(arr)
         return len(batch)
 
+    _CONTACT_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
+    # Measured sample rate: frames drained per second, re-estimated ~1 Hz.
+    _rate = {"t": time.monotonic(), "n": 0, "sps": None}
+
+    def _poll_contact():
+        if contact_source is None:
+            return
+        try:
+            model.contact.update(contact_source())
+        except Exception:                   # noqa: BLE001 - display only
+            return
+        verdict = model.contact.ref()
+        ref_dot.config(fg=_CONTACT_FG.get(verdict, C["text_dim"]))
+
     def _redraw():
         got = _drain_queue()
+        _poll_contact()
+        _poll_record()
+        _rate["n"] += got
+        _now = time.monotonic()
+        if _now - _rate["t"] >= 1.0:
+            _rate["sps"] = _rate["n"] / (_now - _rate["t"])
+            _rate["t"], _rate["n"] = _now, 0
         canvas.delete("trace")
         W = canvas.winfo_width()
         H = canvas.winfo_height()
@@ -883,10 +1128,24 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 canvas.create_rectangle(cx - chip / 2, base - 13, cx + chip / 2,
                                         base + 13, fill=C["canvas_bg"],
                                         outline="", tags="trace")
-                canvas.create_text(cx, base - 5, text=e_name, fill=C["text"],
-                                   font=(_MONO, _fs(8), "bold"), tags="trace")
+                e_text = canvas.create_text(cx, base - 5, text=e_name,
+                                            fill=C["text"],
+                                            font=(_MONO, _fs(8), "bold"),
+                                            tags="trace")
                 canvas.create_text(cx, base + 6, text=s_name, fill=C["text_sec"],
                                    font=(_MONO, _fs(8)), tags="trace")
+                # 6) contact dots flanking the electrode pair: left = upper
+                #    electrode, right = lower (green on / amber intermittent /
+                #    red off). None until the first lead-off readout.
+                if contact_source is not None:
+                    tx0, _, tx1, _ = canvas.bbox(e_text)
+                    for site, dot_x in ((r["pair"][0], tx0 - 7),
+                                        (r["pair"][1], tx1 + 7)):
+                        fg = _CONTACT_FG.get(model.site_contact(site))
+                        if fg:
+                            canvas.create_oval(dot_x - 3, base - 8, dot_x + 3,
+                                               base - 2, fill=fg, outline="",
+                                               tags="trace")
             # calibration marker: 100 uV vertical, 1 s horizontal
             cal_uv = 100.0 / sens * PX_PER_MM
             cal_s = W / WINDOW_SECONDS
@@ -899,12 +1158,32 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
             canvas.create_text(x0 + cal_s + 4, y0, text="1 s", anchor="w",
                                fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
+        if _toast["text"] and time.monotonic() < _toast["until"] and W > 2:
+            tid = canvas.create_text(W - 12, 12, text=_toast["text"],
+                                     anchor="ne", fill=_toast["fg"],
+                                     font=(_MONO, _fs(9)), tags="trace")
+            x0, y0, x1, y1 = canvas.bbox(tid)
+            bg = canvas.create_rectangle(x0 - 8, y0 - 4, x1 + 8, y1 + 4,
+                                         fill=C["surface"],
+                                         outline=C["border_hi"], tags="trace")
+            canvas.tag_lower(bg, tid)
         pct = int(100 * model.filled / model.win)
-        status.config(text=f"buffer {pct:3d}%   +{got}/tick")
-        # Signal dot: green = frames flowing, yellow = buffered but stalled,
-        # red = nothing yet.
-        status_dot.config(fg=C["green"] if got > 0
-                          else C["yellow"] if model.filled > 0 else C["red"])
+        # While the 10 s window fills, show progress; after that, the rate
+        # frames actually arrive at (should match the chip's CONFIG1 rate).
+        if pct < 100 or _rate["sps"] is None:
+            _stream["text"] = f"buffer {pct}%"
+        else:
+            _stream["text"] = f"{_rate['sps']:.0f} sps"
+        _stream["fg"] = (C["green"] if got > 0
+                         else C["yellow"] if model.filled > 0 else C["red"])
+        if W > 2 and H > 2:
+            sid = canvas.create_text(W - 10, H - 10, anchor="se",
+                                     text=_stream["text"], fill=C["axis"],
+                                     font=(_MONO, _fs(9)), tags="trace")
+            x0, y0, _, y1 = canvas.bbox(sid)
+            canvas.create_text(x0 - 4, (y0 + y1) / 2, anchor="e", text="●",
+                               fill=_stream["fg"], font=(_MONO, _fs(9)),
+                               tags="trace")
         root.after(REDRAW_MS, _redraw)
 
     def _on_close():
@@ -954,11 +1233,25 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                  font=("TkDefaultFont", _fs(12), "bold")).pack(pady=(10, 2))
         tk.Label(pop, text="CONNECT REACT EEG TO", bg=C["bg"], fg=C["text_dim"],
                  font=("TkDefaultFont", _fs(10))).pack(pady=(4, 2))
-        # The address is data → mono, in the accent blue.
-        tk.Label(pop, text=f"ws://{ip}:{port}", bg=C["bg"], fg=C["accent_lt"],
-                 font=(_MONO, _fs(16), "bold")).pack()
-        tk.Label(pop, text=f"({mode})", bg=C["bg"], fg=C["text_sec"],
-                 font=(_MONO, _fs(10))).pack(pady=(0, 8))
+        # Every address the server is reachable on (Wi-Fi AND the Ethernet
+        # cable when both are up), primary first — the laptop uses whichever
+        # network it's on. Addresses are data → mono, in the accent blue.
+        targets = connect_popup.get("targets") or [(mode, ip)]
+        if len(targets) == 1:
+            tk.Label(pop, text=f"ws://{targets[0][1]}:{port}", bg=C["bg"],
+                     fg=C["accent_lt"], font=(_MONO, _fs(16), "bold")).pack()
+            tk.Label(pop, text=f"({_mode_label(targets[0][0])})", bg=C["bg"],
+                     fg=C["text_sec"], font=(_MONO, _fs(10))).pack(pady=(0, 8))
+        else:
+            addrs = tk.Frame(pop, bg=C["bg"])
+            addrs.pack(pady=(2, 8))
+            for row, (t_mode, t_ip) in enumerate(targets):
+                tk.Label(addrs, text=f"ws://{t_ip}:{port}", bg=C["bg"],
+                         fg=C["accent_lt"], font=(_MONO, _fs(15), "bold")
+                         ).grid(row=row, column=0, sticky="w")
+                tk.Label(addrs, text=_mode_label(t_mode), bg=C["bg"],
+                         fg=C["text_sec"], font=(_MONO, _fs(10))
+                         ).grid(row=row, column=1, sticky="w", padx=(10, 0))
 
         # ---- collapsible version history --------------------------------- #
         # Collapsed by default: just the current version title, clickable. Click
@@ -1077,6 +1370,20 @@ def _mock_feed(q: "queue.Queue", nch=8, fs=250, stop=None):
         time.sleep(dt)
 
 
+def _mock_contact(nch=8):
+    """Lead-off readouts for the standalone --mock window: E6 off, E4
+    flickering (intermittent), REF and the rest connected."""
+    tick = {"n": 0}
+
+    def source():
+        tick["n"] += 1
+        off = {6} | ({4} if tick["n"] % 3 == 0 else set())
+        return [{"ch": c, "off": c in off, "p_off": c in off, "n_off": False,
+                 "state": "red" if c in off else "green"}
+                for c in range(1, nch + 1)]
+    return source
+
+
 def _selftest():
     """Headless-ish smoke test: exercise the model + one filter/montage cycle.
 
@@ -1169,6 +1476,29 @@ def _selftest():
     m.set_filters(0.3, 35.0, 60.0)
     assert m.filt.shape == m.raw.shape
     m.set_filters(0.3, 35.0, None)
+    # ---- electrode contact (debounced DC lead-off) ------------------------ #
+    ct = ContactTracker(8, window=4)
+    assert ct.electrode(0) is None and ct.ref() is None   # nothing read yet
+    ct.update(None)                                       # no readout: ignored
+    assert ct.electrode(0) is None
+
+    def _st(p_off=(), n_off=()):
+        return [{"ch": c, "p_off": c in p_off, "n_off": c in n_off}
+                for c in range(1, 9)]
+    for _ in range(4):
+        ct.update(_st(p_off={2}))
+    assert ct.electrode(0) == "green" and ct.electrode(1) == "red"
+    ct.update(_st())                                      # E2 flickers back on
+    assert ct.electrode(1) == "amber"
+    assert ct.ref() == "green"
+    for _ in range(4):
+        ct.update(_st(n_off=set(range(1, 9))))            # reference lifted
+    assert ct.ref() == "red"
+    ct.update(_st(n_off={1}))                             # 1 of 8 N flags: on
+    assert ct.ref() == "amber"
+    assert ct.electrode(99) is None
+    m.contact.update(_st(p_off={1}))
+    assert m.site_contact("Fp1") == "red" and m.site_contact("Fp2") == "green"
     print("acq_viewer selftest OK "
           f"(win={m.win}, rows={[r['name'] for r in m.rows()]})")
 
@@ -1194,6 +1524,7 @@ def main(argv=None):
                               daemon=True)
         th.start()
         run_viewer(q, num_channels=8, fs=250, on_close=stop.set,
+                   contact_source=_mock_contact(8),
                    auto_shot=args.shot,
                    auto_close_ms=(2500 if args.shot else None))
         return

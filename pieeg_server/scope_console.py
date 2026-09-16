@@ -35,16 +35,40 @@ USAGE
     python -m pieeg_server.scope_console --device pieeg16
     python -m pieeg_server.scope_console --mock                # synthetic data
     python -m pieeg_server.scope_console --mock --seconds 5    # auto-close (test)
+
+LOGS
+    The desktop icon runs without a terminal, so everything is also written
+    to ~/.pieeg/scope.log, and a launch that can't start (shield not
+    answering, port 1616 busy, ...) shows an on-screen error window saying why.
+
+RECORDINGS
+    The Rec/Stop button (and REACT's start_record) save to the external USB
+    drive, /mnt/pieeg128/eeg-recordings by default (--recordings-dir to
+    change): journal + CSV while recording, BDF+ exported on Stop. The Rec
+    button refuses to start if that folder isn't on the USB drive, so a
+    missing drive never means sessions silently landing on the SD card.
 """
 
 import argparse
 import asyncio
+import errno
 import logging
+import os
 import queue
 import socket
+import sys
 import threading
+import time
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 logger = logging.getLogger("pieeg.scope_console")
+
+LOG_PATH = Path.home() / ".pieeg" / "scope.log"
+# Recordings default to the external 128 GB USB drive's EEG folder (the one
+# the Samba share and eeg-poststop.sh use), never the SD card and never
+# wherever the desktop icon happened to launch from.
+RECORDINGS_DIR = Path("/mnt/pieeg128/eeg-recordings")
 
 # ── PiEEG Scope version history ──────────────────────────────────────────────
 # The Scope's own product version (separate from the repo's git tags). It starts
@@ -115,6 +139,22 @@ SCOPE_CHANGELOG = [
             "connected), amber (one side floating) or red (both off), sent to "
             "REACT so you can seat electrodes without eyeballing the trace. "
             "The in-process lead viewer still shows waveforms only."),
+    ("2.7", "Record from the Scope: one Rec/Stop button saves the session to "
+            "the external USB drive (eeg-recordings) and exports a BDF+ file "
+            "on Stop; it refuses if the drive isn't mounted. Each lead shows "
+            "a contact dot per electrode (green on, amber intermittent, red "
+            "off). The status bar reads REF (live), GND and an AVG IMP box; "
+            "GND and the kΩ average stay grey until the impedance check "
+            "lands. The sensitivity label now reads µV/MM (it showed MV). "
+            "Acquisition waits on the DRDY interrupt, so recordings no longer "
+            "drop ~3% of samples while the Scope is open. The bipolar "
+            "picker's add button is a compact \"+\" that fits the 7\" "
+            "800x480 panel, and the window "
+            "fits that screen. The connection popup lists every address "
+            "(Wi-Fi and Ethernet). The Scope, REACT and recordings use the "
+            "sample rate actually set on the chip, shown live as \"sps\". A "
+            "launch that can't start now says why on screen and in "
+            "~/.pieeg/scope.log."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -132,6 +172,8 @@ def _num_channels(device: str) -> int:
 
 
 def _sample_rate(device: str) -> int:
+    """Nominal rate for a device; hardware that reports its configured rate
+    (PiEEG reads CONFIG1) overrides this once open."""
     return 500 if device == "ironbci32" else 250
 
 
@@ -171,6 +213,103 @@ def _connect_target() -> tuple[str, str]:
     return "offline", "127.0.0.1"
 
 
+def _connect_targets(host: str) -> list[tuple[str, str]]:
+    """Every (mode, ip) a REACT EEG laptop can reach the server on, primary
+    first.
+
+    The server binds all interfaces by default, so when the secure-link
+    cable AND Wi-Fi are both up a laptop can connect over either; listing only
+    one would mis-direct a laptop on the other network. Local interface reads
+    only (offline-safe). A specific --host is the only reachable address.
+    """
+    if host not in ("0.0.0.0", "", "::"):
+        return [("host", host)]
+    targets = [_connect_target()]
+    try:
+        from .securelink_stream import (ETHERNET_IFACE, WIFI_IFACE,
+                                        ethernet_carrier_up, interface_ipv4)
+        eth = interface_ipv4(ETHERNET_IFACE) if ethernet_carrier_up() else None
+        for mode, ip in (("ethernet", eth), ("wifi", interface_ipv4(WIFI_IFACE))):
+            if ip and all(ip != known for _, known in targets):
+                targets.append((mode, ip))
+    except Exception:  # noqa: BLE001 - hint must never block the scope
+        pass
+    real = [t for t in targets if t[0] != "offline"]
+    return real or targets
+
+
+def _off_usb_problem(path: Path) -> str | None:
+    """Why `path` isn't a safe place to record (not on the external drive).
+
+    Compares the filesystem device of the nearest existing ancestor with the
+    root filesystem's: if /mnt/pieeg128 isn't mounted, the folder would be a
+    plain directory on the SD card, and recording must refuse instead.
+    """
+    probe = path
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        on_root = os.stat(probe).st_dev == os.stat("/").st_dev
+    except OSError as e:
+        return f"can't check {path}: {e}"
+    if on_root:
+        return (f"{path} is not on the external USB drive — is the drive "
+                "plugged in and mounted?")
+    return None
+
+
+def _setup_logging(verbose: bool):
+    """Log to the console AND ~/.pieeg/scope.log (the icon has no terminal)."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(LOG_PATH, maxBytes=1_000_000,
+                                            backupCount=2))
+    except OSError:
+        pass  # read-only home etc. — console logging still works
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(message)s", handlers=handlers)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+def _explain_hw_error(exc: BaseException, args) -> tuple[str, str]:
+    """(headline, what-to-do) for a hardware open() failure."""
+    text = str(exc)
+    if isinstance(exc, SystemExit):
+        return ("PiEEG hardware library missing",
+                "spidev isn't installed in the Scope's Python environment. "
+                "Re-run ./setup.sh in the PiEEG-server folder.")
+    if "SPI comms failed" in text:
+        return ("The PiEEG shield didn't answer",
+                "The ADS1299 never returned its ID over SPI. Check the shield "
+                "is pressed fully onto all 40 GPIO pins and its battery "
+                "supply is on, then launch the Scope again.")
+    if "gain readback" in text.lower():
+        return ("The shield's amplifier gain didn't verify",
+                f"{text}\n\nRelaunch; if it repeats, power-cycle the shield.")
+    if isinstance(exc, PermissionError):
+        return ("No permission to use SPI/GPIO",
+                "This user needs the spi and gpio groups "
+                "(sudo usermod -aG spi,gpio $USER, then log out and back in).")
+    if isinstance(exc, OSError):
+        return ("SPI or GPIO device unavailable",
+                f"{text}\n\nCheck SPI is enabled (raspi-config → Interface "
+                f"Options → SPI) and the GPIO chip {args.gpio_chip} exists.")
+    return ("PiEEG hardware failed to open", f"{type(exc).__name__}: {text}")
+
+
+def _startup_error(args, headline: str, detail: str) -> int:
+    """Log a launch failure and show it on screen. Returns the exit code."""
+    logger.error("Scope could not start: %s — %s", headline, detail)
+    from .acq_viewer import show_error_window
+    show_error_window(f"PiEEG Scope v{SCOPE_VERSION} couldn't start",
+                      headline, detail, log_path=str(LOG_PATH),
+                      auto_close_ms=(int(args.seconds * 1000)
+                                     if args.seconds else None))
+    return 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="PiEEG Scope console: the plain ws:// server + local live "
@@ -196,15 +335,15 @@ def main(argv=None):
     parser.add_argument("--mock", action="store_true",
                         help="mock server, no PiEEG hardware: all channels "
                              "carry the 2 Hz square calibration signal")
+    parser.add_argument("--recordings-dir", type=Path, default=RECORDINGS_DIR,
+                        help="where recordings are saved; must be on the "
+                             "external USB drive (default: %(default)s)")
     parser.add_argument("--seconds", type=float, default=None,
                         help="auto-close the viewer after N seconds (testing)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="debug logging")
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(name)s %(message)s")
-    logging.getLogger("websockets").setLevel(logging.WARNING)
+    _setup_logging(args.verbose)
 
     # Import here so --help works even off the Pi. These are the EXISTING
     # public pieces of the serve path; we do not modify them.
@@ -240,16 +379,33 @@ def main(argv=None):
         from .hardware import PiEEGHardware
         hw = PiEEGHardware(gpio_chip=args.gpio_chip, num_channels=num_ch,
                            profile=args.profile)
-    hw.open()
+    try:
+        hw.open()
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - explained on screen
+        logger.exception("hardware open failed")
+        try:
+            hw.close()                      # release whatever did open
+        except Exception:                   # noqa: BLE001 - best-effort
+            pass
+        return _startup_error(args, *_explain_hw_error(e, args))
+    # The rate the chip was actually programmed with (PiEEG reads it back from
+    # CONFIG1); the nominal device rate only for hardware that can't say.
+    fs = getattr(hw, "sample_rate", None) or fs
 
     # ---- acquisition (thread) + event loop (bg thread) --------------------- #
     loop = asyncio.new_event_loop()          # created here, RUN in the bg thread
-    acq = AcquisitionLoop(hw, loop, mock=args.mock, ble=ble, serial=serial)
+    # PiEEG over SPI waits on the DRDY interrupt instead of busy-polling it
+    # (as securelink_console does). Busy-polling holds the GIL against the Tk
+    # viewer in this same process; measured on the Pi 4 it lost ~3% of samples
+    # (243 of 250 SPS) while the Scope recorded, versus ~0 with the interrupt.
+    acq = AcquisitionLoop(hw, loop, mock=args.mock, ble=ble, serial=serial,
+                          interrupt=not (args.mock or ble or serial))
 
     # ---- server (plain ws://) + optional dashboard ------------------------- #
     server = PiEEGServer(acq, host=args.host, port=args.port,
                          num_channels=acq.num_channels)
     server._lsl_groups = profiles.load_lsl_groups()
+    server._recordings_dir = args.recordings_dir
     server.enable_webhooks()
 
     dashboard = None
@@ -284,6 +440,41 @@ def main(argv=None):
                 boot_error["exc"] = exc
         ready.set()
 
+    # ---- recording (the viewer's Rec/Stop toggle) --------------------------- #
+    # Drives the server's own recorder — the same start/stop REACT's
+    # start_record/stop_record commands use — so the journal, CSV and BDF+
+    # export are unchanged and REACT is told the recording state either way.
+    def _record_status():
+        recording = server._get_record_status()["record_status"]["recording"]
+        started = server._record_start_time
+        return {"recording": recording,
+                "elapsed": (time.time() - started) if recording and started
+                else None}
+
+    async def _toggle_record():
+        status = _record_status()
+        if status["recording"]:
+            session = server._last_session
+            await server._stop_recording()
+            saved = sorted(p.suffix for p in
+                           args.recordings_dir.glob(f"{session}.*")
+                           if p.suffix in (".bdf", ".edf", ".csv"))
+            return {"stopped": session, "saved": saved,
+                    "seconds": status["elapsed"] or 0.0,
+                    "dir": str(args.recordings_dir)}
+        problem = _off_usb_problem(args.recordings_dir)
+        if problem:
+            logger.error("recording refused: %s", problem)
+            raise RuntimeError(problem)
+        await server._start_recording()
+        return {"started": server._last_session}
+
+    record_control = {
+        "status": _record_status,
+        "toggle": lambda: asyncio.run_coroutine_threadsafe(_toggle_record(),
+                                                           loop),
+    }
+
     async def _shutdown():
         # Runs ON the loop: cancel the server (its `async with serve()` closes
         # the socket) and the bridge, then unsubscribe the viewer.
@@ -302,30 +493,52 @@ def main(argv=None):
         loop.create_task(_boot())
         loop.run_forever()
 
+    def _abort_boot():
+        try:
+            asyncio.run_coroutine_threadsafe(_shutdown(), loop).result(timeout=5)
+        except Exception:                       # noqa: BLE001 - best-effort
+            pass
+        loop.call_soon_threadsafe(loop.stop)
+        bg.join(timeout=5)
+        hw.close()
+
     bg = threading.Thread(target=_run_loop, name="pieeg-scope-loop", daemon=True)
     bg.start()
     if not ready.wait(timeout=15):
-        logger.error("server did not become ready in time; aborting.")
-        loop.call_soon_threadsafe(loop.stop)
-        hw.close()
-        return
+        _abort_boot()
+        return _startup_error(
+            args, "The server didn't start in time",
+            "The WebSocket server took longer than 15 s to come up. "
+            "Close anything else using the PiEEG and launch again.")
     if "exc" in boot_error:
-        logger.error("server failed to start: %s "
-                     "(is another PiEEG server already running on port %d?)",
-                     boot_error["exc"], args.port)
-        loop.call_soon_threadsafe(loop.stop)
-        hw.close()
-        return
+        _abort_boot()
+        exc = boot_error["exc"]
+        if isinstance(exc, OSError) and exc.errno == errno.EADDRINUSE:
+            return _startup_error(
+                args, f"Port {args.port} is already in use",
+                "Another PiEEG server is already running (a second Scope, "
+                "or the pieeg-server service). Close it — or run "
+                "pkill -f pieeg-server — then launch the Scope again.")
+        return _startup_error(args, "The server failed to start",
+                              f"{type(exc).__name__}: {exc}")
 
     acq.start()
     if dashboard is not None:
-        dashboard.start()
+        try:
+            dashboard.start()
+        except OSError as e:
+            # Not fatal: REACT and the viewer don't need the web dashboard.
+            logger.warning("dashboard not started (port %d: %s); continuing "
+                           "without it.", args.dashboard_port, e)
+            dashboard = None
 
-    mode, ip = _connect_target()
-    logger.info("Scope up: ws://%s:%d  (mode=%s, %d ch @ %d Hz%s) + local "
-                "viewer. Close the window to stop the server.",
-                ip, args.port, mode, acq.num_channels, fs,
-                " · MOCK" if args.mock else "")
+    targets = _connect_targets(args.host)
+    mode, ip = targets[0]
+    logger.info("Scope up: %s  (%d ch @ %d Hz%s) + local viewer. Close the "
+                "window to stop the server.",
+                ", ".join(f"ws://{t_ip}:{args.port} [{t_mode}]"
+                          for t_mode, t_ip in targets),
+                acq.num_channels, fs, " · MOCK" if args.mock else "")
     title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   REACT EEG connects to  "
              f"ws://{ip}:{args.port}"
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
@@ -335,19 +548,38 @@ def main(argv=None):
         run_viewer(tk_q, num_channels=acq.num_channels, fs=fs,
                    electrodes=electrodes, title=title,
                    connect_popup={"ip": ip, "port": args.port, "mode": mode,
+                                  "targets": targets,
                                   "version": SCOPE_VERSION,
                                   "changelog": SCOPE_CHANGELOG},
+                   contact_source=getattr(hw, "leadoff_status", None),
+                   # No Rec button on mock launches: synthetic data must never
+                   # land in recordings/ looking like a real session.
+                   record_control=None if args.mock else record_control,
                    auto_close_ms=(int(args.seconds * 1000) if args.seconds else None))
     finally:
         # ---- orderly shutdown --------------------------------------------- #
         logger.info("Shutting down: stopping server, dashboard, acquisition; "
                     "freeing SPI.")
+        # Closing the window mid-recording still saves it properly: stop the
+        # recording the normal way (journal finalised, BDF+ exported) while
+        # acquisition is still running, before anything else is torn down.
+        try:
+            if _record_status()["recording"]:
+                logger.info("Recording in progress; stopping and exporting it "
+                            "before shutdown.")
+                asyncio.run_coroutine_threadsafe(
+                    server._stop_recording(), loop).result(timeout=600)
+        except Exception as e:                  # noqa: BLE001
+            logger.warning("could not finish the recording cleanly (%s); the "
+                           "crash-safe journal is still on disk.", e)
         if dashboard is not None:
             try:
                 dashboard.stop()
             except Exception as e:              # noqa: BLE001
                 logger.warning("dashboard.stop() raised: %s", e)
         acq.stop()                              # joins the acquisition thread
+        if acq._interrupt:
+            logger.info("acquisition stats: %s", acq.capture_stats())
         # Close the server + bridge ON the loop, THEN stop the loop, so the
         # websockets server never tries to close on a dead loop.
         fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
@@ -373,4 +605,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except Exception:
+        logger.exception("PiEEG Scope crashed")
+        raise
