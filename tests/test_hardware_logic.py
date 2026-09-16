@@ -21,6 +21,7 @@ from pieeg_server.hardware import (
     CONFIG4_PD_LOFF_COMP, LOFF_SENSE_ALL,
     STATUS_SYNC_MASK, STATUS_SYNC_VALUE,
     parse_leadoff_status, leadoff_state, _status_sync_ok,
+    config1_sample_rate,
     PiEEGHardware,
 )
 
@@ -314,6 +315,31 @@ class TestRegisterState:
         assert len(PiEEGHardware.CH_REGS) == 8
         # Sequential from 0x05 to 0x0C
         assert PiEEGHardware.CH_REGS == tuple(range(0x05, 0x0D))
+
+
+class TestSampleRate:
+    """CONFIG1 DR bits -> sample rate, exposed as PiEEGHardware.sample_rate."""
+
+    @pytest.mark.parametrize("config1, rate", [
+        (0x96, 250), (0x95, 500), (0x94, 1000), (0x93, 2000),
+        (0x92, 4000), (0x91, 8000), (0x90, 16000),
+    ])
+    def test_config1_rate_table(self, config1, rate):
+        assert config1_sample_rate(config1) == rate
+
+    def test_reserved_rate_code_is_none(self):
+        assert config1_sample_rate(0x97) is None
+
+    def test_none_before_configured(self):
+        hw = PiEEGHardware.__new__(PiEEGHardware)
+        assert hw.sample_rate is None
+        hw._config1 = None
+        assert hw.sample_rate is None
+
+    def test_follows_written_config1(self):
+        hw = PiEEGHardware.__new__(PiEEGHardware)
+        hw._config1 = 0x95
+        assert hw.sample_rate == 500
 
 
 class TestMockRegisterConfig:

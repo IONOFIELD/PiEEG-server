@@ -161,6 +161,16 @@ def _status_sync_ok(raw: list[int]) -> bool:
     return (raw[0] & STATUS_SYNC_MASK) == STATUS_SYNC_VALUE
 
 
+def config1_sample_rate(config1: int) -> int | None:
+    """Output data rate (SPS) selected by an ADS1299 CONFIG1 register value.
+
+    The low three bits DR[2:0] divide the 16 kSPS modulator rate by a power
+    of two: 000 = 16000 ... 101 = 500, 110 = 250. 111 is reserved (None).
+    """
+    dr = config1 & 0x07
+    return None if dr == 0x07 else 16000 >> dr
+
+
 def leadoff_state(p_off: bool, n_off: bool) -> str:
     """Map a channel's P/N lead-off flags to a green/amber/red contact verdict.
 
@@ -250,6 +260,9 @@ class PiEEGHardware:
         self._register_state: dict[int, int] = {}
         # PGA gain verified by register readback in _configure_adc.
         self._pga_gain: int | None = None
+        # CONFIG1 value written in _configure_adc; the sample rate derives from
+        # it. None until open() has configured the chip.
+        self._config1: int | None = None
         # Latest per-channel lead-off (electrode contact) state, parsed from the
         # STATUS word of the live data stream. Empty until the first read.
         self._leadoff: list[dict] = []
@@ -262,6 +275,16 @@ class PiEEGHardware:
     def pga_gain(self) -> int | None:
         """PGA gain confirmed by register readback (None until configured)."""
         return self._pga_gain
+
+    @property
+    def sample_rate(self) -> int | None:
+        """Sample rate (SPS) programmed into CONFIG1 (None until configured).
+
+        Consumers (server welcome, filters, journal, the Scope viewer) read
+        this instead of assuming 250, so PIEEG_CONFIG1 changes stay consistent.
+        """
+        config1 = getattr(self, "_config1", None)
+        return None if config1 is None else config1_sample_rate(config1)
 
     @property
     def spike_threshold(self) -> int:
@@ -730,6 +753,7 @@ class PiEEGHardware:
         config1 = int(os.environ.get("PIEEG_CONFIG1", "0x96"), 0)
         logger.info("WREG CONFIG1 <- 0x%02X (sample rate)", config1)
         self._write_register(chip_num, CONFIG1, config1)
+        self._config1 = config1
         self._write_register(chip_num, CONFIG2, 0xD4)
         self._write_register(chip_num, CONFIG3, 0xFF)
         self._write_register(chip_num, LOFF, LOFF_DC_95_5)  # DC lead-off, 95%/5%
