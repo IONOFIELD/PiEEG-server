@@ -3,7 +3,7 @@ PiEEG Scope console — the everyday "Scope" launch, now all in one window.
 
 WHAT THIS IS
     The same server the desktop "PiEEG Server" icon has always started
-    (plain ws://<ip>:1616 for REACT-EEG / Wi-Fi clients, plus the web
+    (plain ws://<ip>:1616 for Wi-Fi / Ethernet clients, plus the web
     dashboard on :1617 and the webhook engine), but with two things added
     that used to be missing or separate:
 
@@ -19,8 +19,9 @@ WHAT THIS IS
 HOW IT SHARES THE DATA (nothing downstream changes)
     The viewer is a read-only subscriber on the SAME acquisition fan-out the
     server already uses (the pattern ws_server.py/securelink_console.py use). It
-    reads frames in-process, so it does NOT take a client slot — every REACT
-    laptop still gets its own ws:// connection exactly as before. Acquisition,
+    receives frames from the acquisition fan-out (batched to its own viewer
+    process), so it does NOT take a client slot — every laptop still gets its
+    own ws:// connection exactly as before. Acquisition,
     hardware, the journal, recording, and export are untouched; this module
     only wires the existing public pieces together and adds the viewer.
 
@@ -42,7 +43,7 @@ LOGS
     answering, port 1616 busy, ...) shows an on-screen error window saying why.
 
 RECORDINGS
-    The Rec/Stop button (and REACT's start_record) save to the external USB
+    The Rec/Stop button (and a client's start_record) save to the external USB
     drive, /mnt/pieeg128/eeg-recordings by default (--recordings-dir to
     change): journal + CSV while recording, BDF+ exported on Stop. The Rec
     button refuses to start if that folder isn't on the USB drive, so a
@@ -51,8 +52,10 @@ RECORDINGS
 
 import argparse
 import asyncio
+import collections
 import errno
 import logging
+import multiprocessing
 import os
 import queue
 import socket
@@ -89,7 +92,7 @@ SCOPE_CHANGELOG = [
             "loads and stays in front until you minimise/close it. Launcher "
             "terminal window hidden."),
     ("1.3", "Controls reorganised into two rows so they fit without maximising. "
-            "Window title and popup now say \"REACT EEG\"."),
+            "Window title and popup now name the connection."),
     ("1.4", "All on-screen text ~10% smaller for room. Montage controls moved "
             "to the top row. Removed the separate Shut down button — closing "
             "the window is the shutdown."),
@@ -102,7 +105,7 @@ SCOPE_CHANGELOG = [
     ("1.7", "Version-history dropdown no longer runs off the bottom of the "
             "screen: it grows only as far as there's room (nudging up if "
             "needed) and scrolls inside that height."),
-    ("1.8", "Restyled to match the REACT EEG dashboard (Geist design system): "
+    ("1.8", "Restyled to match the web dashboard (Geist design system): "
             "near-black surfaces, hairline borders, blue accent, monospace data "
             "labels, the dashboard's canvas-blue trace, and the signature "
             "blue→green gradient hairline. Added a live signal dot (green = "
@@ -111,7 +114,7 @@ SCOPE_CHANGELOG = [
             "so Add clearly belongs to the channel it builds. The corner \"IP\" "
             "button gets a black outline. Removed the connection popup's in-"
             "window Minimise/Close buttons — its title bar already has both."),
-    ("2.0", "Milestone: the Scope now matches the REACT EEG dashboard end to "
+    ("2.0", "Milestone: the Scope now matches the web dashboard end to "
             "end. Every control cluster (montage, bipolar builder, filters, "
             "sensitivity) is a bordered chip, so related controls read as one "
             "group. The connection popup is sized to hug its content and only "
@@ -137,7 +140,7 @@ SCOPE_CHANGELOG = [
     ("2.6", "The server the Scope launches now reports per-channel electrode "
             "contact (ADS1299 lead-off): each channel reads green (both inputs "
             "connected), amber (one side floating) or red (both off), sent to "
-            "REACT so you can seat electrodes without eyeballing the trace. "
+            "clients so you can seat electrodes without eyeballing the trace. "
             "The in-process lead viewer still shows waveforms only."),
     ("2.7", "Record from the Scope: one Rec/Stop button saves the session to "
             "the external USB drive (eeg-recordings) and exports a BDF+ file "
@@ -151,10 +154,24 @@ SCOPE_CHANGELOG = [
             "picker's add button is a compact \"+\" that fits the 7\" "
             "800x480 panel, and the window "
             "fits that screen. The connection popup lists every address "
-            "(Wi-Fi and Ethernet). The Scope, REACT and recordings use the "
+            "(Wi-Fi and Ethernet). The Scope, clients and recordings use the "
             "sample rate actually set on the chip, shown live as \"sps\". A "
             "launch that can't start now says why on screen and in "
             "~/.pieeg/scope.log."),
+    ("2.8", "REF and GND dots now show the real wiring. In 2.7 the REF dot "
+            "was always red and GND grey: the chip's reference flag is stuck "
+            "on this board. Both are now judged from the electrode flags plus "
+            "which traces sit at the rail (checked on the bench: pulling GND "
+            "flags every lead off; pulling REF rails the connected leads). "
+            "The per-channel contact state sent to clients is now green (on) "
+            "or red (off) "
+            "instead of never reaching green. Fixed the square waves on the "
+            "traces: with the Scope open, late reads of the chip returned "
+            "torn or all-zero samples (tens of mV spikes) that also reached "
+            "clients and recordings. Unsynced, stale and torn reads are now "
+            "dropped and counted instead of passed on. The viewer now runs in "
+            "its own process, so drawing no longer delays reading the chip. "
+            "The window title and connection popup no longer name a client."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -178,7 +195,7 @@ def _sample_rate(device: str) -> int:
 
 
 def _connect_target() -> tuple[str, str]:
-    """(mode, ip) for the on-screen 'connect REACT to' hint, read LIVE.
+    """(mode, ip) for the on-screen 'connect to' hint, read LIVE.
 
     The IP is never hard-coded: it is derived from the live interface state at
     launch, so it always matches whatever the operator actually plugged in.
@@ -214,7 +231,7 @@ def _connect_target() -> tuple[str, str]:
 
 
 def _connect_targets(host: str) -> list[tuple[str, str]]:
-    """Every (mode, ip) a REACT EEG laptop can reach the server on, primary
+    """Every (mode, ip) a laptop can reach the server on, primary
     first.
 
     The server binds all interfaces by default, so when the secure-link
@@ -256,6 +273,170 @@ def _off_usb_problem(path: Path) -> str | None:
         return (f"{path} is not on the external USB drive — is the drive "
                 "plugged in and mounted?")
     return None
+
+
+def _contact_source(hw):
+    """The hardware's lead-off readout for the viewer, or None without one.
+
+    Returns None (no verdict) while any channel is on an internal signal
+    (test signal, shorted inputs, ...): electrode contact means nothing then,
+    and an identical test signal on every lead looks like a floating REF.
+    """
+    leadoff = getattr(hw, "leadoff_status", None)
+    if not callable(leadoff):
+        return None
+    ch_regs = tuple(getattr(hw, "CH_REGS", ()))
+
+    def source():
+        regs = getattr(hw, "register_state", None) or {}
+        if any((regs.get(r, 0) & 0x07) != 0 for r in ch_regs):
+            return None
+        return leadoff()
+    return source
+
+
+def _viewer_main(conn, **kwargs):
+    """Viewer process entry. Lowers its own priority BEFORE importing numpy,
+    scipy and Tk, so that start-up (and later drawing) yields the CPU to the
+    acquisition process whenever cores are busy."""
+    try:
+        os.nice(10)
+    except OSError:
+        pass
+    from .acq_viewer import run_viewer_process
+    run_viewer_process(conn, **kwargs)
+
+
+def _future_payload(fut):
+    try:
+        return {"result": fut.result()}
+    except Exception as e:                  # noqa: BLE001 - reported to viewer
+        return {"error": str(e)}
+
+
+class _ViewerLink:
+    """Parent side of the Scope's viewer process.
+
+    The Tk viewer runs in its own process (acq_viewer.run_viewer_process) so
+    its drawing can't hold this process's GIL while the acquisition thread
+    must read each sample within ~3 ms of its DRDY edge. In-process it skipped
+    ~2-3% of samples for lateness. Frames are batched and sent ~20 times a
+    second along with the lead-off readout and recording state; Rec/Stop
+    presses come back as commands. Only the sender thread writes to the pipe,
+    so the asyncio loop never blocks on a slow viewer.
+    """
+
+    SEND_INTERVAL = 0.05
+    MAX_BACKLOG = 5000                      # frames held if the viewer lags
+    MAX_PER_TICK = 500                      # newest frames sent per tick
+    CHUNK = 100                             # rows converted per GIL hold
+
+    def __init__(self, viewer_kwargs, leadoff=None, record_status=None,
+                 toggle_record=None):
+        ctx = multiprocessing.get_context("spawn")
+        self._conn, self._child_conn = ctx.Pipe(duplex=True)
+        self._proc = ctx.Process(
+            target=_viewer_main, args=(self._child_conn,),
+            kwargs=dict(viewer_kwargs, contact=leadoff is not None,
+                        record=toggle_record is not None),
+            name="pieeg-scope-viewer", daemon=True)
+        self._leadoff = leadoff
+        self._record_status = record_status
+        self._toggle_record = toggle_record
+        self._frames = collections.deque(maxlen=self.MAX_BACKLOG)
+        self._outbox: queue.SimpleQueue = queue.SimpleQueue()
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def push(self, frame):
+        """Queue one acquisition frame for the viewer (any thread)."""
+        self._frames.append(frame["channels"])
+
+    def start(self):
+        self._proc.start()
+        self._child_conn.close()            # the child owns its end now
+        for target, name in ((self._send_loop, "viewer-tx"),
+                             (self._recv_loop, "viewer-rx")):
+            t = threading.Thread(target=target, name=name, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def _send_loop(self):
+        import numpy as np
+
+        while not self._stop.wait(self.SEND_INTERVAL):
+            # A viewer that fell behind (e.g. still starting up) only needs
+            # the newest frames; convert them in small chunks so this thread
+            # never holds the GIL long enough to delay a sample read.
+            while len(self._frames) > self.MAX_PER_TICK:
+                try:
+                    self._frames.popleft()
+                except IndexError:
+                    break
+            chunks, rows = [], []
+            while self._frames:
+                try:
+                    rows.append(self._frames.popleft())
+                except IndexError:
+                    break
+                if len(rows) == self.CHUNK:
+                    chunks.append(np.asarray(rows, dtype=np.float64))
+                    rows = []
+                    time.sleep(0)
+            if rows:
+                chunks.append(np.asarray(rows, dtype=np.float64))
+            try:
+                while True:
+                    self._conn.send(self._outbox.get_nowait())
+            except queue.Empty:
+                pass
+            except (OSError, ValueError):
+                return                      # viewer gone
+            tick = {"frames": (np.concatenate(chunks) if len(chunks) > 1
+                               else chunks[0] if chunks else None),
+                    "leadoff": self._leadoff() if self._leadoff else None,
+                    "record": self._record_status() if self._record_status
+                    else None}
+            try:
+                self._conn.send(("tick", tick))
+            except (OSError, ValueError):
+                return
+
+    def _recv_loop(self):
+        while True:
+            try:
+                kind, *rest = self._conn.recv()
+            except (EOFError, OSError):
+                return
+            if kind == "toggle_record" and self._toggle_record is not None:
+                req = rest[0]
+                try:
+                    fut = self._toggle_record()
+                except Exception as e:      # noqa: BLE001
+                    self._outbox.put(("record_result", req, {"error": str(e)}))
+                    continue
+                fut.add_done_callback(
+                    lambda f, req=req: self._outbox.put(
+                        ("record_result", req, _future_payload(f))))
+            elif kind == "error":
+                logger.error("viewer process crashed:\n%s", rest[0])
+
+    def wait(self):
+        """Block until the viewer window is closed; returns its exit code."""
+        self._proc.join()
+        return self._proc.exitcode
+
+    def close(self):
+        self._stop.set()
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=5)
+        try:
+            self._conn.close()
+        except OSError:
+            pass
+        for t in self._threads:
+            t.join(timeout=2)
 
 
 def _setup_logging(verbose: bool):
@@ -344,11 +525,17 @@ def main(argv=None):
                         help="debug logging")
     args = parser.parse_args(argv)
     _setup_logging(args.verbose)
+    # The acquisition thread must read each sample within ~3 ms of its DRDY
+    # edge, but shares this process's GIL with the server loop, which runs
+    # Python for every frame. With the default 5 ms switch interval a wake-up
+    # that lands mid-loop could wait past that deadline (~1-2 skipped samples
+    # a second on the Pi 4); handing the GIL over every 0.5 ms bounds it.
+    sys.setswitchinterval(0.0005)
 
     # Import here so --help works even off the Pi. These are the EXISTING
     # public pieces of the serve path; we do not modify them.
     from .acquisition import AcquisitionLoop
-    from .acq_viewer import run_viewer
+    from .hardware import VREF_UV
     from .server import PiEEGServer
     from . import profiles
 
@@ -414,15 +601,17 @@ def main(argv=None):
         dashboard = DashboardServer(host=args.host, port=args.dashboard_port,
                                     get_spectrum=server.spectrum_cache)
 
-    # In-process bridge: acquisition subscriber queue -> thread-safe queue the
-    # Tk viewer drains. Runs inside the asyncio loop (bg thread).
+    # Bridge: acquisition subscriber queue -> the viewer link's frame buffer,
+    # batched out to the viewer process. Runs inside the asyncio loop.
     sub_q = acq.subscribe(maxsize=2048)
-    tk_q: queue.Queue = queue.Queue()
+    link_ref: dict = {}
 
     async def _bridge():
         while True:
             frame = await sub_q.get()
-            tk_q.put(frame)
+            link = link_ref.get("link")
+            if link is not None:
+                link.push(frame)
 
     ready = threading.Event()
     boot_error: dict = {}
@@ -441,13 +630,13 @@ def main(argv=None):
         ready.set()
 
     # ---- recording (the viewer's Rec/Stop toggle) --------------------------- #
-    # Drives the server's own recorder — the same start/stop REACT's
-    # start_record/stop_record commands use — so the journal, CSV and BDF+
-    # export are unchanged and REACT is told the recording state either way.
+    # Drives the server's own recorder — the same start/stop a connected
+    # client's start_record/stop_record commands use — so the journal, CSV and
+    # BDF+ export are unchanged and clients are told the state either way.
     def _record_status():
         recording = server._get_record_status()["record_status"]["recording"]
         started = server._record_start_time
-        return {"recording": recording,
+        return {"recording": recording, "started": started,
                 "elapsed": (time.time() - started) if recording and started
                 else None}
 
@@ -469,11 +658,6 @@ def main(argv=None):
         await server._start_recording()
         return {"started": server._last_session}
 
-    record_control = {
-        "status": _record_status,
-        "toggle": lambda: asyncio.run_coroutine_threadsafe(_toggle_record(),
-                                                           loop),
-    }
 
     async def _shutdown():
         # Runs ON the loop: cancel the server (its `async with serve()` closes
@@ -522,44 +706,54 @@ def main(argv=None):
         return _startup_error(args, "The server failed to start",
                               f"{type(exc).__name__}: {exc}")
 
-    acq.start()
-    if dashboard is not None:
-        try:
-            dashboard.start()
-        except OSError as e:
-            # Not fatal: REACT and the viewer don't need the web dashboard.
-            logger.warning("dashboard not started (port %d: %s); continuing "
-                           "without it.", args.dashboard_port, e)
-            dashboard = None
-
+    # Everything that forks this process (the `ip` lookups, spawning the
+    # viewer) happens BEFORE acquisition starts: a fork of a large process
+    # stalls it for tens of ms, which would drop samples mid-stream.
     targets = _connect_targets(args.host)
     mode, ip = targets[0]
-    logger.info("Scope up: %s  (%d ch @ %d Hz%s) + local viewer. Close the "
-                "window to stop the server.",
-                ", ".join(f"ws://{t_ip}:{args.port} [{t_mode}]"
-                          for t_mode, t_ip in targets),
-                acq.num_channels, fs, " · MOCK" if args.mock else "")
-    title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   REACT EEG connects to  "
-             f"ws://{ip}:{args.port}"
+    title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   ws://{ip}:{args.port}"
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
-    # ---- viewer (blocks in the main thread until the window closes) -------- #
+    # ---- viewer (its own process; closing its window is the shutdown) ------ #
+    link = _ViewerLink(
+        dict(num_channels=acq.num_channels, fs=fs, electrodes=electrodes,
+             title=title,
+             connect_popup={"ip": ip, "port": args.port, "mode": mode,
+                            "targets": targets, "version": SCOPE_VERSION,
+                            "changelog": SCOPE_CHANGELOG},
+             full_scale_uv=VREF_UV / (acq.pga_gain or 24),
+             auto_close_ms=(int(args.seconds * 1000) if args.seconds else None)),
+        leadoff=_contact_source(hw),
+        record_status=_record_status,
+        # No Rec button on mock launches: synthetic data must never land in
+        # recordings/ looking like a real session.
+        toggle_record=None if args.mock else (
+            lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)))
     try:
-        run_viewer(tk_q, num_channels=acq.num_channels, fs=fs,
-                   electrodes=electrodes, title=title,
-                   connect_popup={"ip": ip, "port": args.port, "mode": mode,
-                                  "targets": targets,
-                                  "version": SCOPE_VERSION,
-                                  "changelog": SCOPE_CHANGELOG},
-                   contact_source=getattr(hw, "leadoff_status", None),
-                   # No Rec button on mock launches: synthetic data must never
-                   # land in recordings/ looking like a real session.
-                   record_control=None if args.mock else record_control,
-                   auto_close_ms=(int(args.seconds * 1000) if args.seconds else None))
+        link_ref["link"] = link
+        link.start()
+        acq.start()
+        if dashboard is not None:
+            try:
+                dashboard.start()
+            except OSError as e:
+                # Not fatal: clients and the viewer don't need the dashboard.
+                logger.warning("dashboard not started (port %d: %s); "
+                               "continuing without it.", args.dashboard_port, e)
+                dashboard = None
+        logger.info("Scope up: %s  (%d ch @ %d Hz%s) + viewer. Close the "
+                    "window to stop the server.",
+                    ", ".join(f"ws://{t_ip}:{args.port} [{t_mode}]"
+                              for t_mode, t_ip in targets),
+                    acq.num_channels, fs, " · MOCK" if args.mock else "")
+        code = link.wait()
+        if code:
+            logger.warning("viewer process exited with code %s", code)
     finally:
         # ---- orderly shutdown --------------------------------------------- #
         logger.info("Shutting down: stopping server, dashboard, acquisition; "
                     "freeing SPI.")
+        link.close()
         # Closing the window mid-recording still saves it properly: stop the
         # recording the normal way (journal finalised, BDF+ exported) while
         # acquisition is still running, before anything else is torn down.
