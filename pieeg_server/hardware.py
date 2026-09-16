@@ -457,6 +457,12 @@ class PiEEGHardware:
             self._update_leadoff(raw1)
             if not self._is_valid_frame(raw1):
                 return None
+            # Reject reads without the 1100 sync marker. A read that starts
+            # after the chip has shifted the frame out (a late or duplicate
+            # read) returns all zeros, and a misaligned one garbage; both
+            # passed straight through before and showed up as huge spikes.
+            if not _status_sync_ok(raw1):
+                return None
             return self._decode_channels(raw1)
 
     def _update_leadoff(self, raw1: list[int], raw2: list[int] | None = None):

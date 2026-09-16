@@ -772,19 +772,26 @@ class TestAcquisitionRestartWithConfig:
 
 
 class TestInterruptLoopRestart:
-    """The interrupt acquisition loop must survive restart_with_config()."""
+    """The interrupt acquisition loop must survive restart_with_config() and
+    never pass on a stale, torn or unsynced read."""
 
     class _EdgeHardware:
-        """Fake SPI hardware: DRDY edges every 4 ms of kernel time."""
+        """Fake SPI hardware: DRDY edges every 4 ms of CLOCK_MONOTONIC time
+        while streaming, like the ADS1299 (STOP halts them)."""
 
         num_channels = 8
         sample_rate = 250
         spike_threshold = -1
+        PERIOD = 4_000_000
 
-        def __init__(self):
+        def __init__(self, slow_reads=()):
             import threading
-            self._ts = 1_000_000_000
+            import time
             self._lock = threading.Lock()
+            self._next = time.monotonic_ns() + self.PERIOD
+            self._running = True
+            self._reads = 0
+            self._slow = dict(slow_reads)       # read number -> seconds
             self.registers = {}
 
         def enable_drdy_events(self):
@@ -794,42 +801,118 @@ class TestInterruptLoopRestart:
             pass
 
         def stop_streaming(self):
-            pass
+            with self._lock:
+                self._running = False
 
         def wait_drdy_event(self, timeout=0.5):
             import time
-            time.sleep(0.004)
-            with self._lock:
-                self._ts += 4_000_000
-                return self._ts
+            deadline = time.monotonic_ns() + int(timeout * 1e9)
+            while True:
+                now = time.monotonic_ns()
+                with self._lock:
+                    if self._running and self._next <= now:
+                        ts = self._next
+                        self._next += self.PERIOD
+                        return ts
+                    due = self._next if self._running else now + self.PERIOD
+                if now >= deadline:
+                    return None
+                time.sleep(max(0.0, min(due, deadline) - now) / 1e9)
 
         def read_sample(self):
-            return [0.0] * 8
+            import time
+            self._reads += 1
+            if self._reads in self._slow:
+                time.sleep(self._slow[self._reads])
+            return [float(self._reads)] + [0.0] * 7
 
         def configure_registers(self, reg_map):
+            import time
             with self._lock:
-                self._ts += 500_000_000   # the write pauses the edge stream
+                self._running = True
+                self._next = time.monotonic_ns() + self.PERIOD
             self.registers.update(reg_map)
 
-    def test_frames_keep_flowing_after_restart(self):
+    def _run(self, hw, seconds, restart=None):
         import asyncio
         import time
         from pieeg_server.acquisition import AcquisitionLoop
 
         loop = asyncio.new_event_loop()
-        hw = self._EdgeHardware()
         acq = AcquisitionLoop(hw, loop, interrupt=True)
         acq.start()
-        time.sleep(0.2)
-        acq.restart_with_config({0x05: 0x61})
+        time.sleep(seconds)
         before = acq.capture_stats()["frames_read"]
-        time.sleep(0.4)
+        if restart is not None:
+            acq.restart_with_config(restart)
+            time.sleep(seconds)
         stats = acq.capture_stats()
         acq.stop()
         loop.close()
+        return acq, before, stats
 
+    def test_frames_keep_flowing_after_restart(self):
+        hw = self._EdgeHardware()
+        acq, before, stats = self._run(hw, 0.3, restart={0x05: 0x61})
         assert acq._thread is not None and not acq._thread.is_alive()
         assert stats["frames_read"] > before, "acquisition died after restart"
         # The register-write pause is not counted as dropped samples.
         assert stats["dropped_frames"] == 0
         assert hw.registers == {0x05: 0x61}
+
+    def test_backlog_skips_to_the_newest_edge(self):
+        # read 20 stalls 10 ms: two edges queue up behind it
+        hw = self._EdgeHardware(slow_reads={20: 0.010})
+        _, _, stats = self._run(hw, 0.4)
+        assert stats["late_skips"] + stats["torn_reads"] >= 1
+        assert stats["dropped_frames"] >= 1
+
+    def test_read_overlapping_the_next_edge_is_discarded(self):
+        import asyncio
+        import time
+        from pieeg_server.acquisition import AcquisitionLoop
+
+        hw = self._EdgeHardware(slow_reads={30: 0.0045})
+        loop = asyncio.new_event_loop()
+        acq = AcquisitionLoop(hw, loop, interrupt=True)
+        got = []
+        acq._enqueue = lambda frame: got.append(frame["channels"][0])
+        acq.start()
+        time.sleep(0.4)
+        acq.stop()
+        loop.run_until_complete(asyncio.sleep(0))   # deliver queued callbacks
+        loop.close()
+        stats = acq.capture_stats()
+        assert stats["torn_reads"] >= 1
+        assert 30.0 not in got, "a torn read was passed on as data"
+
+
+class TestEightChannelFrameSync:
+    """8-channel reads without the 1100 STATUS marker are rejected."""
+
+    class _Spi:
+        def __init__(self, frame):
+            self.frame = frame
+
+        def readbytes(self, n):
+            return list(self.frame)
+
+    def _hw(self, frame):
+        hw = PiEEGHardware.__new__(PiEEGHardware)
+        hw._num_channels = 8
+        hw._leadoff = []
+        hw._spike_threshold = -1
+        hw._last_valid_value = None
+        hw._consecutive_rejects = 0
+        hw._spike_count = 0
+        hw._pga_gain = 24
+        hw._spi1 = self._Spi(frame)
+        return hw
+
+    def test_all_zero_read_is_rejected(self):
+        assert self._hw([0] * 27).read_sample() is None
+
+    def test_synced_frame_decodes(self):
+        frame = [0xC0, 0x00, 0x00] + [0x00, 0x00, 0x10] * 8
+        out = self._hw(frame).read_sample()
+        assert out is not None and len(out) == 8

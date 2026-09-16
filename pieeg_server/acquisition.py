@@ -50,6 +50,9 @@ class AcquisitionLoop:
         self._first_event_ns = None
         self._last_event_ns = None
         self._max_interval_ns = 0    # largest gap between consecutive DRDY edges
+        self._late_skips = 0         # edges skipped: too late to read cleanly
+        self._torn_reads = 0         # reads discarded: next sample landed mid-read
+        self._bad_frames = 0         # reads rejected by the hardware (sync/spike)
         # Device-agnostic Hampel spike filter (runs in acquisition thread)
         self._hampel = HampelFilter(num_channels=hardware.num_channels)
         # Default both spike filters to OFF (user can enable via dashboard)
@@ -215,45 +218,90 @@ class AcquisitionLoop:
         is counted as a dropped sample. Decoding + journaling are unchanged:
         read_sample() uses the existing gain-aware decoder, and frames go to the
         same subscriber queues.
+
+        Reads must finish before the chip's next conversion overwrites its
+        output. When this thread wakes late (the Scope's Tk viewer shares the
+        GIL), a read can straddle that update and return a torn frame: on the
+        bench that gave tens-of-mV single-sample spikes and all-zero frames.
+        So: if newer edges are already queued, the older ones' data is gone —
+        skip to the newest; don't start a read too close to the next
+        conversion; and discard a read if the next edge landed while it ran.
+        Skipped samples are counted as dropped, never passed on as data.
         """
         fs = getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE
         nominal_ns = 1_000_000_000 / fs
         gap_ns = 1.5 * nominal_ns          # interval beyond this = missed sample(s)
+        # Latest start for a read: 0.4 ms before the next conversion. A read
+        # (27 bytes at 2 MHz plus overhead) takes ~0.2 ms, and the torn-read
+        # check below still discards any read the next edge lands in.
+        read_deadline_ns = max(nominal_ns / 2, nominal_ns - 400_000)
         prev_ns = None
+        pending = None
+
+        def account(ts_ns):
+            nonlocal prev_ns
+            self._drdy_events += 1
+            if self._first_event_ns is None:
+                self._first_event_ns = ts_ns
+            if prev_ns is not None:
+                # prev_ns is None on the first edge of every run, including
+                # after restart_with_config(): the deliberate pause for the
+                # register write is not an interval, and not a drop.
+                interval = ts_ns - prev_ns
+                if interval > self._max_interval_ns:
+                    self._max_interval_ns = interval
+                if interval > gap_ns:
+                    # A DRDY edge is only truly MISSED when a full extra
+                    # period elapsed. round(interval/period)-1 gives the
+                    # count; a late-but-present edge (~1.5x) rounds to 0 via
+                    # round(x-1), so pure jitter is not miscounted as a drop.
+                    missed = round(interval / nominal_ns - 1.0)
+                    if missed > 0:
+                        self._dropped_frames += missed
+                        self._gap_count += 1
+                        logger.warning("DRDY gap: %.2f ms (~%d missed)",
+                                       interval / 1e6, missed)
+            self._last_event_ns = ts_ns
+            prev_ns = ts_ns
 
         self._hw.enable_drdy_events()
         try:
             while not self._stop_event.is_set():
-                ts_ns = self._hw.wait_drdy_event(timeout=0.5)
-                if ts_ns is None:
-                    continue               # no edge yet — re-check the stop flag
+                if pending is not None:
+                    ts_ns, pending = pending, None
+                else:
+                    ts_ns = self._hw.wait_drdy_event(timeout=0.5)
+                    if ts_ns is None:
+                        continue           # no edge yet — re-check the stop flag
+                account(ts_ns)
 
-                self._drdy_events += 1
-                if self._first_event_ns is None:
-                    self._first_event_ns = ts_ns
-                if prev_ns is not None:
-                    # prev_ns is None on the first edge of every run, including
-                    # after restart_with_config(): the deliberate pause for the
-                    # register write is not an interval, and not a drop.
-                    interval = ts_ns - prev_ns
-                    if interval > self._max_interval_ns:
-                        self._max_interval_ns = interval
-                    if interval > gap_ns:
-                        # A DRDY edge is only truly MISSED when a full extra
-                        # period elapsed. round(interval/period)-1 gives the
-                        # count; a late-but-present edge (~1.5x) rounds to 0 via
-                        # round(x-1), so pure jitter is not miscounted as a drop.
-                        missed = round(interval / nominal_ns - 1.0)
-                        if missed > 0:
-                            self._dropped_frames += missed
-                            self._gap_count += 1
-                            logger.warning("DRDY gap: %.2f ms (~%d missed)",
-                                           interval / 1e6, missed)
-                self._last_event_ns = ts_ns
-                prev_ns = ts_ns
+                # Newer edges already queued: this edge's data was overwritten.
+                newer = self._hw.wait_drdy_event(timeout=0)
+                while newer is not None:
+                    self._dropped_frames += 1
+                    self._late_skips += 1
+                    account(newer)
+                    ts_ns = newer
+                    newer = self._hw.wait_drdy_event(timeout=0)
+
+                if time.monotonic_ns() - ts_ns > read_deadline_ns:
+                    self._dropped_frames += 1
+                    self._late_skips += 1
+                    continue
 
                 sample = self._hw.read_sample()
+                read_end_ns = time.monotonic_ns()
+                nxt = self._hw.wait_drdy_event(timeout=0)
+                if nxt is not None:
+                    pending = nxt
+                    if nxt <= read_end_ns:
+                        # The next conversion landed during the read.
+                        self._dropped_frames += 1
+                        self._torn_reads += 1
+                        continue
                 if sample is None:
+                    self._dropped_frames += 1
+                    self._bad_frames += 1
                     continue
                 # Discard settling frames after a register-config restart.
                 if self._settle_remaining > 0:
@@ -294,6 +342,9 @@ class AcquisitionLoop:
             "span_seconds": round(span_s, 3),
             "effective_rate_hz": round(rate, 3),
             "max_interval_ms": round(self._max_interval_ns / 1e6, 3),
+            "late_skips": self._late_skips,
+            "torn_reads": self._torn_reads,
+            "bad_frames": self._bad_frames,
         }
 
     def _enqueue(self, frame: dict):
