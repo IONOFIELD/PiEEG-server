@@ -15,6 +15,25 @@
   panel over the traces and the AVG box. Checked on the breadboard with the Scope open:
   three checks in a row, 10.00–10.05 kΩ on 10 kΩ, every check completed.
 
+**Update (2026-09-17) — measured values only, and a phase reference (v3.1, §12):**
+
+- Every lead is converted with **its own** bench readings; there is no theory fallback,
+  no shared gain, and nothing borrowed from another lead. No calibration (or one from
+  another sample rate) means no numbers, not approximate ones.
+- Readings above the largest resistor a lead was checked with show as `>N`, never
+  extrapolated. E1 is checked to 50 kΩ, E2–E8 only to 10 kΩ, until the next session.
+- AVG averages the measured electrodes only and carries the count of the others
+  (`AVG 19.5k·3`); an off lead is no longer counted as a made-up 1 MΩ.
+- **The carrier's phase is now measured** (the check drives START itself and counts
+  samples from it), so the board's input path is subtracted as a vector — right for an
+  electrode, which is part capacitor. Sizes alone read ~10% low on 10 kΩ at −45°.
+- Zeros re-recorded on the breadboard short rig with phase: scatter 1–2 Ω (31 Ω on the
+  old twisted wires), shorts read 2–11 Ω.
+- **Limit: the absolute scale is still the resistors' own tolerance (±1%).** 0.1%
+  resistors (1 k, 10 k, 47 k, 100 k, 470 k, 1 M) and a ±1% ~470 nF film capacitor
+  (10.8 kΩ at 31.25 Hz, to prove the vector correction on a reactive load) are the next
+  physical step.
+
 ## 1. The hardware (read off the board)
 
 | Item | Value | How it was confirmed |
@@ -59,14 +78,18 @@ fixed series resistance explains. The lead-to-lead differences are the test curr
   number of cycles (496 samples, ~2 s), after removing a linear trend. The noise figure
   is the same measure 3–5 bins either side. Unlike a 27–37 Hz band-pass followed by a
   standard deviation, this ignores EEG beta, EMG and mains.
-- **Conversion.** `Z = gain × scale[lead] × (carrier − zero[lead]) − offset`
-  - **zero[lead]:** that lead's carrier with its input shorted. Measured and saved.
-  - **scale[lead]:** that lead's own gain relative to the mean (0.937–1.053). Without it
-    one shared gain is off by up to 10.5%.
-  - **gain:** fitted 162.05 Ω/µV (square-wave theory with 6 nA: 130.9).
-  - **offset:** fitted 5 Ω, i.e. none once the zeros are removed.
-  - Calibration lives in `~/.config/pieeg/impedance_cal.json`. `source` is `theory`,
-    `zeroed` (shorts recorded) or `bench` (gain fitted; the current state).
+- **Conversion (v3.1).** Per lead, from that lead's readings alone:
+  `Z = ohms_per_uv[lead] × |carrier − zero[lead]|`
+  - **zero[lead]:** that lead's carrier with its input shorted to REF/BIO, kept as a
+    **vector** (µV and degrees). 31.9–35.6 µV at −68.4° to −69.5°, scatter 1–2 Ω.
+  - **ohms_per_uv[lead]:** the least-squares slope through that lead's own zero over the
+    resistors read on that lead (151.9–170.7 Ω/µV; the leads' currents differ ~10%).
+  - **range:** `max_ohms[lead]`, the largest resistor read on that lead. Above it (plus
+    `RANGE_MARGIN`, 2%) the lead reads `>N`; nothing is extrapolated.
+  - No offset term and no theory gain: a lead without its own short and resistor
+    readings simply has no calibration and shows "no cal".
+  - Calibration lives in `~/.config/pieeg/impedance_cal.json` (`version: 3`, per-lead,
+    with the sample rate it was fitted at). Older files are refused, not reinterpreted.
 
 ## 4. How a check runs (as built)
 
@@ -272,6 +295,36 @@ this session); `fit` rebuilds the calibration from all of them.
   - Continuous mode while seating electrodes
   - A command so a connected client can start a check
 
+## 12. Phase reference and the vector subtraction (2026-09-17)
+
+**The problem.** Each input carries ~5.4 kΩ of the board's own path in series with the
+electrode, so a channel reads `k·I·(Rs + Z)`. Subtracting the short's reading as a
+*size* assumes Rs and Z point the same way. That holds for a resistor and fails for an
+electrode, which is part capacitor: a 10 kΩ electrode at −45° reads 8.95 kΩ (−10%), and
+2 kΩ at −60° reads ~28% low. Resistor calibration can never show this error.
+
+**What makes the fix possible.** The excitation restarts with START: over 8 restarts with
+every lead shorted, each lead's carrier came back at the same angle within 0.1°
+(E1 −69.5°, E3 −68.4°, …), and a second block later in the same run matched. So if the
+samples are counted from START, the carrier's phase is a stable, measurable quantity
+rather than an accident of when the block began.
+
+**How it is measured.** `read_from_start()` writes the AC registers with `start=False`,
+takes the DRDY line, sends START itself and reads every edge, so sample *k* is known.
+`carrier_phasors(block, fs, k0)` then gives each channel's carrier as a vector, and the
+lead's zero vector is subtracted from it. A late, torn or missed frame throws the run
+away, because an unbroken count is what makes the index — and so the phase — true; the
+check retries, as it already did.
+
+**Cost.** The acquisition loop stops for the ~2 s pass and restarts with DC lead-off
+after. On the board: two checks back to back, streaming resumed at 499 frames in 2 s,
+registers restored, no dropped samples. Hardware without the helpers (the mock) still
+runs through the loop, with no phase and size-only subtraction.
+
+**Still to prove.** The correction is right by construction for a series RC, but it has
+not been checked against a known reactive load. A ±1% film capacitor (~470 nF = 10.8 kΩ
+at 31.25 Hz), alone and in series with a resistor, would settle it.
+
 ## 11. Open questions
 
 1. ~~Is REF impedance measurable on this board?~~ No, not with a cap connected (§8 REF
@@ -282,6 +335,10 @@ this session); `fit` rebuilds the calibration from all of them.
    the register read-back helper.
 4. Should connected clients be able to start a check? (phase 4)
 5. PiEEG-16 (two chips) is out of scope unless you move to that board.
+5b. **Does the vector subtraction read a known reactive load correctly?** Needs a ±1%
+   film capacitor (~470 nF) and an RC pair; untested until the parts arrive.
+5c. **The absolute scale is only as good as the resistors** (±1% parts, values taken as
+   printed, no multimeter). 0.1% resistors would take the calibration from ~1% to ~0.2%.
 6. ~~With the Scope open, the acquisition skips ~0.3% of samples.~~ Fixed: an 8-channel
    PiEEG is now read by a separate realtime process (`drdy_reader.py`); 0 of 12,182 samples
    lost in 50 s with the Scope open, against 257 with the old in-thread reader.
