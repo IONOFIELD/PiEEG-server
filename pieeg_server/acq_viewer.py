@@ -55,7 +55,7 @@ import numpy as np
 from scipy import signal
 
 from .hardware import VREF_UV, contact_from_signal
-from .impedance import CAP_OHMS, band as impedance_band, format_ohms
+from .impedance import band as impedance_band, format_ohms
 
 # ── electrode map: chip input (E1..) -> scalp label ──────────────────────────
 # The PiEEG chip streams its inputs in order, and we call them E1, E2, E3 …
@@ -557,17 +557,20 @@ class ViewerModel:
 
 
 def average_impedance(result, inputs):
-    """AVG IMP: mean lead impedance (Ω) over 1-based `inputs` from an
-    impedance result dict (ImpedanceResult.to_dict()). An off or railed lead
-    counts as CAP_OHMS, so a lifted electrode shows in the average; REF and
-    GND are never averaged in. None when there's nothing to average or the
-    readings were withheld."""
-    if not result or result.get("problem"):
-        return None
-    wanted = set(inputs)
-    vals = [CAP_OHMS if lead["ohms"] is None else min(lead["ohms"], CAP_OHMS)
-            for i, lead in enumerate(result["leads"], start=1) if i in wanted]
-    return sum(vals) / len(vals) if vals else None
+    """AVG IMP over 1-based `inputs` from an impedance result dict
+    (ImpedanceResult.to_dict()): (mean Ω, not_measured). The mean covers only
+    leads that were measured (status "ok"); nothing is stood in for the
+    others, which not_measured counts (off, railed, above the calibrated
+    range, uncalibrated). REF and GND are never averaged in. mean is None
+    when no lead was measured or the readings were withheld."""
+    if not result:
+        return None, 0
+    mine = [lead for i, lead in enumerate(result["leads"], start=1)
+            if i in set(inputs)]
+    vals = [lead["ohms"] for lead in mine if lead.get("status") == "ok"]
+    if result.get("problem") or not vals:
+        return None, len(mine) - len(vals)
+    return sum(vals) / len(vals), len(mine) - len(vals)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -857,7 +860,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # the rail (ContactTracker). The average impedance in kΩ needs the AC
     # impedance check, so it stays "—" until that is wired into the Scope
     # (docs/IMPEDANCE_CHECK_PLAN.md).
-    ref_dot = gnd_dot = imp_lbl = None
+    ref_dot = gnd_dot = imp_lbl = imp_off_lbl = None
     if contact_source is not None or impedance_control is not None:
         ewrap = tk.Frame(bar, bg=C["surface"])
         ewrap.pack(side="right", padx=(0, 2))
@@ -878,12 +881,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             gnd_dot = _elec_dot("GND")
         ibox = _chip(ewrap)
         ibox.pack(side="left", padx=(4, 0), pady=1)
-        # Average impedance of the visible montage (from the Ω check). Fixed
-        # width, sized for the longest reading ("AVG 99.9 kΩ"), so the row
-        # doesn't shift once values arrive.
+        # Average impedance of the visible montage's measured electrodes (from
+        # the Ω check), then how many weren't measured ("2 OFF"). Fixed
+        # widths, sized for the longest text, so the row doesn't shift once
+        # values arrive.
         imp_lbl = tk.Label(ibox, text="AVG —", width=11, bg=C["raised"],
                            fg=C["text_dim"], font=(_MONO, _fs(10), "bold"))
-        imp_lbl.pack(padx=4, pady=2)
+        imp_lbl.pack(side="left", padx=(4, 0), pady=2)
+        imp_off_lbl = tk.Label(ibox, text="", width=5, anchor="w",
+                               bg=C["raised"], fg=C["red"],
+                               font=(_MONO, _fs(9), "bold"))
+        imp_off_lbl.pack(side="left", padx=(0, 4), pady=2)
 
     # Stream health (signal dot + measured sample rate) is drawn on the chart's
     # bottom-right corner, not the toolbar, so no unlabelled dot sits by REF.
@@ -1066,12 +1074,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         res = _imp["result"]
         if res is None or imp_lbl is None:
             return
-        avg = average_impedance(res, model.montage_inputs())
+        avg, not_measured = average_impedance(res, model.montage_inputs())
+        stale = time.time() - _imp["at"] > IMP_STALE_S
+        imp_off_lbl.configure(
+            text=f"{not_measured} OFF" if not_measured and not res.get("problem")
+            else "", fg=C["text_dim"] if stale else C["red"])
         if avg is None:
             imp_lbl.configure(text="AVG —",
                               fg=C["red"] if res.get("problem") else C["text_dim"])
         else:
-            stale = time.time() - _imp["at"] > IMP_STALE_S
             imp_lbl.configure(text=f"AVG {format_ohms(avg)}",
                               fg=C["text_dim"] if stale
                               else _BAND_FG[impedance_band(avg)])
@@ -1103,11 +1114,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 continue
             if withheld:
                 value, fg = "—", C["text_dim"]
-            elif lead["ohms"] is None:
-                value, fg = "off", C["red"]
             else:
-                value = format_ohms(lead["ohms"])
-                fg = _BAND_FG[impedance_band(lead["ohms"])]
+                # Server-side text: a measured value, ">10.0 kΩ" above the
+                # lead's calibrated range, "off" or "no cal".
+                value = lead["text"]
+                fg = _BAND_FG.get(lead["band"], C["text_dim"])
             lines.append((f"{model.elabel(site):<3} {site:<5}{value:>9}", fg))
         verdict = {"green": "ok", "red": "OFF", None: "?"}
         lines.append((f"REF {verdict.get(res.get('ref'), '?'):<4}"

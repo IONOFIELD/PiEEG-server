@@ -26,8 +26,10 @@ class _Result:
         self.problem = problem
 
     def to_dict(self):
-        return {"leads": [{"name": "E1", "ohms": 5000.0}], "ref": "green",
-                "gnd": "green", "problem": self.problem}
+        return {"leads": [{"name": "E1", "ohms": 5000.0, "status": "ok",
+                           "text": "5.0 kΩ", "carrier_uv": 71.25,
+                           "noise_uv": 0.02}],
+                "ref": "green", "gnd": "green", "problem": self.problem}
 
 
 def _server(monkeypatch, check):
@@ -122,22 +124,22 @@ def test_recording_does_not_start_during_a_check(monkeypatch):
 
 class TestAverageImpedance:
     RESULT = {"problem": None, "leads": [
-        {"ohms": 4000.0}, {"ohms": None}, {"ohms": 6000.0}, {"ohms": 5e6}]}
+        {"ohms": 4000.0, "status": "ok"}, {"ohms": None, "status": "off"},
+        {"ohms": 6000.0, "status": "ok"},
+        {"ohms": None, "status": "above", "limit_ohms": 50000.0}]}
 
     def test_mean_over_the_montage_inputs_only(self):
-        assert acq_viewer.average_impedance(self.RESULT, [1, 3]) == 5000.0
+        assert acq_viewer.average_impedance(self.RESULT, [1, 3]) == (5000.0, 0)
 
-    def test_off_and_huge_leads_count_as_the_cap(self):
-        cap = acq_viewer.CAP_OHMS
-        assert acq_viewer.average_impedance(self.RESULT, [2]) == cap
-        assert acq_viewer.average_impedance(self.RESULT, [1, 4]) == \
-            (4000.0 + cap) / 2
+    def test_unmeasured_leads_are_counted_not_stood_in_for(self):
+        assert acq_viewer.average_impedance(self.RESULT, [2]) == (None, 1)
+        assert acq_viewer.average_impedance(self.RESULT, [1, 2, 4]) == (4000.0, 2)
 
     def test_nothing_when_withheld_or_empty(self):
         assert acq_viewer.average_impedance(
-            dict(self.RESULT, problem="REF isn't connected"), [1]) is None
-        assert acq_viewer.average_impedance(self.RESULT, []) is None
-        assert acq_viewer.average_impedance(None, [1]) is None
+            dict(self.RESULT, problem="REF isn't connected"), [1]) == (None, 0)
+        assert acq_viewer.average_impedance(self.RESULT, []) == (None, 0)
+        assert acq_viewer.average_impedance(None, [1]) == (None, 0)
 
     def test_montage_inputs_are_the_visible_rows_electrodes(self):
         model = acq_viewer.ViewerModel(8, 250, acq_viewer.DEFAULT_ELECTRODES[:8])
