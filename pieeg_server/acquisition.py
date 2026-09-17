@@ -8,15 +8,31 @@ for downstream consumers (WebSocket server, file writer, etc.).
 
 import asyncio
 import logging
+import os
+import select
+import subprocess
+import sys
 import threading
 import time
 
+from . import drdy_reader
 from .spike_filter import HampelFilter
 
 logger = logging.getLogger("pieeg.acquisition")
 
 SAMPLE_RATE = 250  # Hz
 SAMPLE_INTERVAL = 1.0 / SAMPLE_RATE  # 4 ms
+
+# SCHED_FIFO priority requested for the SPI reading thread (0 disables).
+# The operating system otherwise stalls the thread for 2-6 ms every few
+# seconds, longer than the ~3.6 ms a sample stays readable at 250 SPS. Needs
+# an rtprio limit: /etc/security/limits.d (login sessions) or LimitRTPRIO=
+# (systemd). Without it the request fails quietly and nothing else changes.
+RT_PRIORITY = int(os.environ.get("PIEEG_RT_PRIORITY", "50"))
+
+# Read an 8-channel PiEEG from a separate process (drdy_reader) instead of a
+# thread that competes for the GIL. PIEEG_READER_PROCESS=0 turns it off.
+READER_PROCESS = os.environ.get("PIEEG_READER_PROCESS", "1") != "0"
 
 # Number of frames to discard after a register config change.
 # At 250 Hz, 25 frames = 100 ms — enough for SPI + ADC to settle.
@@ -53,6 +69,12 @@ class AcquisitionLoop:
         self._late_skips = 0         # edges skipped: too late to read cleanly
         self._torn_reads = 0         # reads discarded: next sample landed mid-read
         self._bad_frames = 0         # reads rejected by the hardware (sync/spike)
+        self.realtime = False        # reading thread/process got SCHED_FIFO
+        self._rt_warned = False
+        self._reader_mode = None     # "process" or "thread" once running
+        self._reader_announced = False
+        self._nominal_ns = 1_000_000_000 / SAMPLE_RATE
+        self._prev_edge_ns = None
         # Device-agnostic Hampel spike filter (runs in acquisition thread)
         self._hampel = HampelFilter(num_channels=hardware.num_channels)
         # Default both spike filters to OFF (user can enable via dashboard)
@@ -126,6 +148,29 @@ class AcquisitionLoop:
         self._hampel.reset()
         self._settle_remaining = _SETTLE_FRAMES
         self.start()
+
+    def _make_realtime(self):
+        """Put the calling (reading) thread on SCHED_FIFO if allowed.
+
+        Only for the in-thread interrupt loop: the reader process asks for
+        realtime priority itself.
+        """
+        if RT_PRIORITY <= 0 or not hasattr(os, "sched_setscheduler"):
+            return
+        try:
+            # pid 0 = the calling thread on Linux.
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(RT_PRIORITY))
+        except OSError as e:
+            self.realtime = False
+            if not self._rt_warned:
+                self._rt_warned = True
+                logger.info("realtime priority not available (%s); the reading "
+                            "thread may be stalled now and then and skip a "
+                            "sample", e.strerror or e)
+            return
+        if not self.realtime:
+            logger.info("reading thread on SCHED_FIFO priority %d", RT_PRIORITY)
+        self.realtime = True
 
     def _run(self):
         if self._mock:
@@ -216,53 +261,105 @@ class AcquisitionLoop:
         Blocks on a GPIO edge event (no busy-poll). The kernel timestamps each
         edge, so any missed edge shows up as a larger-than-nominal interval and
         is counted as a dropped sample. Decoding + journaling are unchanged:
-        read_sample() uses the existing gain-aware decoder, and frames go to the
-        same subscriber queues.
+        the existing gain-aware decoder runs here, and frames go to the same
+        subscriber queues.
 
         Reads must finish before the chip's next conversion overwrites its
-        output. When this thread wakes late (the Scope's Tk viewer shares the
-        GIL), a read can straddle that update and return a torn frame: on the
-        bench that gave tens-of-mV single-sample spikes and all-zero frames.
-        So: if newer edges are already queued, the older ones' data is gone —
-        skip to the newest; don't start a read too close to the next
+        output. A late read can straddle that update and return a torn frame:
+        on the bench that gave tens-of-mV single-sample spikes and all-zero
+        frames. So: if newer edges are already queued, the older ones' data is
+        gone — skip to the newest; don't start a read too close to the next
         conversion; and discard a read if the next edge landed while it ran.
         Skipped samples are counted as dropped, never passed on as data.
+
+        On an 8-channel PiEEG the wait and the SPI read run in a separate
+        process (drdy_reader), because inside a busy server this thread waits
+        for the GIL long enough to skip ~0.3% of samples. Other boards, and a
+        reader that can't start or dies, use the same loop in this thread.
         """
         fs = getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE
+        self._nominal_ns = 1_000_000_000 / fs
+        # None on the first edge of every run, including after
+        # restart_with_config(): the pause for the register write is not an
+        # interval, and not a drop.
+        self._prev_edge_ns = None
+
+        handles = self._reader_handles()
+        if handles is not None:
+            finished = True
+            try:
+                finished = self._run_reader_process(handles, fs)
+            finally:
+                if finished:
+                    self._finish_streaming()
+            if finished:
+                return
+        self._reader_mode = "thread"
+        # Only this loop gets realtime priority: it sleeps between samples.
+        # The polling loop never blocks and would hog a core.
+        self._make_realtime()
+        self._run_interrupt_thread(fs)
+
+    def _account_edge(self, ts_ns):
+        self._drdy_events += 1
+        if self._first_event_ns is None:
+            self._first_event_ns = ts_ns
+        prev_ns = self._prev_edge_ns
+        if prev_ns is not None:
+            interval = ts_ns - prev_ns
+            if interval > self._max_interval_ns:
+                self._max_interval_ns = interval
+            if interval > 1.5 * self._nominal_ns:
+                # A DRDY edge is only truly MISSED when a full extra period
+                # elapsed. round(interval/period)-1 gives the count; a
+                # late-but-present edge (~1.5x) rounds to 0 via round(x-1), so
+                # pure jitter is not miscounted as a drop.
+                missed = round(interval / self._nominal_ns - 1.0)
+                if missed > 0:
+                    self._dropped_frames += missed
+                    self._gap_count += 1
+                    logger.warning("DRDY gap: %.2f ms (~%d missed)",
+                                   interval / 1e6, missed)
+        self._last_event_ns = ts_ns
+        self._prev_edge_ns = ts_ns
+
+    def _deliver(self, sample, t):
+        """Pass one read on: count a rejected read, drop settling frames,
+        otherwise filter, number and enqueue it."""
+        if sample is None:
+            self._dropped_frames += 1
+            self._bad_frames += 1
+            return
+        # Discard settling frames after a register-config restart.
+        if self._settle_remaining > 0:
+            self._settle_remaining -= 1
+            return
+        sample = self._hampel.apply(sample)
+        self._sample_count += 1
+        self._frames_read += 1
+        frame = {
+            "t": round(t, 6),
+            "n": self._sample_count,
+            "channels": sample,
+        }
+        self._loop.call_soon_threadsafe(self._enqueue, frame)
+
+    def _finish_streaming(self):
+        # Clean stop: halt streaming, then restore the DRDY level handle.
+        try:
+            self._hw.stop_streaming()
+        finally:
+            self._hw.disable_drdy_events()
+
+    def _run_interrupt_thread(self, fs):
+        """The DRDY wait and SPI read in this thread (see drdy_reader for the
+        same loop in its own process)."""
         nominal_ns = 1_000_000_000 / fs
-        gap_ns = 1.5 * nominal_ns          # interval beyond this = missed sample(s)
         # Latest start for a read: 0.4 ms before the next conversion. A read
         # (27 bytes at 2 MHz plus overhead) takes ~0.2 ms, and the torn-read
         # check below still discards any read the next edge lands in.
         read_deadline_ns = max(nominal_ns / 2, nominal_ns - 400_000)
-        prev_ns = None
         pending = None
-
-        def account(ts_ns):
-            nonlocal prev_ns
-            self._drdy_events += 1
-            if self._first_event_ns is None:
-                self._first_event_ns = ts_ns
-            if prev_ns is not None:
-                # prev_ns is None on the first edge of every run, including
-                # after restart_with_config(): the deliberate pause for the
-                # register write is not an interval, and not a drop.
-                interval = ts_ns - prev_ns
-                if interval > self._max_interval_ns:
-                    self._max_interval_ns = interval
-                if interval > gap_ns:
-                    # A DRDY edge is only truly MISSED when a full extra
-                    # period elapsed. round(interval/period)-1 gives the
-                    # count; a late-but-present edge (~1.5x) rounds to 0 via
-                    # round(x-1), so pure jitter is not miscounted as a drop.
-                    missed = round(interval / nominal_ns - 1.0)
-                    if missed > 0:
-                        self._dropped_frames += missed
-                        self._gap_count += 1
-                        logger.warning("DRDY gap: %.2f ms (~%d missed)",
-                                       interval / 1e6, missed)
-            self._last_event_ns = ts_ns
-            prev_ns = ts_ns
 
         self._hw.enable_drdy_events()
         try:
@@ -273,14 +370,14 @@ class AcquisitionLoop:
                     ts_ns = self._hw.wait_drdy_event(timeout=0.5)
                     if ts_ns is None:
                         continue           # no edge yet — re-check the stop flag
-                account(ts_ns)
+                self._account_edge(ts_ns)
 
                 # Newer edges already queued: this edge's data was overwritten.
                 newer = self._hw.wait_drdy_event(timeout=0)
                 while newer is not None:
                     self._dropped_frames += 1
                     self._late_skips += 1
-                    account(newer)
+                    self._account_edge(newer)
                     ts_ns = newer
                     newer = self._hw.wait_drdy_event(timeout=0)
 
@@ -299,30 +396,112 @@ class AcquisitionLoop:
                         self._dropped_frames += 1
                         self._torn_reads += 1
                         continue
-                if sample is None:
-                    self._dropped_frames += 1
-                    self._bad_frames += 1
-                    continue
-                # Discard settling frames after a register-config restart.
-                if self._settle_remaining > 0:
-                    self._settle_remaining -= 1
-                    continue
-
-                sample = self._hampel.apply(sample)
-                self._sample_count += 1
-                self._frames_read += 1
-                frame = {
-                    "t": round(time.time(), 6),
-                    "n": self._sample_count,
-                    "channels": sample,
-                }
-                self._loop.call_soon_threadsafe(self._enqueue, frame)
+                self._deliver(sample, time.time())
         finally:
-            # Clean stop: halt streaming, then restore the DRDY level handle.
+            self._finish_streaming()
+
+    # --- separate reader process (8-channel PiEEG) ---
+
+    def _reader_handles(self):
+        if not READER_PROCESS:
+            return None
+        get = getattr(self._hw, "reader_handles", None)
+        return get() if callable(get) else None
+
+    def _spawn_reader(self, handles, fs):
+        """Start drdy_reader; returns (process, control write fd, data read fd)."""
+        chip_fd, pin, spi_fd = handles
+        ctrl_r, ctrl_w = os.pipe()
+        data_r, data_w = os.pipe()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-I", "-S", drdy_reader.__file__,
+                 str(spi_fd), str(chip_fd), str(pin), str(fs),
+                 str(RT_PRIORITY), str(ctrl_r), str(data_w)],
+                pass_fds=(spi_fd, chip_fd, ctrl_r, data_w),
+                stdin=subprocess.DEVNULL)
+        except BaseException:
+            for fd in (ctrl_r, ctrl_w, data_r, data_w):
+                os.close(fd)
+            raise
+        os.close(ctrl_r)
+        os.close(data_w)
+        return proc, ctrl_w, data_r
+
+    def _run_reader_process(self, handles, fs) -> bool:
+        """Read records from drdy_reader until stop() is requested.
+
+        Returns False (the caller falls back to the in-thread loop) when the
+        reader can't start or exits on its own; True otherwise.
+        """
+        self._hw.release_drdy_level()       # the reader requests the event line
+        try:
+            proc, ctrl_w, data_r = self._spawn_reader(handles, fs)
+        except OSError as e:
+            logger.warning("DRDY reader process didn't start (%s); reading "
+                           "in-thread", e)
+            return False
+        self._reader_mode = "process"
+        size = drdy_reader.RECORD.size
+        unpack = drdy_reader.RECORD.unpack_from
+        buf = bytearray()
+        exited = False
+        try:
+            while not self._stop_event.is_set():
+                ready, _, _ = select.select([data_r], [], [], 0.2)
+                if not ready:
+                    if proc.poll() is not None:
+                        exited = True
+                        break
+                    continue
+                chunk = os.read(data_r, size * 256)
+                if not chunk:
+                    exited = True
+                    break
+                buf += chunk
+                whole = len(buf) - len(buf) % size
+                for off in range(0, whole, size):
+                    self._handle_record(*unpack(buf, off))
+                del buf[:whole]
+        finally:
+            os.close(ctrl_w)                # tells the reader to exit
             try:
-                self._hw.stop_streaming()
-            finally:
-                self._hw.disable_drdy_events()
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            os.close(data_r)
+        if exited and not self._stop_event.is_set():
+            logger.error("DRDY reader process exited (code %s); reading "
+                         "in-thread", proc.returncode)
+            return False
+        return True
+
+    def _handle_record(self, ts_ns, kind, raw):
+        if kind == drdy_reader.READY:
+            realtime = bool(raw[0])
+            if realtime != self.realtime or not self._reader_announced:
+                self._reader_announced = True
+                if realtime:
+                    logger.info("DRDY reader process on SCHED_FIFO priority %d",
+                                RT_PRIORITY)
+                else:
+                    logger.info("DRDY reader process without realtime "
+                                "priority (no rtprio limit); it may be "
+                                "stalled now and then and skip a sample")
+            self.realtime = realtime
+            return
+        self._account_edge(ts_ns)
+        if kind == drdy_reader.LATE:
+            self._dropped_frames += 1
+            self._late_skips += 1
+        elif kind == drdy_reader.TORN:
+            self._dropped_frames += 1
+            self._torn_reads += 1
+        else:
+            # Wall-clock time of the edge itself, not of this (later) decode.
+            t = time.time() - (time.monotonic_ns() - ts_ns) / 1e9
+            self._deliver(self._hw.decode_frame(list(raw)), t)
 
     def capture_stats(self) -> dict:
         """Drop-detection summary for the interrupt loop.
@@ -345,6 +524,8 @@ class AcquisitionLoop:
             "late_skips": self._late_skips,
             "torn_reads": self._torn_reads,
             "bad_frames": self._bad_frames,
+            "reader": self._reader_mode,
+            "realtime": self.realtime,
         }
 
     def _enqueue(self, frame: dict):

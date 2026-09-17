@@ -20,7 +20,7 @@ try:
 except ImportError:
     fcntl = None  # not on Linux — hardware methods will fail, mock mode still works
 
-from . import _native
+from . import _native, drdy_reader
 from .profiles import HardwareProfile, get_profile
 
 logger = logging.getLogger("pieeg.hardware")
@@ -149,11 +149,9 @@ _GPIOHANDLE_REQUEST_OUTPUT = 1 << 1
 _HANDLE_REQUEST_SIZE = 364  # sizeof(struct gpiohandle_request)
 _HANDLE_DATA_SIZE    = 64   # sizeof(struct gpiohandle_data)
 
-# Line EVENTS (edge interrupts) — GPIO_GET_LINEEVENT_IOCTL = _IOWR(0xB4, 0x04, 48)
-_GPIO_GET_LINEEVENT = 0xC030B404
-_GPIOEVENT_REQUEST_FALLING_EDGE = 1 << 1   # ADS1299 DRDY asserts LOW = data ready
-_EVENT_REQUEST_SIZE = 48   # sizeof(struct gpioevent_request)
-_EVENT_DATA_SIZE    = 16   # sizeof(struct gpioevent_data): u64 timestamp + u32 id
+# Line EVENTS (edge interrupts): requested via drdy_reader, which the reader
+# process also runs standalone.
+_EVENT_DATA_SIZE = drdy_reader.EVENT_DATA_SIZE   # u64 timestamp + u32 id
 
 
 def _status_sync_ok(raw: list[int]) -> bool:
@@ -453,17 +451,25 @@ class PiEEGHardware:
             channels.extend(self._decode_channels(raw2))
             return channels
         else:
-            # 8-channel mode: spike detection on chip 1
-            self._update_leadoff(raw1)
-            if not self._is_valid_frame(raw1):
-                return None
-            # Reject reads without the 1100 sync marker. A read that starts
-            # after the chip has shifted the frame out (a late or duplicate
-            # read) returns all zeros, and a misaligned one garbage; both
-            # passed straight through before and showed up as huge spikes.
-            if not _status_sync_ok(raw1):
-                return None
-            return self._decode_channels(raw1)
+            return self.decode_frame(raw1)
+
+    def decode_frame(self, raw1):
+        """Decode one 27-byte 8-channel frame into µV (None if rejected).
+
+        Split out of read_sample() so the separate reader process
+        (drdy_reader) can do the SPI read and hand the bytes back here.
+        """
+        # 8-channel mode: spike detection on chip 1
+        self._update_leadoff(raw1)
+        if not self._is_valid_frame(raw1):
+            return None
+        # Reject reads without the 1100 sync marker. A read that starts
+        # after the chip has shifted the frame out (a late or duplicate
+        # read) returns all zeros, and a misaligned one garbage; both
+        # passed straight through before and showed up as huge spikes.
+        if not _status_sync_ok(raw1):
+            return None
+        return self._decode_channels(raw1)
 
     def _update_leadoff(self, raw1: list[int], raw2: list[int] | None = None):
         """Refresh cached lead-off state from the STATUS word(s) of a frame.
@@ -678,20 +684,24 @@ class PiEEGHardware:
         Returns a file descriptor that becomes readable on each edge; reading
         16 bytes yields one struct gpioevent_data (u64 kernel timestamp, u32 id).
         """
-        # struct gpioevent_request (48 bytes):
-        #   0..3   lineoffset       (u32)
-        #   4..7   handleflags      (u32)  -> INPUT
-        #   8..11  eventflags       (u32)  -> FALLING_EDGE
-        #   12..43 consumer_label   (char × 32)
-        #   44..47 fd               (i32, filled by kernel)
-        buf = bytearray(_EVENT_REQUEST_SIZE)
-        struct.pack_into("I", buf, 0, pin)
-        struct.pack_into("I", buf, 4, _GPIOHANDLE_REQUEST_INPUT)
-        struct.pack_into("I", buf, 8, _GPIOEVENT_REQUEST_FALLING_EDGE)
-        label = consumer[:32]
-        buf[12:12 + len(label)] = label
-        fcntl.ioctl(chip_fd, _GPIO_GET_LINEEVENT, buf)
-        return struct.unpack_from("i", buf, 44)[0]
+        return drdy_reader.request_falling_edge_events(chip_fd, pin, consumer)
+
+    def reader_handles(self):
+        """(gpiochip fd, DRDY pin, spidev fd) for the drdy_reader process.
+
+        None when it can't be used: 16-channel boards read a second chip
+        with its own DRDY and chip-select sequence, which stays in-thread.
+        """
+        if self._num_channels != 8 or self._spi1 is None or self._chip_fd < 0:
+            return None
+        return self._chip_fd, DRDY_PIN, self._spi1.fileno()
+
+    def release_drdy_level(self):
+        """Free the DRDY level handle so the reader process can request the
+        line as an event source. disable_drdy_events() restores it."""
+        if self._drdy_fd >= 0:
+            os.close(self._drdy_fd)
+            self._drdy_fd = -1
 
     def enable_drdy_events(self):
         """Switch chip-1 DRDY to interrupt mode (falling-edge events).
