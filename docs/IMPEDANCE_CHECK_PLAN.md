@@ -11,7 +11,9 @@
   Worst error 1.2% from 1 kΩ to 50 kΩ; saved as source `bench`.
 - **REF impedance can't be measured on this board with a cap connected** (§8, REF test).
   REF stays a contact verdict (green/red).
-- **Next:** the check goes into the Scope (phase 3) and fills the `AVG IMP —` box.
+- **In the Scope (v2.9):** the Ω button beside IP runs the check; results appear in a
+  panel over the traces and the AVG box. Checked on the breadboard with the Scope open:
+  three checks in a row, 10.00–10.05 kΩ on 10 kΩ, every check completed.
 
 ## 1. The hardware (read off the board)
 
@@ -41,9 +43,9 @@ fixed series resistance explains. The lead-to-lead differences are the test curr
 | Indicator | Source | Meaning |
 |---|---|---|
 | Lead dots | P lead-off flag, debounced over ~0.5 s | green on, amber flickering, red off |
-| REF dot | `hardware.contact_from_signal` (§7 signatures) | green / red; grey while channels carry an internal test signal |
-| GND dot | same | green / red / grey (can't tell, e.g. nothing connected) |
-| AVG IMP box | not built yet | shows "—" until phase 3 |
+| REF word | `hardware.contact_from_signal` (§7 signatures, mains averaged out, drift) | OK / LOOSE / OFF; "—" while channels carry an internal test signal |
+| GND word | same | OK / LOOSE / OFF / "—" (can't tell, e.g. nothing connected) |
+| Ω button + AVG box | `server.run_impedance_check` → `ImpedanceCheck` | per-lead kΩ panel; AVG over the visible montage |
 | Contact state sent to clients | P flag only | green (on) / red (off); `n_off` is passed through raw |
 
 ## 3. How the measurement works
@@ -94,16 +96,23 @@ averaged; they stay as their own dots.
 
 **Wet-gel bands:** green ≤ 10 kΩ, amber ≤ 50 kΩ, red > 50 kΩ.
 
-## 5. Streaming and recording during a check (phase 3, not built)
+## 5. Streaming and recording during a check (built, v2.9)
 
-The 31.25 Hz carrier sits in the beta/gamma band on every connected channel. The check
-must stay a short, explicit, operator-started mode:
+The 31.25 Hz carrier sits in the beta/gamma band on every connected channel, so the check
+is a short, explicit, operator-started mode (`PiEEGServer.run_impedance_check`):
 
-- **Refuse while recording** ("stop recording first").
-- **Pause the sample broadcast to clients** for the ~4 s, and announce it with
-  `{"status":"impedance","active":true}`, then `{"active":false,"results":…}`.
-  Suppress the lead-off broadcast meanwhile.
-- **Reset the viewer's filter state** afterwards so the traces don't jump.
+- **Refuses while recording** ("stop the recording before checking impedance"), and a
+  recording can't start during a check.
+- **Pauses the sample and lead-off broadcast** for the ~4 s (frames stay out of the
+  server's filters and band powers too), announced with
+  `{"status":"impedance","active":true}`, then `{"active":false,"results":…}` or
+  `{"active":false,"error":…}`.
+- **The viewer holds its traces flat** during the check instead of drawing the test
+  current, and skips its contact readout meanwhile.
+- **Refuses on internal signals** (test signal, shorted inputs): nothing to measure, and
+  the identical test signal looks like a floating REF.
+- **REF is judged again on the measurement itself;** a REF that came loose during the
+  check withholds the values.
 
 ## 6. Code status
 
@@ -114,8 +123,9 @@ must stay a short, explicit, operator-started mode:
 | `impedance.py`: demodulation, calibration (zeros, per-lead scale, gain, fit), wiring-aware analysis, masked lead pass, `ImpedanceCheck`, CLI | built |
 | `mock.py`: AC lead-off simulation (`set_impedances`) | built |
 | `acq_viewer.py` / `scope_console.py`: contact, REF and GND dots; viewer in its own process | built (v2.8) |
-| Scope **Z** button, result overlay, AVG IMP value | phase 3 |
-| `server.py`: pause and status messages during a check | phase 3 |
+| Scope Ω button, result panel, AVG value, REF/GND words | built (v2.9) |
+| `server.py`: pause and status messages during a check | built (v2.9) |
+| `drdy_reader.py`: sample reading in its own realtime process | built |
 | `hardware.py`: register read-back helper (BIAS_STAT, restore check) | optional |
 
 ## 7. Wire bench findings (2026-09-16, board wires only)
@@ -254,10 +264,10 @@ this session); `fit` rebuilds the calibration from all of them.
 - **Phase 1 (done):** measurement core, mock, tests, bench CLI.
 - **Phase 2a (done):** wire bench tests; per-lead zeros saved; the design fixes in §7.
 - **Phase 2b (done):** resistor session, per-lead calibration saved (§8).
-- **Phase 3:**
-  - The Scope's Z check: button, result overlay (fits 800×480), AVG IMP value, lead dots
-    coloured by band
+- **Phase 3 (done, v2.9):**
+  - The Scope's Ω check: button beside IP, result panel (fits 800×480), AVG value
   - Server pause and status messages (§5)
+  - Samples read by a separate realtime process, so a check with the Scope open finishes
 - **Phase 4 (optional):**
   - Continuous mode while seating electrodes
   - A command so a connected client can start a check
@@ -275,8 +285,11 @@ this session); `fit` rebuilds the calibration from all of them.
 6. ~~With the Scope open, the acquisition skips ~0.3% of samples.~~ Fixed: an 8-channel
    PiEEG is now read by a separate realtime process (`drdy_reader.py`); 0 of 12,182 samples
    lost in 50 s with the Scope open, against 257 with the old in-thread reader.
-7. The DC REF verdict gives false alarms on mains hum through a high-impedance REF and
-   misses a REF that has only just come out (slow drift). See §8 REF test.
+7. ~~The DC REF verdict gives false alarms on mains hum and misses a REF that has just
+   come out.~~ Fixed: the shared signal is averaged over 100 ms (whole 50 and 60 Hz
+   cycles) before it's judged, and a shared drift of 1.5 mV/s or a shared DC level of
+   30 mV also means REF is off. The thresholds come from one bench episode; check them
+   on a person.
 
 ## References
 

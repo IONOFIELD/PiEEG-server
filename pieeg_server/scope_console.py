@@ -172,6 +172,16 @@ SCOPE_CHANGELOG = [
             "dropped and counted instead of passed on. The viewer now runs in "
             "its own process, so drawing no longer delays reading the chip. "
             "The window title and connection popup no longer name a client."),
+    ("2.9", "Ω button beside IP: measures every electrode's impedance in about "
+            "4 s. Results show in a panel over the traces (tap to close), and "
+            "the AVG box averages the electrodes in the montage on screen "
+            "(green up to 10 kΩ, amber up to 50 kΩ, red above or off). The "
+            "check won't run during a recording, and the stream to connected "
+            "apps pauses while it runs. REF and GND now read OK / LOOSE / OFF "
+            "in words. Mains hum through a poorly seated REF no longer shows "
+            "REF as off, and a REF that has just come loose is caught sooner. "
+            "No more skipped samples: the board is now read by its own small "
+            "process (0 lost in 50 s with the Scope open, from about 2%)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -321,9 +331,10 @@ class _ViewerLink:
     its drawing can't hold this process's GIL while the acquisition thread
     must read each sample within ~3 ms of its DRDY edge. In-process it skipped
     ~2-3% of samples for lateness. Frames are batched and sent ~20 times a
-    second along with the lead-off readout and recording state; Rec/Stop
-    presses come back as commands. Only the sender thread writes to the pipe,
-    so the asyncio loop never blocks on a slow viewer.
+    second along with the lead-off readout and recording state; Rec/Stop and
+    Ω (impedance check) presses come back as requests, each answered when its
+    future finishes. Only the sender thread writes to the pipe, so the asyncio
+    loop never blocks on a slow viewer.
     """
 
     SEND_INTERVAL = 0.05
@@ -332,17 +343,23 @@ class _ViewerLink:
     CHUNK = 100                             # rows converted per GIL hold
 
     def __init__(self, viewer_kwargs, leadoff=None, record_status=None,
-                 toggle_record=None):
+                 toggle_record=None, impedance=None):
         ctx = multiprocessing.get_context("spawn")
         self._conn, self._child_conn = ctx.Pipe(duplex=True)
         self._proc = ctx.Process(
             target=_viewer_main, args=(self._child_conn,),
             kwargs=dict(viewer_kwargs, contact=leadoff is not None,
-                        record=toggle_record is not None),
+                        record=toggle_record is not None,
+                        impedance=impedance is not None),
             name="pieeg-scope-viewer", daemon=True)
         self._leadoff = leadoff
         self._record_status = record_status
-        self._toggle_record = toggle_record
+        # request kind -> (reply kind, callable returning a concurrent Future)
+        self._requests = {}
+        if toggle_record is not None:
+            self._requests["toggle_record"] = ("record_result", toggle_record)
+        if impedance is not None:
+            self._requests["impedance"] = ("impedance_result", impedance)
         self._frames = collections.deque(maxlen=self.MAX_BACKLOG)
         self._outbox: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
@@ -408,16 +425,17 @@ class _ViewerLink:
                 kind, *rest = self._conn.recv()
             except (EOFError, OSError):
                 return
-            if kind == "toggle_record" and self._toggle_record is not None:
+            if kind in self._requests:
+                reply, start = self._requests[kind]
                 req = rest[0]
                 try:
-                    fut = self._toggle_record()
+                    fut = start()
                 except Exception as e:      # noqa: BLE001
-                    self._outbox.put(("record_result", req, {"error": str(e)}))
+                    self._outbox.put((reply, req, {"error": str(e)}))
                     continue
                 fut.add_done_callback(
-                    lambda f, req=req: self._outbox.put(
-                        ("record_result", req, _future_payload(f))))
+                    lambda f, req=req, reply=reply: self._outbox.put(
+                        (reply, req, _future_payload(f))))
             elif kind == "error":
                 logger.error("viewer process crashed:\n%s", rest[0])
 
@@ -536,6 +554,7 @@ def main(argv=None):
     # public pieces of the serve path; we do not modify them.
     from .acquisition import AcquisitionLoop
     from .hardware import VREF_UV
+    from .impedance import unsupported_reason
     from .server import PiEEGServer
     from . import profiles
 
@@ -642,6 +661,8 @@ def main(argv=None):
 
     async def _toggle_record():
         status = _record_status()
+        if server._impedance_active:
+            raise RuntimeError("wait for the impedance check to finish")
         if status["recording"]:
             session = server._last_session
             await server._stop_recording()
@@ -728,7 +749,12 @@ def main(argv=None):
         # No Rec button on mock launches: synthetic data must never land in
         # recordings/ looking like a real session.
         toggle_record=None if args.mock else (
-            lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)))
+            lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)),
+        # Ω: the electrode impedance check (PiEEG-8 only; works on --mock too,
+        # which simulates it).
+        impedance=None if unsupported_reason(acq) else (
+            lambda: asyncio.run_coroutine_threadsafe(
+                server.run_impedance_check(), loop)))
     try:
         link_ref["link"] = link
         link.start()

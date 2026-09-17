@@ -90,6 +90,9 @@ class PiEEGServer:
         self._cloud_relay_timeout_task: asyncio.Task | None = None
         self._cloud_relay_meta: dict | None = None  # {relay_id, share_url}
         self._noise_test_running = False
+        # True while an electrode impedance check runs (see
+        # run_impedance_check): the sample broadcast pauses meanwhile.
+        self._impedance_active = False
         # Spectral cache — updated at ~4 Hz, served by GET /api/spectrum
         self._spec_buffers: list = []   # populated lazily on first frame
         self._spec_frame: int = 0
@@ -555,6 +558,10 @@ class PiEEGServer:
         if self._recorder_task and not self._recorder_task.done():
             logger.warning("Recording already in progress")
             return
+        if self._impedance_active:
+            # The check's 31.25 Hz test current would be in the recording.
+            logger.warning("Impedance check running; not starting a recording")
+            return
 
         # One timestamp -> one base name shared by the CSV, the journal, its
         # sidecar, and the eventual EDF, so a session's files stay together.
@@ -694,6 +701,53 @@ class PiEEGServer:
             logger.warning("Could not compute CSV integrity for %s: %s", path, exc)
             return 0, None
 
+    async def run_impedance_check(self) -> dict:
+        """Measure electrode impedance on the live stream (a few seconds).
+
+        The check injects a 31.25 Hz test current, which would land in every
+        client's data and in a recording. So it refuses while recording, and
+        the sample and lead-off broadcast pause while it runs. Clients get
+        {"status": "impedance", "active": true} first, then {"status":
+        "impedance", "active": false} with "results" (ImpedanceResult
+        .to_dict()) or "error". Returns the results dict.
+        """
+        from .impedance import ImpedanceCheck
+
+        if self._impedance_active:
+            raise RuntimeError("an impedance check is already running")
+        if self._recorder_task is not None and not self._recorder_task.done():
+            raise RuntimeError("stop the recording before checking impedance")
+        self._impedance_active = True
+        done = {"status": "impedance", "active": False}
+        try:
+            await self._broadcast_json({"status": "impedance", "active": True})
+            result = (await ImpedanceCheck(self._acq).run()).to_dict()
+            done["results"] = result
+            logger.info("impedance check: %s%s", " ".join(
+                f"{r['name']}={'off' if r['ohms'] is None else round(r['ohms'])}"
+                for r in result["leads"]),
+                f" ({result['problem']})" if result["problem"] else "")
+            return result
+        except Exception as e:
+            done["error"] = str(e)
+            raise
+        finally:
+            self._impedance_active = False
+            await self._broadcast_json(done)
+
+    async def _broadcast_json(self, message: dict):
+        """Send one JSON message to every connected client."""
+        if not self._clients:
+            return
+        payload = json.dumps(message)
+        stale = set()
+        for ws in list(self._clients):
+            try:
+                await ws.send(payload)
+            except websockets.ConnectionClosed:
+                stale.add(ws)
+        self._clients -= stale
+
     async def _broadcast_record_status(self, stop_info: dict | None = None):
         """Send recording status to all connected clients."""
         status = self._get_record_status(stop_info=stop_info)
@@ -728,6 +782,11 @@ class PiEEGServer:
 
         while True:
             frame = await queue.get()
+            if self._impedance_active:
+                # Test current on every channel: not EEG. Nothing goes out
+                # (clients were told the check started), and it stays out of
+                # the filters and band powers.
+                continue
 
             if self._filter or self._notch_filter:
                 frame = frame.copy()
