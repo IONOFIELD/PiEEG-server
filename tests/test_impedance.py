@@ -113,9 +113,45 @@ def _bench(ohms, carriers, fs=FS):
 
 class TestCalibration:
     def test_lead_converts_with_its_own_zero_and_slope(self):
-        lc = imp.LeadCalibration(zero_uv=33.0, ohms_per_uv=100.0, max_ohms=5e4)
+        lc = imp.LeadCalibration(zero_re=33.0, ohms_per_uv=100.0, max_ohms=5e4)
         assert lc.ohms(43.0) == pytest.approx(1000)
         assert lc.limit_ohms == pytest.approx(5e4 * (1 + imp.RANGE_MARGIN))
+
+    def test_a_zero_with_phase_is_subtracted_as_a_vector(self):
+        lc = imp.LeadCalibration(zero_re=3.0, zero_im=4.0, ohms_per_uv=100.0,
+                                 max_ohms=5e4)
+        assert lc.zero_uv == pytest.approx(5.0) and lc.has_phase
+        # the part the electrode added is (2, 1): 2.236 µV, not 7.071 - 5
+        assert lc.ohms(complex(5.0, 5.0)) == pytest.approx(223.607, rel=1e-5)
+        assert lc.ohms(abs(complex(5.0, 5.0))) == pytest.approx(207.107, rel=1e-5)
+
+    def test_a_zero_without_phase_can_only_subtract_sizes(self):
+        lc = imp.LeadCalibration(zero_re=5.0, ohms_per_uv=100.0, max_ohms=5e4)
+        assert not lc.has_phase
+        assert lc.ohms(complex(5.0, 5.0)) == pytest.approx(207.107, rel=1e-5)
+
+    def test_fit_keeps_the_zero_vector_when_readings_carry_a_phase(self):
+        def pts(ohms, mag, deg):
+            rad = math.radians(deg)
+            return [{"pass": "lead", "name": "E1", "ohms": ohms, "fs": FS,
+                     "carrier_uv": mag, "carrier_re": mag * math.cos(rad),
+                     "carrier_im": mag * math.sin(rad)}]
+        # zero 33 µV at -69.5°, then a resistor 10 kΩ further along that line
+        points = pts(0, 33.0, -69.5) + pts(0, 33.0, -69.5)
+        points += pts(10000, 33.0 + 10000 / 160.0, -69.5)
+        cal, report = imp.fit_calibration(points)
+        lc = cal.leads[0]
+        assert lc.has_phase and lc.zero_uv == pytest.approx(33.0)
+        assert math.degrees(math.atan2(lc.zero_im, lc.zero_re)) == \
+            pytest.approx(-69.5)
+        assert lc.ohms_per_uv == pytest.approx(160.0)
+        assert "-69.5°" in report[1]
+
+    def test_fit_falls_back_to_sizes_without_phases(self):
+        pts = _bench(0, [30.0] + [None] * 7) + _bench(1e4, [90.0] + [None] * 7)
+        cal, report = imp.fit_calibration(pts)
+        assert not cal.leads[0].has_phase
+        assert "size only" in report[1]
 
     def test_fit_gives_each_lead_its_own_slope_zero_and_range(self):
         zeros = [30.0 + i for i in range(8)]
@@ -337,6 +373,42 @@ class TestAnalyze:
         assert r.leads[0].ohms == pytest.approx(10_150)
         assert (r.leads[1].status, r.leads[1].ohms) == (imp.ABOVE, None)
         assert r.leads[1].limit_ohms == 10_000 and r.leads[1].text == ">10.0 kΩ"
+
+    def _phasor_block(self, phasors, k0, n=None):
+        """A block whose carrier is `phasors` (µV peak) when read with the
+        block's first sample at index k0 from START."""
+        n = n or imp.block_length(FS)
+        t = k0 + np.arange(n)
+        cols = [np.real(z * np.exp(2j * np.pi * imp.EXCITATION_HZ * t / FS))
+                for z in phasors]
+        return np.column_stack(cols)
+
+    def test_phase_is_measured_against_the_start_index(self):
+        k0 = 125
+        want = [33.0 * np.exp(-1j * np.radians(69.5)), 20.0 + 5.0j]
+        block = self._phasor_block(want, k0)
+        got, _ = imp.carrier_phasors(block, FS, k0)
+        assert got == pytest.approx(np.array(want), rel=1e-6)
+        shifted, _ = imp.carrier_phasors(block, FS, k0 + 1)
+        assert np.degrees(np.angle(shifted[0] / got[0])) == pytest.approx(-45)
+
+    def test_a_capacitive_electrode_is_subtracted_as_a_vector(self):
+        # board path 33 µV at -69.5°, electrode adds 10 kΩ at -45° to it
+        k0 = 125
+        zero = 33.0 * np.exp(-1j * np.radians(69.5))
+        cal = imp.Calibration(fs=FS, fitted_at="test", leads=[
+            imp.LeadCalibration(zero_re=zero.real, zero_im=zero.imag,
+                                ohms_per_uv=160.0, max_ohms=5e4)] * 2)
+        added = (10_000 / 160.0) * np.exp(-1j * np.radians(69.5 + 45))
+        block = self._phasor_block([zero + added] * 2, k0)
+        r = imp.analyze(block, FS, FULL_SCALE, cal, self._contact(), k0=k0)
+        assert r.leads[0].ohms == pytest.approx(10_000, rel=1e-6)
+        assert r.leads[0].phase_deg == pytest.approx(
+            np.degrees(np.angle(zero + added)), abs=1e-4)
+        # without the start index only sizes can be subtracted, and a 10 kΩ
+        # electrode at -45° then reads ~8.95 kΩ (10% low)
+        flat = imp.analyze(block, FS, FULL_SCALE, cal, self._contact())
+        assert flat.leads[0].ohms == pytest.approx(8952, rel=1e-3)
 
     def test_reading_below_the_short_is_zero(self):
         r = imp.analyze(self._lead_block([100, 100]), FS, FULL_SCALE,

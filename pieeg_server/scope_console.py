@@ -192,8 +192,12 @@ SCOPE_CHANGELOG = [
             "the check shows no numbers. Above the largest resistor that "
             "electrode was checked with it shows \">\" that value instead of "
             "a guess. Values under 1 kΩ show in ohms again. AVG averages only "
-            "the measured electrodes and shows how many weren't measured "
-            "(\"2 OFF\")."),
+            "the measured electrodes, with how many weren't measured after "
+            "it (\"AVG 19.5k·3\"). The check also measures WHEN the test "
+            "signal arrives, not just how big it is, so the board's own "
+            "input path is taken off an electrode correctly even though an "
+            "electrode behaves partly like a capacitor; sizes alone read "
+            "about 10% low on a 10 kΩ electrode."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

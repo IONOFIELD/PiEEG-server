@@ -556,6 +556,15 @@ class ViewerModel:
         return self.filt[:, self.site_index[a]] - self.filt[:, self.site_index[b]]
 
 
+def _compact_ohms(ohms):
+    """Short form for the AVG box when a count has to fit beside it."""
+    if ohms < 1000:
+        return f"{ohms:.0f}Ω"
+    if ohms < 100_000:
+        return f"{ohms / 1000:.1f}k"
+    return f"{ohms / 1000:.0f}k"
+
+
 def average_impedance(result, inputs):
     """AVG IMP over 1-based `inputs` from an impedance result dict
     (ImpedanceResult.to_dict()): (mean Ω, not_measured). The mean covers only
@@ -860,7 +869,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # the rail (ContactTracker). The average impedance in kΩ needs the AC
     # impedance check, so it stays "—" until that is wired into the Scope
     # (docs/IMPEDANCE_CHECK_PLAN.md).
-    ref_dot = gnd_dot = imp_lbl = imp_off_lbl = None
+    ref_dot = gnd_dot = imp_lbl = None
     if contact_source is not None or impedance_control is not None:
         ewrap = tk.Frame(bar, bg=C["surface"])
         ewrap.pack(side="right", padx=(0, 2))
@@ -882,16 +891,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ibox = _chip(ewrap)
         ibox.pack(side="left", padx=(4, 0), pady=1)
         # Average impedance of the visible montage's measured electrodes (from
-        # the Ω check), then how many weren't measured ("2 OFF"). Fixed
-        # widths, sized for the longest text, so the row doesn't shift once
-        # values arrive.
+        # the Ω check). Fixed width, sized for the longest reading
+        # ("AVG 99.9 kΩ"), so the row doesn't shift once values arrive. Row 2
+        # is full at 800 px, so electrodes that weren't measured are counted
+        # inside the same label ("AVG 19.5k·3"), not in a field of their own.
         imp_lbl = tk.Label(ibox, text="AVG —", width=11, bg=C["raised"],
                            fg=C["text_dim"], font=(_MONO, _fs(10), "bold"))
-        imp_lbl.pack(side="left", padx=(4, 0), pady=2)
-        imp_off_lbl = tk.Label(ibox, text="", width=5, anchor="w",
-                               bg=C["raised"], fg=C["red"],
-                               font=(_MONO, _fs(9), "bold"))
-        imp_off_lbl.pack(side="left", padx=(0, 4), pady=2)
+        imp_lbl.pack(padx=4, pady=2)
 
     # Stream health (signal dot + measured sample rate) is drawn on the chart's
     # bottom-right corner, not the toolbar, so no unlabelled dot sits by REF.
@@ -1071,20 +1077,25 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                             panel_until=time.monotonic() + IMP_PANEL_S)
                 if res.get("problem"):
                     _hint(res["problem"], seconds=10, fg=C["red"])
+                else:
+                    # The AVG box only has room for a count, so say it once.
+                    _, missing = average_impedance(res, model.montage_inputs())
+                    if missing:
+                        _hint(f"{missing} of the montage's electrodes weren't "
+                              "measured — see the panel", seconds=8,
+                              fg=C["yellow"])
         res = _imp["result"]
         if res is None or imp_lbl is None:
             return
         avg, not_measured = average_impedance(res, model.montage_inputs())
         stale = time.time() - _imp["at"] > IMP_STALE_S
-        imp_off_lbl.configure(
-            text=f"{not_measured} OFF" if not_measured and not res.get("problem")
-            else "", fg=C["text_dim"] if stale else C["red"])
         if avg is None:
             imp_lbl.configure(text="AVG —",
                               fg=C["red"] if res.get("problem") else C["text_dim"])
         else:
-            imp_lbl.configure(text=f"AVG {format_ohms(avg)}",
-                              fg=C["text_dim"] if stale
+            text = (f"AVG {_compact_ohms(avg)}·{not_measured}" if not_measured
+                    else f"AVG {format_ohms(avg)}")
+            imp_lbl.configure(text=text, fg=C["text_dim"] if stale
                               else _BAND_FG[impedance_band(avg)])
 
     def _draw_impedance(W, H):
