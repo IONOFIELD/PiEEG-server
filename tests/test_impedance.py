@@ -141,6 +141,37 @@ class TestCalibration:
         assert cal.lead_offset == pytest.approx(0.0, abs=1e-6)
         assert cal.lead_ohms(zeros[3] + 10000 / gain, 3) == pytest.approx(10000)
 
+    def test_per_lead_scale_applies_only_with_an_index(self):
+        cal = imp.Calibration(lead_gain=100.0, lead_zero_uv=[30.0, 30.0],
+                              lead_scale=[1.0, 1.1])
+        assert cal.lead_ohms(40.0, 0) == pytest.approx(1000)
+        assert cal.lead_ohms(40.0, 1) == pytest.approx(1100)
+        assert cal.lead_ohms(40.0) == pytest.approx(4000)
+
+    def test_fit_gives_each_lead_its_own_gain(self):
+        zeros = [30.0 + i for i in range(8)]
+        gains = [150.0, 170.0, 160.0, 165.0, 155.0, 168.0, 158.0, 152.0]
+        pts = self._bench(0, zeros)
+        for ohms in (1000, 10000, 50000):
+            pts += self._bench(ohms, [z + ohms / g for z, g in zip(zeros, gains)])
+        cal, report = imp.fit_calibration(pts)
+        assert cal.source == "bench"
+        assert cal.lead_offset == pytest.approx(0.0, abs=1e-6)
+        for i, g in enumerate(gains):
+            assert cal.lead_ohms(zeros[i] + 25000 / g, i) == pytest.approx(25000)
+        assert any("lead scale" in line for line in report)
+        assert any("worst error 0.0%" in line for line in report)
+
+    def test_leads_without_resistors_keep_scale_1(self):
+        zeros = [30.0] * 8
+        pts = self._bench(0, zeros)
+        pts += [{"pass": "lead", "name": "E1", "ohms": 10000, "carrier_uv": 90.0},
+                {"pass": "lead", "name": "E2", "ohms": 10000, "carrier_uv": 80.0}]
+        cal, report = imp.fit_calibration(pts)
+        assert cal.lead_scale[2:] == [1.0] * 6
+        assert cal.lead_scale[0] < 1.0 < cal.lead_scale[1]
+        assert any("no resistor readings for E3" in line for line in report)
+
     def test_fit_recovers_gain_and_offset(self):
         pts = [((z + 2200) / 125.0, z) for z in (1000, 4700, 10000, 47000, 100000)]
         gain, offset, r2, err = imp.fit_line(pts)
