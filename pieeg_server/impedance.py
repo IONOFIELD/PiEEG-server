@@ -40,8 +40,10 @@ CALIBRATION (measured only)
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -89,7 +91,7 @@ NOISY_SNR = 3.0           # carrier below 3x the neighbouring-bin noise
 # lead shows "above" that resistor.
 RANGE_MARGIN = 0.02
 
-CAL_VERSION = 2           # per-lead calibration; older files aren't used
+CAL_VERSION = 3           # per-lead calibration with phase; older files aren't used
 CAL_PATH = Path.home() / ".config" / "pieeg" / "impedance_cal.json"
 BENCH_PATH = Path.home() / ".config" / "pieeg" / "impedance_bench.json"
 
@@ -114,10 +116,30 @@ def block_length(fs, seconds=2.0, f0=EXCITATION_HZ):
     return int(round(cycles * per_cycle))
 
 
-def _bin_amplitude(x, w, fs, freq):
+def _bin_phasor(x, w, fs, freq, k0=0):
     n = np.arange(x.shape[0])
-    ph = np.exp(-2j * np.pi * freq * n / fs)
-    return 2.0 * np.abs((w[:, None] * x * ph[:, None]).sum(axis=0)) / w.sum()
+    ph = np.exp(-2j * np.pi * freq * (k0 + n) / fs)
+    return 2.0 * (w[:, None] * x * ph[:, None]).sum(axis=0) / w.sum()
+
+
+def _bin_amplitude(x, w, fs, freq):
+    return np.abs(_bin_phasor(x, w, fs, freq))
+
+
+def carrier_phasors(block, fs, k0=0, f0=EXCITATION_HZ):
+    """(phasor, noise) per channel in µV peak.
+
+    Same measurement as carrier_amplitudes, but the carrier keeps its phase,
+    referenced to sample index k0 — the block's first sample counted from the
+    START that began this run. The excitation restarts with START (measured:
+    the same phase to 0.1° over 8 restarts, 2026-09-17), so phases are
+    comparable between runs, which is what lets the board's own input path be
+    subtracted as a vector instead of as a size. That matters for electrodes,
+    which are part capacitor: |Rs + Z| is not Rs + |Z| unless Z is resistive.
+    """
+    x, w, n = _detrended(block)
+    carrier = _bin_phasor(x, w, fs, f0, k0)
+    return carrier, _side_noise(x, w, fs, n, f0)
 
 
 def carrier_amplitudes(block, fs, f0=EXCITATION_HZ):
@@ -130,6 +152,12 @@ def carrier_amplitudes(block, fs, f0=EXCITATION_HZ):
     noise: RMS of the same measure at bins 3-5 either side of f0 (outside the
     window's main lobe), i.e. the local background the carrier sits on.
     """
+    x, w, n = _detrended(block)
+    return _bin_amplitude(x, w, fs, f0), _side_noise(x, w, fs, n, f0)
+
+
+def _detrended(block):
+    """(signal without its linear trend, periodic Hann window, length)."""
     x = np.asarray(block, dtype=np.float64)
     if x.ndim == 1:
         x = x[:, None]
@@ -137,13 +165,14 @@ def carrier_amplitudes(block, fs, f0=EXCITATION_HZ):
     t = np.arange(n)
     design = np.column_stack([np.ones(n), t])
     coef, *_ = np.linalg.lstsq(design, x, rcond=None)
-    x = x - design @ coef
     w = 0.5 - 0.5 * np.cos(2 * np.pi * t / n)       # periodic Hann
-    carrier = _bin_amplitude(x, w, fs, f0)
+    return x - design @ coef, w, n
+
+
+def _side_noise(x, w, fs, n, f0):
     df = fs / n
     side = [_bin_amplitude(x, w, fs, f0 + k * df) for k in (-5, -4, -3, 3, 4, 5)]
-    noise = np.sqrt(np.mean(np.square(side), axis=0))
-    return carrier, noise
+    return np.sqrt(np.mean(np.square(side), axis=0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -153,10 +182,10 @@ def carrier_amplitudes(block, fs, f0=EXCITATION_HZ):
 class LeadCalibration:
     """One lead's calibration, from bench readings taken on that lead.
 
-    ohms = ohms_per_uv * (carrier_uv - zero_uv)
-    zero_uv: mean carrier with the lead shorted to the REF/BIO strip. The
-    PiEEG-8 reads ~32-36 µV through a dead short (the board's own ~5.4 kΩ
-    input path).
+    zero_re/zero_im: the carrier with the lead shorted to the REF/BIO strip,
+    as a vector (µV). The PiEEG-8 reads ~32-36 µV through a dead short (the
+    board's own ~5.4 kΩ input path). zero_im is None for a zero recorded
+    before phases were measured; then only sizes can be subtracted.
     ohms_per_uv: least-squares slope through the zero over this lead's
     resistor readings (the leads' test currents differ by up to ~10%).
     max_ohms: the largest resistor read on this lead; readings more than
@@ -164,15 +193,34 @@ class LeadCalibration:
     worst_error_ohms: the largest miss on those resistor readings.
     """
 
-    zero_uv: float
+    zero_re: float
     ohms_per_uv: float
     max_ohms: float
+    zero_im: float | None = None
     zero_readings: int = 0
     resistor_readings: int = 0
     worst_error_ohms: float = 0.0
 
-    def ohms(self, carrier_uv):
-        return self.ohms_per_uv * (float(carrier_uv) - self.zero_uv)
+    @property
+    def zero(self):
+        return complex(self.zero_re, self.zero_im or 0.0)
+
+    @property
+    def zero_uv(self):
+        return math.hypot(self.zero_re, self.zero_im or 0.0)
+
+    @property
+    def has_phase(self):
+        return self.zero_im is not None
+
+    def ohms(self, carrier):
+        """`carrier` as a complex phasor subtracts the board's input path as a
+        vector, which is right for an electrode that is part capacitor. A
+        plain size (or a zero without phase) subtracts sizes, which reads low
+        on such an electrode."""
+        if self.has_phase and isinstance(carrier, complex):
+            return self.ohms_per_uv * abs(carrier - self.zero)
+        return self.ohms_per_uv * (abs(carrier) - self.zero_uv)
 
     @property
     def limit_ohms(self):
@@ -274,6 +322,7 @@ class Reading:
     railed: bool
     status: str = OK
     limit_ohms: float | None = None
+    phase_deg: float | None = None    # None when the run's START index is unknown
 
     @property
     def band(self):
@@ -327,6 +376,8 @@ class ImpedanceResult:
             return {"name": r.name, "ohms": r.ohms, "status": r.status,
                     "limit_ohms": r.limit_ohms, "text": r.text, "band": r.band,
                     "carrier_uv": round(r.carrier_uv, 3),
+                    "phase_deg": (None if r.phase_deg is None
+                                  else round(r.phase_deg, 2)),
                     "noise_uv": round(r.noise_uv, 3), "railed": r.railed,
                     "noisy": r.noisy}
         return {"leads": [one(r) for r in self.leads], "ref": self.ref,
@@ -335,7 +386,7 @@ class ImpedanceResult:
 
 
 def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
-            ref_block=None):
+            ref_block=None, k0=None):
     """Turn the lead pass (N x channels, µV) into a result.
 
     contact: classify_contact() of the DC wiring just before the check. The
@@ -346,10 +397,16 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
     (or for a lead) that lead has no value.
     ref_block: optional REF pass; its carrier is reported for bench work only
     (on the PiEEG-8 it doesn't follow REF once the leads are connected).
+    k0: index of the block's first sample counted from the START that began
+    this run. With it the carrier keeps its phase and the board's input path
+    is subtracted as a vector; without it (hardware that can't be read from
+    START) only sizes are subtracted, which reads low on an electrode that is
+    part capacitor.
     """
     lead_block = np.asarray(lead_block, dtype=float)
     rail = RAIL_FRACTION * full_scale_uv
-    amp, noise = carrier_amplitudes(lead_block, fs)
+    phasor, noise = carrier_phasors(lead_block, fs, k0 or 0)
+    amp = np.abs(phasor)
     at_rail = np.max(np.abs(lead_block), axis=0) >= rail
     lead_verdicts = (contact or {}).get("leads") or []
     ref = (contact or {}).get("ref")
@@ -392,7 +449,7 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
         elif lc is None:
             status = UNCALIBRATED
         else:
-            value = lc.ohms(amp[i])
+            value = lc.ohms(complex(phasor[i]) if k0 is not None else amp[i])
             if value > lc.limit_ohms:
                 status, limit = ABOVE, lc.max_ohms
             else:
@@ -401,7 +458,9 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
         leads.append(Reading(
             name=f"E{i + 1}", ohms=ohms, carrier_uv=float(amp[i]),
             noise_uv=float(noise[i]), railed=bool(at_rail[i]),
-            status=status, limit_ohms=limit))
+            status=status, limit_ohms=limit,
+            phase_deg=(float(np.degrees(np.angle(phasor[i])))
+                       if k0 is not None else None)))
     ref_carrier = None
     if ref_block is not None:
         ref_block = np.asarray(ref_block, dtype=float)
@@ -417,6 +476,80 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
 # ─────────────────────────────────────────────────────────────────────────────
 #  orchestration
 # ─────────────────────────────────────────────────────────────────────────────
+MEASURE_LATE_NS = 3_000_000     # a read started this long after its edge
+                                # may have missed the sample
+
+
+def can_measure_from_start(hw):
+    """True if this hardware lets the check own the chip for a pass: write
+    registers without starting, send START itself, and read each DRDY edge.
+    Without it the pass runs through the acquisition loop and the sample
+    index from START — and so the carrier's phase — isn't known."""
+    return all(callable(getattr(hw, name, None)) for name in (
+        "start_conversions", "read_raw_frame", "drain_drdy_events",
+        "enable_drdy_events", "disable_drdy_events", "wait_drdy_event",
+        "decode_frame", "stop_streaming"))
+
+
+@contextlib.contextmanager
+def _thread_realtime():
+    """Run this thread on SCHED_FIFO while reading the chip, if the user's
+    rtprio limit allows it; restore the normal policy afterwards."""
+    from .acquisition import RT_PRIORITY
+
+    changed = False
+    if RT_PRIORITY > 0 and hasattr(os, "sched_setscheduler"):
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(RT_PRIORITY))
+            changed = True
+        except OSError:
+            pass
+    try:
+        yield changed
+    finally:
+        if changed:
+            try:
+                os.sched_setscheduler(0, os.SCHED_OTHER, os.sched_param(0))
+            except OSError:
+                pass
+
+
+def read_from_start(hw, reg_map, count, late_ns=MEASURE_LATE_NS):
+    """Write `reg_map`, send START, and read `count` frames counted from the
+    first DRDY edge after START, so each sample's index — and with it the
+    excitation's phase — is known.
+
+    Returns the frames (a list of channel lists), or None if any frame was
+    late, torn or missed: the phase reference needs an unbroken count, so a
+    broken run is thrown away rather than patched up. The caller must have
+    stopped the acquisition loop first; this owns the chip and the DRDY line
+    and leaves conversions stopped.
+    """
+    hw.configure_registers(dict(reg_map), start=False)
+    hw.enable_drdy_events()
+    rows = []
+    try:
+        with _thread_realtime():
+            hw.drain_drdy_events()
+            hw.start_conversions()
+            for _ in range(count):
+                edge_ns = hw.wait_drdy_event(timeout=1.0)
+                if edge_ns is None:
+                    return None
+                raw = hw.read_raw_frame()
+                late = time.monotonic_ns() - edge_ns > late_ns
+                sample = hw.decode_frame(raw)
+                if sample is None or late:
+                    return None
+                rows.append(sample)
+    finally:
+        try:
+            hw.stop_streaming()
+        finally:
+            hw.disable_drdy_events()
+    return rows
+
+
 class ImpedanceCheckError(RuntimeError):
     """The check couldn't run or complete; registers are already restored."""
 
@@ -434,13 +567,15 @@ def unsupported_reason(acq):
 
 
 class ImpedanceCheck:
-    """Runs the check on a live AcquisitionLoop: classify the DC wiring, then
-    the AC lead pass (and optionally the REF pass).
+    """Runs the check on a live AcquisitionLoop: classify the DC wiring from
+    its frames, then the AC lead pass (and optionally the REF pass).
 
-    Async: run it on the acquisition's event loop. Register writes go through
-    acq.restart_with_config() in an executor; samples come from its own
-    subscriber queue. The DC lead-off configuration and the Hampel filter
-    state are restored in a finally, whatever happens.
+    Async: run it on the acquisition's event loop; the chip work happens in an
+    executor. On a PiEEG shield the loop is stopped for the passes and this
+    drives the chip itself, so samples are counted from START and the
+    carrier's phase is known (see read_from_start). Hardware without those
+    helpers falls back to passes through the running loop. Either way DC
+    lead-off is restored and the loop is running again in a finally.
     """
 
     def __init__(self, acq, calibration=None, seconds=2.0, settle_seconds=0.5,
@@ -526,6 +661,21 @@ class ImpedanceCheck:
             return None
         return contact_from_signal(status, rows, full_scale, fs)
 
+    async def _own_pass(self, reg_map, n, fs):
+        """One pass with the chip to ourselves: (block, k0). k0 is the block's
+        first sample counted from START, which fixes the carrier's phase."""
+        loop = asyncio.get_running_loop()
+        skip = int(round(self._settle * fs))
+        # A late read still happens now and then, and the phase reference
+        # needs an unbroken count, so allow several tries.
+        for _ in range(6):
+            rows = await loop.run_in_executor(
+                None, read_from_start, self._acq._hw, reg_map, skip + n)
+            if rows is not None:
+                return np.asarray(rows[skip:], dtype=float), skip
+        raise ImpedanceCheckError("samples were dropped during the impedance "
+                                  "check; try again")
+
     async def run(self):
         reason = unsupported_reason(self._acq)
         if reason:
@@ -541,20 +691,56 @@ class ImpedanceCheck:
         n = block_length(fs, self._seconds)
         full_scale = VREF_UV / (self._acq.pga_gain or 24)
         q = self._acq.subscribe(maxsize=4 * n)
+        try:
+            contact = await self._dc_contact(q, fs, full_scale)
+        finally:
+            self._acq.unsubscribe(q)
+        mask = excitation_mask(contact, self._acq.num_channels)
+        if not mask:
+            # Nothing connected (or GND out): no lead to excite.
+            return analyze(np.zeros((n, self._acq.num_channels)), fs,
+                           full_scale, self._cal, contact)
+        logger.info("impedance check: lead pass (%d samples @ %s Hz, "
+                    "SENSP 0x%02X)", n, fs, mask)
+        if can_measure_from_start(hw):
+            return await self._run_owning_the_chip(mask, n, fs, full_scale,
+                                                   contact)
+        return await self._run_on_the_loop(mask, n, fs, full_scale, contact)
+
+    async def _run_owning_the_chip(self, mask, n, fs, full_scale, contact):
+        """Stop the acquisition loop, measure the passes ourselves (so the
+        samples are counted from START), then restore DC lead-off and restart
+        the loop."""
+        loop = asyncio.get_running_loop()
+        ref = ref_k0 = None
+        await loop.run_in_executor(None, self._acq.stop)
+        try:
+            lead, k0 = await self._own_pass(lead_pass(mask), n, fs)
+            if self._ref_pass:
+                logger.info("impedance check: REF pass")
+                ref, ref_k0 = await self._own_pass(REF_PASS, n, fs)
+        finally:
+            await loop.run_in_executor(None, self._restore_and_restart)
+        return analyze(lead, fs, full_scale, self._cal, contact,
+                       ref_block=ref, k0=k0)
+
+    def _restore_and_restart(self):
+        self._acq._hw.configure_registers(dict(DC_RESTORE))
+        logger.info("impedance check: DC lead-off restored")
+        self._acq.start()
+
+    async def _run_on_the_loop(self, mask, n, fs, full_scale, contact):
+        """Fallback for hardware that can't be read from START (the mock, and
+        anything without the DRDY/register helpers): the passes run through
+        the acquisition loop, so the carrier's phase is unknown and only
+        sizes can be subtracted."""
+        q = self._acq.subscribe(maxsize=4 * n)
         hampel = self._acq.hampel
         hampel_was = hampel.enabled
         ref = None
         self._switched = False
         try:
-            contact = await self._dc_contact(q, fs, full_scale)
-            mask = excitation_mask(contact, self._acq.num_channels)
-            if not mask:
-                # Nothing connected (or GND out): no lead to excite.
-                return analyze(np.zeros((n, self._acq.num_channels)), fs,
-                               full_scale, self._cal, contact)
-            hampel.enabled = False          # it would clip the carrier
-            logger.info("impedance check: lead pass (%d samples @ %s Hz, "
-                        "SENSP 0x%02X)", n, fs, mask)
+            hampel.enabled = False              # it would clip the carrier
             lead = await self._pass(q, lead_pass(mask), n, fs)
             if self._ref_pass:
                 logger.info("impedance check: REF pass")
@@ -762,11 +948,16 @@ def _record_bench(args, results):
         for ch in _parse_channels(args.channels):
             lead = r.leads[ch - 1]
             if lead.status in _RECORDABLE:
-                points.append({"pass": "lead", "name": lead.name,
-                               "ohms": args.ohms,
-                               "carrier_uv": lead.carrier_uv,
-                               "noise_uv": lead.noise_uv, "fs": r.fs,
-                               "recorded_at": stamp})
+                point = {"pass": "lead", "name": lead.name, "ohms": args.ohms,
+                         "carrier_uv": lead.carrier_uv,
+                         "noise_uv": lead.noise_uv, "fs": r.fs,
+                         "recorded_at": stamp}
+                if lead.phase_deg is not None:
+                    rad = math.radians(lead.phase_deg)
+                    point["carrier_re"] = lead.carrier_uv * math.cos(rad)
+                    point["carrier_im"] = lead.carrier_uv * math.sin(rad)
+                    point["phase_deg"] = lead.phase_deg
+                points.append(point)
                 added += 1
             else:
                 print(f"{lead.name} not recorded: {lead.status}"
@@ -777,16 +968,28 @@ def _record_bench(args, results):
           f"-> {BENCH_PATH} ({len(points)} total)")
 
 
+def _point_phasor(q):
+    """The reading as a vector, or None if it was recorded before phases
+    were measured (size only)."""
+    re, im = q.get("carrier_re"), q.get("carrier_im")
+    return None if re is None or im is None else complex(re, im)
+
+
 def fit_calibration(points, fs=None):
     """Fit each lead from its own bench readings; returns (calibration,
     report lines).
 
-    points: [{"pass": "lead", "name": "E1", "ohms", "carrier_uv", "fs"}, ...]
-    (other passes are ignored). Only readings at one sample rate are used:
-    `fs`, or the only rate present. A lead is calibrated only when it has at
-    least one 0 Ω reading (its zero) and one resistor reading; its slope is
-    the least-squares line through its zero, and its range ends at its
-    largest resistor. Nothing is borrowed from other leads or from theory.
+    points: [{"pass": "lead", "name": "E1", "ohms", "carrier_uv",
+    "carrier_re", "carrier_im", "fs"}, ...] (other passes are ignored). Only
+    readings at one sample rate are used: `fs`, or the only rate present. A
+    lead is calibrated only when it has at least one 0 Ω reading (its zero)
+    and one resistor reading; its slope is the least-squares line through its
+    zero, and its range ends at its largest resistor. Nothing is borrowed
+    from other leads or from theory.
+
+    Readings that carry a phase give the lead a zero vector, so measurements
+    subtract it as a vector. A resistor reading without a phase is compared
+    by size, which is the same thing for a resistor.
     """
     leads = [q for q in points if q.get("pass") == "lead"]
     rates = sorted({float(q["fs"]) for q in leads if "fs" in q})
@@ -802,35 +1005,53 @@ def fit_calibration(points, fs=None):
     for i in range(8):
         name = f"E{i + 1}"
         mine = [q for q in use if q["name"] == name]
-        shorts = np.array([q["carrier_uv"] for q in mine if q["ohms"] == 0],
-                          dtype=float)
-        res = [(q["carrier_uv"], float(q["ohms"])) for q in mine if q["ohms"] > 0]
-        if not len(shorts) or not res:
-            missing = "no 0 Ω reading" if not len(shorts) else "no resistor reading"
+        shorts = [q for q in mine if q["ohms"] == 0]
+        res = [q for q in mine if q["ohms"] > 0]
+        if not shorts or not res:
+            missing = "no 0 Ω reading" if not shorts else "no resistor reading"
             report.append(f"{name}: not calibrated ({missing})")
             continue
-        zero = float(shorts.mean())
-        u = np.array([uv for uv, _ in res]) - zero
-        o = np.array([ohms for _, ohms in res])
-        if float(u @ o) <= 0:
+        vectors = [_point_phasor(q) for q in shorts]
+        if all(v is not None for v in vectors):
+            zero = sum(vectors) / len(vectors)
+            spread_uv = float(np.std([abs(v - zero) for v in vectors]))
+        else:
+            mags = [q["carrier_uv"] for q in shorts]
+            zero = complex(float(np.mean(mags)), 0.0)
+            spread_uv = float(np.std(mags))
+            vectors = None                       # size-only zero
+
+        def distance(q):
+            """This reading's carrier measured from the zero."""
+            v = _point_phasor(q)
+            if vectors is not None and v is not None:
+                return abs(v - zero)
+            return q["carrier_uv"] - abs(zero)
+
+        x = np.array([distance(q) for q in res], dtype=float)
+        o = np.array([float(q["ohms"]) for q in res], dtype=float)
+        if float(x @ o) <= 0:
             report.append(f"{name}: not calibrated (resistor readings aren't "
                           "above the short)")
             continue
-        slope = float(u @ o) / float(u @ u)
-        miss = np.abs(slope * u - o)
-        lc = LeadCalibration(zero_uv=zero, ohms_per_uv=slope,
-                             max_ohms=float(o.max()),
-                             zero_readings=int(len(shorts)),
-                             resistor_readings=len(res),
-                             worst_error_ohms=float(miss.max()))
-        cal.leads[i] = lc
-        spread = slope * float(shorts.std()) if len(shorts) > 1 else 0.0
+        slope = float(x @ o) / float(x @ x)
+        miss = np.abs(slope * x - o)
+        cal.leads[i] = LeadCalibration(
+            zero_re=float(zero.real), ohms_per_uv=slope, max_ohms=float(o.max()),
+            zero_im=float(zero.imag) if vectors is not None else None,
+            zero_readings=len(shorts), resistor_readings=len(res),
+            worst_error_ohms=float(miss.max()))
         values = ", ".join(format_ohms(v) for v in sorted(set(o.tolist())))
         worst = int(np.argmax(miss))
+        sizes_only = sum(1 for q in res if _point_phasor(q) is None)
         report.append(
-            f"{name}: zero {zero:.3f} µV (n={len(shorts)}, sd {spread:.0f} Ω)  "
-            f"{slope:.2f} Ω/µV  resistors {values} (n={len(res)})  "
-            f"worst miss {miss[worst]:.0f} Ω at {format_ohms(o[worst])} "
+            f"{name}: zero {abs(zero):.3f} µV "
+            + (f"at {np.degrees(np.angle(zero)):.1f}° " if vectors is not None
+               else "(size only) ")
+            + f"(n={len(shorts)}, sd {slope * spread_uv:.0f} Ω)  "
+            f"{slope:.2f} Ω/µV  resistors {values} (n={len(res)}"
+            + (f", {sizes_only} without phase" if sizes_only else "")
+            + f")  worst miss {miss[worst]:.0f} Ω at {format_ohms(o[worst])} "
             f"({miss[worst] / o[worst]:.2%})")
     if not cal.calibrated:
         report.append("no lead could be calibrated")

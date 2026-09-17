@@ -583,13 +583,17 @@ class PiEEGHardware:
 
     # --- register configuration ---
 
-    def configure_registers(self, reg_map: dict[int, int]):
+    def configure_registers(self, reg_map: dict[int, int], start: bool = True):
         """Write arbitrary registers with STOP → SDATAC → write → RDATAC → START.
 
         Applies to both chips in 16-ch mode, chip 1 only in 8-ch mode.
         Updates the shadow register state.
         Resets spike filter baseline so the first post-config frames aren't
         rejected due to the signal level changing (e.g. normal → shorted).
+        start=False leaves conversions stopped, for a caller that wants to
+        send START itself once it is ready to catch the first DRDY edge (the
+        impedance check counts samples from START to know the phase of the
+        test signal).
         """
         chips = [1, 2] if self._num_channels == 16 else [1]
         for chip in chips:
@@ -598,13 +602,30 @@ class PiEEGHardware:
             for addr, value in reg_map.items():
                 self._write_register(chip, int(addr), int(value) & 0xFF)
             self._send_command(chip, CMD_RDATAC)
-            self._send_command(chip, CMD_START)
+            if start:
+                self._send_command(chip, CMD_START)
         self._register_state.update(reg_map)
         # Reset spike filter — signal level changes after config, old baseline
         # would cause false rejections (e.g. normal→shorted: ±50µV → ±2µV)
         self._last_valid_value = None
         self._consecutive_rejects = 0
         logger.info("Registers configured: %s", {hex(k): hex(v) for k, v in reg_map.items()})
+
+    def drain_drdy_events(self):
+        """Throw away any DRDY edges already queued, so the next one read is
+        the next one that happens."""
+        while self._drdy_event_fd >= 0 and select.select(
+                [self._drdy_event_fd], [], [], 0)[0]:
+            os.read(self._drdy_event_fd, _EVENT_DATA_SIZE)
+
+    def start_conversions(self, chip_num: int = 1):
+        """START on its own, for a caller that configured with start=False."""
+        self._send_command(chip_num, CMD_START)
+
+    def read_raw_frame(self):
+        """The 27 raw bytes of one 8-channel frame (decode with
+        decode_frame). The caller waits for DRDY itself."""
+        return self._spi1.readbytes(BYTES_PER_READ)
 
     def set_input_short(self):
         """Set all CHnSET registers to 0x01 (input shorted for noise test)."""
