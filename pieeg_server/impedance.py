@@ -23,11 +23,15 @@ WHAT THIS MEASURES
     short explicit mode, never a background task. Registers are always restored
     to DC lead-off afterwards. See docs/IMPEDANCE_CHECK_PLAN.md.
 
-CALIBRATION
-    kΩ = gain * carrier_uV - offset. Until the bench fit exists, the gain is
-    the square-wave theory value pi / (4 * 6 nA) and the offset 0; the PiEEG-8
-    input network isn't published, so bench-fit it before trusting absolute
-    numbers:
+CALIBRATION (measured only)
+    Every lead is converted with its own bench readings and nothing else:
+    ohms = ohms_per_uv * (carrier_uV - zero_uV), where zero_uV is that lead
+    shorted to the REF/BIO strip and ohms_per_uv is fitted on resistors read
+    on that lead. There is no theory fallback: a lead without its own short
+    and resistor readings shows no value, and so does every lead when the
+    calibration is missing or was made at another sample rate. A reading more
+    than RANGE_MARGIN above the largest resistor that lead was read with shows
+    as "above" that resistor, never as an extrapolated number.
 
     python -m pieeg_server.impedance measure             # table (Scope closed)
     python -m pieeg_server.impedance bench --ohms 10000  # record one resistor
@@ -38,7 +42,6 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -79,10 +82,14 @@ DC_RESTORE = {LOFF: LOFF_DC_95_5, LOFF_SENSP: LOFF_SENSE_ALL,
 # ── display bands (wet gel) ──────────────────────────────────────────────────
 GREEN_MAX_OHMS = 10_000
 AMBER_MAX_OHMS = 50_000
-CAP_OHMS = 1_000_000      # railed / off leads count as this in averages
 RAIL_FRACTION = 0.98      # |sample| beyond this share of full scale = railed
 NOISY_SNR = 3.0           # carrier below 3x the neighbouring-bin noise
+# A reading may sit this far above the lead's largest checked resistor and
+# still show as a number (1% resistors plus reading noise); beyond it the
+# lead shows "above" that resistor.
+RANGE_MARGIN = 0.02
 
+CAL_VERSION = 2           # per-lead calibration; older files aren't used
 CAL_PATH = Path.home() / ".config" / "pieeg" / "impedance_cal.json"
 BENCH_PATH = Path.home() / ".config" / "pieeg" / "impedance_bench.json"
 
@@ -142,55 +149,74 @@ def carrier_amplitudes(block, fs, f0=EXCITATION_HZ):
 # ─────────────────────────────────────────────────────────────────────────────
 #  calibration
 # ─────────────────────────────────────────────────────────────────────────────
-THEORY_GAIN_OHM_PER_UV = math.pi / (4 * LEAD_OFF_CURRENT_A) * 1e-6
+@dataclass
+class LeadCalibration:
+    """One lead's calibration, from bench readings taken on that lead.
+
+    ohms = ohms_per_uv * (carrier_uv - zero_uv)
+    zero_uv: mean carrier with the lead shorted to the REF/BIO strip. The
+    PiEEG-8 reads ~32-36 µV through a dead short (the board's own ~5.4 kΩ
+    input path).
+    ohms_per_uv: least-squares slope through the zero over this lead's
+    resistor readings (the leads' test currents differ by up to ~10%).
+    max_ohms: the largest resistor read on this lead; readings more than
+    RANGE_MARGIN above it aren't converted.
+    worst_error_ohms: the largest miss on those resistor readings.
+    """
+
+    zero_uv: float
+    ohms_per_uv: float
+    max_ohms: float
+    zero_readings: int = 0
+    resistor_readings: int = 0
+    worst_error_ohms: float = 0.0
+
+    def ohms(self, carrier_uv):
+        return self.ohms_per_uv * (float(carrier_uv) - self.zero_uv)
+
+    @property
+    def limit_ohms(self):
+        return self.max_ohms * (1 + RANGE_MARGIN)
 
 
 @dataclass
 class Calibration:
-    """ohms = gain * (carrier_uV - zero_uV[lead]) - offset.
+    """Per-lead bench calibration made at sample rate `fs`. leads[i] is None
+    for a lead without its own short and resistor readings. An empty
+    Calibration (no file) converts nothing."""
 
-    Theory: a ±I square-wave current through Z has a fundamental of
-    (4/pi)·I·Z, so gain = pi / (4·I) and offset 0.
-    lead_zero_uv: each lead's carrier with its input shorted (0 Ω). The
-    PiEEG-8 reads ~32-36 µV per lead through a dead short (the board's own
-    input path), which would otherwise add ~4 kΩ to every reading.
-    lead_scale: each lead's gain relative to lead_gain. The leads' test
-    currents differ by up to ~10% on the PiEEG-8 (bench, 2026-09-16), so one
-    shared gain misses the 10% target; None means 1.0 for every lead.
-    source: "theory", "zeroed" (shorts recorded, gain still theory) or
-    "bench" (gain fitted from resistors).
-    """
-
-    lead_gain: float = THEORY_GAIN_OHM_PER_UV
-    lead_offset: float = 0.0
-    ref_gain: float = THEORY_GAIN_OHM_PER_UV
-    ref_offset: float = 0.0
-    source: str = "theory"
+    leads: list = field(default_factory=lambda: [None] * 8)
+    fs: float | None = None
     fitted_at: str | None = None
-    lead_zero_uv: list[float] | None = None
-    lead_scale: list[float] | None = None
 
-    def lead_ohms(self, carrier_uv, index=None):
-        uv = float(carrier_uv)
-        gain = self.lead_gain
-        if index is not None:
-            if self.lead_zero_uv and 0 <= index < len(self.lead_zero_uv):
-                uv = max(0.0, uv - self.lead_zero_uv[index])
-            if self.lead_scale and 0 <= index < len(self.lead_scale):
-                gain *= self.lead_scale[index]
-        return max(0.0, gain * uv - self.lead_offset)
+    @property
+    def calibrated(self):
+        return self.fs is not None and any(self.leads)
 
-    def ref_ohms(self, carrier_uv):
-        return max(0.0, self.ref_gain * float(carrier_uv) - self.ref_offset)
+    def lead(self, index):
+        return self.leads[index] if 0 <= index < len(self.leads) else None
 
 
 def load_calibration(path=CAL_PATH):
-    """Saved bench calibration, or the theory default if none/corrupt."""
+    """The saved bench calibration, or an empty one if there is none, it
+    can't be read, or it predates per-lead calibration."""
     try:
         raw = json.loads(Path(path).read_text())
-        return Calibration(**{k: raw[k] for k in Calibration.__dataclass_fields__
-                              if k in raw})
-    except (OSError, ValueError, TypeError):
+    except OSError:
+        return Calibration()
+    except ValueError:
+        logger.warning("impedance calibration %s is unreadable", path)
+        return Calibration()
+    try:
+        if raw.get("version") != CAL_VERSION:
+            logger.warning("impedance calibration %s is an old format; run "
+                           "`python -m pieeg_server.impedance fit`", path)
+            return Calibration()
+        return Calibration(
+            leads=[LeadCalibration(**lc) if lc else None for lc in raw["leads"]],
+            fs=float(raw["fs"]), fitted_at=raw.get("fitted_at"))
+    except (AttributeError, KeyError, TypeError, ValueError):
+        logger.warning("impedance calibration %s is unreadable", path)
         return Calibration()
 
 
@@ -198,29 +224,10 @@ def save_calibration(cal, path=CAL_PATH):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(asdict(cal), indent=2))
+    data = {"version": CAL_VERSION, "fs": cal.fs, "fitted_at": cal.fitted_at,
+            "leads": [asdict(lc) if lc else None for lc in cal.leads]}
+    tmp.write_text(json.dumps(data, indent=2))
     os.replace(tmp, path)
-
-
-def fit_line(points):
-    """Least-squares ohms = gain*uv - offset over [(uv, ohms), ...].
-
-    Returns (gain, offset, r2, worst_err). worst_err is the largest error
-    relative to max(ohms, 10 kΩ), so a value ≤ 0.1 meets the plan's "within
-    10% or 1 kΩ, whichever is larger" (and 0 Ω shorts don't blow it up).
-    Needs at least two distinct resistor values.
-    """
-    uv = np.array([p[0] for p in points], dtype=float)
-    ohms = np.array([p[1] for p in points], dtype=float)
-    if len(set(ohms.tolist())) < 2:
-        raise ValueError("need at least two different resistor values")
-    gain, intercept = np.polyfit(uv, ohms, 1)
-    pred = gain * uv + intercept
-    ss_res = float(np.sum((ohms - pred) ** 2))
-    ss_tot = float(np.sum((ohms - ohms.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot else 1.0
-    rel = np.abs(pred - ohms) / np.maximum(ohms, 10_000.0)
-    return float(gain), float(-intercept), r2, float(rel.max())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,34 +241,58 @@ def band(ohms):
 
 
 def format_ohms(ohms):
-    """Display text. Under 1 kΩ reads "<1 kΩ": the per-lead zeros drift by
-    ~0.1 µV (~20 Ω), so inputs shorted to REF/BIO read anywhere from 0 to
-    ~20 Ω and ohm digits would make identical shorts look different."""
     if ohms is None:
         return "off"
-    if ohms >= CAP_OHMS:
-        return ">1 MΩ"
     if ohms < 1000:
-        return "<1 kΩ"
+        return f"{ohms:.0f} Ω"
     if ohms < 100_000:
         return f"{ohms / 1000:.1f} kΩ"
-    return f"{ohms / 1000:.0f} kΩ"
+    if ohms < 1_000_000:
+        return f"{ohms / 1000:.0f} kΩ"
+    return f"{ohms / 1e6:.2f} MΩ"
+
+
+# Reading.status values
+OK = "ok"                      # measured, within the lead's calibrated range
+ABOVE = "above"                # above the largest resistor read on this lead
+OFF = "off"                    # DC lead-off says the electrode is off
+RAILED = "railed"              # channel at the rail during the measurement
+UNCALIBRATED = "uncalibrated"  # no calibration for this lead / sample rate
+WITHHELD = "withheld"          # GND/REF wiring makes every reading untrustworthy
 
 
 @dataclass
 class Reading:
-    """One electrode's result. ohms is None when the lead is off or its
-    reading can't be trusted (railed, or GND/REF missing)."""
+    """One electrode's result. ohms is a number only for status OK; for
+    ABOVE, limit_ohms is the largest resistor this lead was calibrated with.
+    carrier_uv and noise_uv are always the raw measurement."""
 
     name: str
     ohms: float | None
     carrier_uv: float
     noise_uv: float
     railed: bool
+    status: str = OK
+    limit_ohms: float | None = None
 
     @property
     def band(self):
-        return band(self.ohms)
+        if self.status == OK:
+            return band(self.ohms)
+        if self.status in (OFF, RAILED):
+            return "red"
+        if self.status == ABOVE and self.limit_ohms >= AMBER_MAX_OHMS:
+            return "red"
+        return None                 # not measured, or above a small resistor
+
+    @property
+    def text(self):
+        if self.status == OK:
+            return format_ohms(self.ohms)
+        if self.status == ABOVE:
+            return ">" + format_ohms(self.limit_ohms)
+        return {OFF: "off", RAILED: "off", UNCALIBRATED: "no cal"}.get(
+            self.status, "—")
 
     @property
     def noisy(self):
@@ -274,26 +305,27 @@ class ImpedanceResult:
     ref: str | None                  # REF contact: "green" / "red" / None
     gnd: str | None                  # GND (BIO) contact: same
     fs: float
-    calibration: str
+    calibration: str | None          # when the calibration was fitted
     problem: str | None = None       # why lead values are withheld, if they are
     ref_carrier_uv: float | None = None   # REF pass (bench only; unverified)
     timestamp: float = field(default_factory=time.time)
 
     def average_ohms(self, channels):
-        """Mean lead impedance over 1-based `channels` (e.g. the montage's
-        electrodes). Off or railed leads count as CAP_OHMS so a lifted lead
-        shows in the average. None if no channels are given, or if the
-        readings were withheld (GND/REF missing)."""
-        if self.problem:
-            return None
+        """(mean, not_measured) over 1-based `channels` (e.g. the montage's
+        electrodes). The mean covers measured leads only; not_measured counts
+        the others (off, railed, above range, uncalibrated). mean is None if
+        no lead was measured or the readings were withheld."""
         wanted = set(channels)
-        vals = [min(r.ohms, CAP_OHMS) if r.ohms is not None else CAP_OHMS
-                for i, r in enumerate(self.leads, start=1) if i in wanted]
-        return float(np.mean(vals)) if vals else None
+        mine = [r for i, r in enumerate(self.leads, start=1) if i in wanted]
+        vals = [r.ohms for r in mine if r.status == OK]
+        if self.problem or not vals:
+            return None, len(mine) - len(vals)
+        return float(np.mean(vals)), len(mine) - len(vals)
 
     def to_dict(self):
         def one(r):
-            return {"name": r.name, "ohms": r.ohms, "band": r.band,
+            return {"name": r.name, "ohms": r.ohms, "status": r.status,
+                    "limit_ohms": r.limit_ohms, "text": r.text, "band": r.band,
                     "carrier_uv": round(r.carrier_uv, 3),
                     "noise_uv": round(r.noise_uv, 3), "railed": r.railed,
                     "noisy": r.noisy}
@@ -310,6 +342,8 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
     AC readings are only trusted when it shows GND and REF connected: with
     GND out the bench still gave steady, plausible 9-12 kΩ values, and with
     REF out the connected leads rail. Leads the DC flags call off read off.
+    Values come only from `calibration`; without one for this sample rate
+    (or for a lead) that lead has no value.
     ref_block: optional REF pass; its carrier is reported for bench work only
     (on the PiEEG-8 it doesn't follow REF once the leads are connected).
     """
@@ -321,6 +355,7 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
     ref = (contact or {}).get("ref")
     gnd = (contact or {}).get("gnd")
     problem = None
+    wiring = True
     if gnd == "red":
         problem = "GND (BIO) isn't connected: fix ground before reading impedance"
     elif ref == "red":
@@ -335,15 +370,38 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
         ref = "red"
         problem = ("REF came loose during the check: fix the reference and "
                    "check again")
+    else:
+        wiring = False
+    cal_ok = calibration.calibrated and calibration.fs == float(fs)
+    if problem is None and not calibration.calibrated:
+        problem = ("impedance isn't calibrated: record the bench calibration "
+                   "(docs/IMPEDANCE_CHECK_PLAN.md)")
+    elif problem is None and not cal_ok:
+        problem = (f"the impedance calibration is for {calibration.fs:g} SPS, "
+                   f"not {float(fs):g} SPS")
     leads = []
     for i in range(lead_block.shape[1]):
-        dc_off = i < len(lead_verdicts) and lead_verdicts[i] == "red"
-        trusted = not (problem or dc_off or at_rail[i])
+        lc = calibration.lead(i) if cal_ok else None
+        ohms, limit = None, None
+        if i < len(lead_verdicts) and lead_verdicts[i] == "red":
+            status = OFF
+        elif at_rail[i]:
+            status = RAILED
+        elif wiring:
+            status = WITHHELD
+        elif lc is None:
+            status = UNCALIBRATED
+        else:
+            value = lc.ohms(amp[i])
+            if value > lc.limit_ohms:
+                status, limit = ABOVE, lc.max_ohms
+            else:
+                # below the short is within the zero's scatter: 0 Ω
+                status, ohms = OK, max(0.0, value)
         leads.append(Reading(
-            name=f"E{i + 1}",
-            ohms=calibration.lead_ohms(amp[i], i) if trusted else None,
-            carrier_uv=float(amp[i]), noise_uv=float(noise[i]),
-            railed=bool(at_rail[i])))
+            name=f"E{i + 1}", ohms=ohms, carrier_uv=float(amp[i]),
+            noise_uv=float(noise[i]), railed=bool(at_rail[i]),
+            status=status, limit_ohms=limit))
     ref_carrier = None
     if ref_block is not None:
         ref_block = np.asarray(ref_block, dtype=float)
@@ -352,8 +410,8 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
         if usable.any():
             ref_carrier = float(np.median(ref_amp[usable]))
     return ImpedanceResult(leads=leads, ref=ref, gnd=gnd, fs=float(fs),
-                           calibration=calibration.source, problem=problem,
-                           ref_carrier_uv=ref_carrier)
+                           calibration=calibration.fitted_at if cal_ok else None,
+                           problem=problem, ref_carrier_uv=ref_carrier)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -547,17 +605,13 @@ def _other_pieeg_running():
 
 def _print_result(result, restore=None):
     print(f"\nImpedance check · {result.fs:.0f} SPS · calibration: "
-          f"{result.calibration}"
-          + {"theory": "  (theory only, not bench-fitted)",
-             "zeroed": "  (board offset removed; gain still theory)"}.get(
-                 result.calibration, ""))
-    print(f"  {'':4} {'carrier µV':>11} {'noise µV':>9}  {'impedance':>10}  band")
+          f"{result.calibration or 'none'}")
+    print(f"  {'':4} {'carrier µV':>11} {'noise µV':>9}  {'impedance':>10}  "
+          f"{'status':<12} band")
     for r in result.leads:
-        flag = "  noisy" if r.noisy and r.ohms is not None else ""
-        shown = "—" if result.problem else format_ohms(r.ohms)
-        verdict = "—" if result.problem else r.band
-        print(f"  {r.name:4} {r.carrier_uv:11.2f} {r.noise_uv:9.2f}  "
-              f"{shown:>10}  {verdict}{flag}")
+        flag = "  noisy" if r.noisy and r.status == OK else ""
+        print(f"  {r.name:4} {r.carrier_uv:11.3f} {r.noise_uv:9.3f}  "
+              f"{r.text:>10}  {r.status:<12} {r.band or '—'}{flag}")
     print(f"  REF  contact {result.ref or 'unknown'}"
           + (f"   (REF pass carrier {result.ref_carrier_uv:.2f} µV, unverified)"
              if result.ref_carrier_uv is not None else ""))
@@ -633,8 +687,14 @@ def main(argv=None):
             s.add_argument("--channels", default="1-8",
                            help="lead inputs carrying the resistor, e.g. 1-8 "
                                 "or 1,3")
+            s.add_argument("--fresh", action="store_true",
+                           help="start a new bench session: move the existing "
+                                "readings to a dated archive file first")
     fit = sub.add_parser("fit", help="fit and save the calibration from the "
                                      "recorded bench readings")
+    fit.add_argument("--fs", type=float, default=None,
+                     help="sample rate to fit (needed only if the readings "
+                          "cover more than one)")
     fit.add_argument("--dry-run", action="store_true",
                      help="print the fit without saving it")
     args = p.parse_args(argv)
@@ -663,117 +723,117 @@ def _parse_channels(text):
     return sorted(chans)
 
 
+def _archive_bench(path=BENCH_PATH):
+    """Move the bench readings aside (impedance_bench.<date-time>.json) so a
+    new session starts empty. Returns the archive path, or None."""
+    path = Path(path)
+    if not path.exists():
+        return None
+    dest = path.with_name(f"{path.stem}.{time.strftime('%Y%m%d-%H%M%S')}"
+                          f"{path.suffix}")
+    os.replace(path, dest)
+    return dest
+
+
+# Statuses whose carrier is a real reading of the wiring (the calibration
+# isn't involved in recording it).
+_RECORDABLE = (OK, ABOVE, UNCALIBRATED)
+
+
 def _record_bench(args, results):
+    if getattr(args, "fresh", False):
+        archived = _archive_bench()
+        if archived:
+            print(f"previous bench readings moved to {archived}")
     try:
         points = json.loads(BENCH_PATH.read_text())
     except (OSError, ValueError):
         points = []
     added = 0
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     for r in results:
-        if r.problem:
-            print(f"not recorded: {r.problem}")
-            continue
         if args.ref:
-            if r.ref_carrier_uv is not None:
+            if r.ref_carrier_uv is not None and not r.problem:
                 points.append({"pass": "ref", "name": "REF", "ohms": args.ohms,
-                               "carrier_uv": r.ref_carrier_uv})
+                               "carrier_uv": r.ref_carrier_uv, "fs": r.fs,
+                               "recorded_at": stamp})
                 added += 1
             continue
         for ch in _parse_channels(args.channels):
             lead = r.leads[ch - 1]
-            if lead.ohms is not None:
+            if lead.status in _RECORDABLE:
                 points.append({"pass": "lead", "name": lead.name,
                                "ohms": args.ohms,
-                               "carrier_uv": lead.carrier_uv})
+                               "carrier_uv": lead.carrier_uv,
+                               "noise_uv": lead.noise_uv, "fs": r.fs,
+                               "recorded_at": stamp})
                 added += 1
+            else:
+                print(f"{lead.name} not recorded: {lead.status}"
+                      + (f" ({r.problem})" if r.problem else ""))
     BENCH_PATH.parent.mkdir(parents=True, exist_ok=True)
     BENCH_PATH.write_text(json.dumps(points, indent=2))
     print(f"\nrecorded {added} reading(s) at {args.ohms:g} Ω "
           f"-> {BENCH_PATH} ({len(points)} total)")
 
 
-def fit_calibration(points, cal=None):
-    """Fit a Calibration from bench points; returns (calibration, report).
+def fit_calibration(points, fs=None):
+    """Fit each lead from its own bench readings; returns (calibration,
+    report lines).
 
-    points: [{"pass": "lead"|"ref", "name": "E1"|"REF", "ohms", "carrier_uv"}].
-    0 Ω lead points (inputs shorted) set each lead's zero. Each lead with
-    resistor points gets its own gain (a line through its zero), stored as a
-    scale relative to the mean; the shared gain and offset are then fitted
-    on the zero-corrected, scaled carrier. With shorts only, the gain stays
-    theory and the source becomes "zeroed".
+    points: [{"pass": "lead", "name": "E1", "ohms", "carrier_uv", "fs"}, ...]
+    (other passes are ignored). Only readings at one sample rate are used:
+    `fs`, or the only rate present. A lead is calibrated only when it has at
+    least one 0 Ω reading (its zero) and one resistor reading; its slope is
+    the least-squares line through its zero, and its range ends at its
+    largest resistor. Nothing is borrowed from other leads or from theory.
     """
-    cal = cal or Calibration()
-    report = []
-    leads = [q for q in points if q["pass"] == "lead"]
-    shorts = {}
-    for q in leads:
-        if q["ohms"] == 0:
-            shorts.setdefault(q["name"], []).append(q["carrier_uv"])
-    if shorts:
-        cal.lead_zero_uv = [float(np.mean(shorts.get(f"E{i}", [0.0])))
-                            for i in range(1, 9)]
-        report.append("lead zeros (µV, 0 Ω): " + "  ".join(
-            f"E{i} {z:.2f}" for i, z in enumerate(cal.lead_zero_uv, 1)))
-        missing = [f"E{i}" for i in range(1, 9) if f"E{i}" not in shorts]
-        if missing:
-            report.append(f"  no short recorded for {', '.join(missing)} "
-                          "(zero left at 0)")
-        cal.source = "zeroed"
-
-    def zeroed(q):
-        uv = q["carrier_uv"]
-        if q["pass"] == "lead" and cal.lead_zero_uv:
-            idx = int(q["name"][1:]) - 1
-            if 0 <= idx < len(cal.lead_zero_uv):
-                uv -= cal.lead_zero_uv[idx]
-        return uv
-
-    by_lead = {}
-    for q in leads:
-        if q["ohms"] > 0:
-            by_lead.setdefault(int(q["name"][1:]) - 1, []).append(
-                (zeroed(q), q["ohms"]))
-    slopes = {}
-    for idx, pts in by_lead.items():
-        uu = sum(u * u for u, _ in pts)
-        if 0 <= idx < 8 and uu > 0:
-            slope = sum(u * o for u, o in pts) / uu
-            if slope > 0:
-                slopes[idx] = slope
-    if len(slopes) > 1:
-        mean = float(np.mean(list(slopes.values())))
-        cal.lead_scale = [slopes.get(i, mean) / mean for i in range(8)]
-        report.append("lead scale (own gain / mean): " + "  ".join(
-            f"E{i + 1} {cal.lead_scale[i]:.3f}" for i in range(8)))
-        missing = [f"E{i + 1}" for i in range(8) if i not in slopes]
-        if missing:
-            report.append(f"  no resistor readings for {', '.join(missing)} "
-                          "(scale left at 1)")
-
-    def corrected(q):
-        uv = zeroed(q)
-        if q["pass"] == "lead" and cal.lead_scale:
-            uv *= cal.lead_scale[int(q["name"][1:]) - 1]
-        return uv
-
-    for kind in ("lead", "ref"):
-        pts = [(corrected(q), q["ohms"]) for q in points if q["pass"] == kind]
-        if not any(o > 0 for _, o in pts):
-            report.append(f"{kind}: no resistor readings; gain stays "
-                          f"{getattr(cal, kind + '_gain'):.2f} Ω/µV")
+    leads = [q for q in points if q.get("pass") == "lead"]
+    rates = sorted({float(q["fs"]) for q in leads if "fs" in q})
+    if fs is None:
+        if len(rates) != 1:
+            raise ValueError("bench readings cover sample rates "
+                             f"{rates or 'none recorded'}; pick one with --fs")
+        fs = rates[0]
+    fs = float(fs)
+    use = [q for q in leads if "fs" in q and float(q["fs"]) == fs]
+    cal = Calibration(fs=fs, fitted_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    report = [f"{len(use)} lead readings at {fs:g} SPS"]
+    for i in range(8):
+        name = f"E{i + 1}"
+        mine = [q for q in use if q["name"] == name]
+        shorts = np.array([q["carrier_uv"] for q in mine if q["ohms"] == 0],
+                          dtype=float)
+        res = [(q["carrier_uv"], float(q["ohms"])) for q in mine if q["ohms"] > 0]
+        if not len(shorts) or not res:
+            missing = "no 0 Ω reading" if not len(shorts) else "no resistor reading"
+            report.append(f"{name}: not calibrated ({missing})")
             continue
-        try:
-            gain, offset, r2, err = fit_line(pts)
-        except ValueError as e:
-            report.append(f"{kind}: {e}")
+        zero = float(shorts.mean())
+        u = np.array([uv for uv, _ in res]) - zero
+        o = np.array([ohms for _, ohms in res])
+        if float(u @ o) <= 0:
+            report.append(f"{name}: not calibrated (resistor readings aren't "
+                          "above the short)")
             continue
-        report.append(f"{kind}: {len(pts)} readings  gain {gain:.2f} Ω/µV "
-                      f"(theory {THEORY_GAIN_OHM_PER_UV:.2f})  offset "
-                      f"{offset:.0f} Ω  R² {r2:.4f}  worst error {err:.1%}")
-        setattr(cal, f"{kind}_gain", gain)
-        setattr(cal, f"{kind}_offset", offset)
-        cal.source = "bench"
-    cal.fitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        slope = float(u @ o) / float(u @ u)
+        miss = np.abs(slope * u - o)
+        lc = LeadCalibration(zero_uv=zero, ohms_per_uv=slope,
+                             max_ohms=float(o.max()),
+                             zero_readings=int(len(shorts)),
+                             resistor_readings=len(res),
+                             worst_error_ohms=float(miss.max()))
+        cal.leads[i] = lc
+        spread = slope * float(shorts.std()) if len(shorts) > 1 else 0.0
+        values = ", ".join(format_ohms(v) for v in sorted(set(o.tolist())))
+        worst = int(np.argmax(miss))
+        report.append(
+            f"{name}: zero {zero:.3f} µV (n={len(shorts)}, sd {spread:.0f} Ω)  "
+            f"{slope:.2f} Ω/µV  resistors {values} (n={len(res)})  "
+            f"worst miss {miss[worst]:.0f} Ω at {format_ohms(o[worst])} "
+            f"({miss[worst] / o[worst]:.2%})")
+    if not cal.calibrated:
+        report.append("no lead could be calibrated")
     return cal, report
 
 
@@ -784,13 +844,20 @@ def _fit_cli(args):
         print(f"no bench readings in {BENCH_PATH}; record some with "
               "`bench --ohms <value>` first", file=sys.stderr)
         return 1
-    cal, report = fit_calibration(points, Calibration())
+    try:
+        cal, report = fit_calibration(points, args.fs)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
     print("\n".join(report))
     if args.dry_run:
         print("dry run: calibration not saved")
+    elif not cal.calibrated:
+        print("calibration not saved")
+        return 1
     else:
         save_calibration(cal)
-        print(f"saved {CAL_PATH} (source: {cal.source})")
+        print(f"saved {CAL_PATH}")
     return 0
 
 

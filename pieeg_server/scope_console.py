@@ -186,6 +186,14 @@ SCOPE_CHANGELOG = [
             "plugged straight into REF/BIO read 0 to about 20 Ω, which is "
             "below what the check can tell apart, so they no longer look "
             "different from each other."),
+    ("3.1", "Impedance shows measured values only. Each electrode is converted "
+            "with its own bench readings (its short and its resistors), never "
+            "a formula or another electrode's numbers; with no calibration "
+            "the check shows no numbers. Above the largest resistor that "
+            "electrode was checked with it shows \">\" that value instead of "
+            "a guess. Values under 1 kΩ show in ohms again. AVG averages only "
+            "the measured electrodes and shows how many weren't measured "
+            "(\"2 OFF\")."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

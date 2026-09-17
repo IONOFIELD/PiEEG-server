@@ -20,6 +20,15 @@ from pieeg_server.hardware import LOFF, LOFF_SENSN, LOFF_SENSP
 
 FS = 250
 FULL_SCALE = 4.5e6 / 24
+# Square-wave slope pi / (4 I): only for building test calibrations whose
+# values are easy to check by hand. The module itself has no theory value.
+SLOPE = math.pi / (4 * imp.LEAD_OFF_CURRENT_A) * 1e-6
+
+
+def _cal(zero=0.0, slope=SLOPE, max_ohms=1e6, fs=FS):
+    return imp.Calibration(
+        leads=[imp.LeadCalibration(zero, slope, max_ohms) for _ in range(8)],
+        fs=float(fs), fitted_at="test")
 
 
 def _t(n, fs=FS):
@@ -97,111 +106,89 @@ class TestCarrier:
         assert carrier == pytest.approx([10.0, 50.0], rel=1e-6)
 
 
+def _bench(ohms, carriers, fs=FS):
+    return [{"pass": "lead", "name": f"E{i}", "ohms": ohms, "carrier_uv": c,
+             "fs": fs} for i, c in enumerate(carriers, 1) if c is not None]
+
+
 class TestCalibration:
-    def test_theory_converts_square_wave_fundamental_to_ohms(self):
-        cal = imp.Calibration()
-        fundamental_uv = (4 / math.pi) * imp.LEAD_OFF_CURRENT_A * 5000 * 1e6
-        assert cal.lead_ohms(fundamental_uv) == pytest.approx(5000, rel=1e-9)
+    def test_lead_converts_with_its_own_zero_and_slope(self):
+        lc = imp.LeadCalibration(zero_uv=33.0, ohms_per_uv=100.0, max_ohms=5e4)
+        assert lc.ohms(43.0) == pytest.approx(1000)
+        assert lc.limit_ohms == pytest.approx(5e4 * (1 + imp.RANGE_MARGIN))
 
-    def test_offset_is_subtracted_and_clamped(self):
-        cal = imp.Calibration(lead_gain=100.0, lead_offset=2200.0)
-        assert cal.lead_ohms(50) == pytest.approx(2800)
-        assert cal.lead_ohms(1) == 0.0
-
-    def test_per_lead_zero_is_subtracted(self):
-        cal = imp.Calibration(lead_gain=100.0, lead_zero_uv=[33.0, 35.0])
-        assert cal.lead_ohms(43.0, 0) == pytest.approx(1000)
-        assert cal.lead_ohms(43.0, 1) == pytest.approx(800)
-        assert cal.lead_ohms(30.0, 0) == 0.0          # below zero clamps
-        assert cal.lead_ohms(43.0) == pytest.approx(4300)   # no index: raw
-
-    @staticmethod
-    def _bench(ohms, carriers):
-        return [{"pass": "lead", "name": f"E{i}", "ohms": ohms, "carrier_uv": c}
-                for i, c in enumerate(carriers, 1)]
-
-    def test_fit_with_shorts_only_records_zeros(self):
-        zeros = [31.9, 33.4, 33.0, 32.7, 34.1, 32.4, 33.6, 35.6]
-        pts = self._bench(0, zeros) + self._bench(0, [z + 0.1 for z in zeros])
-        cal, report = imp.fit_calibration(pts)
-        assert cal.source == "zeroed"
-        assert cal.lead_zero_uv == pytest.approx([z + 0.05 for z in zeros])
-        assert cal.lead_gain == imp.THEORY_GAIN_OHM_PER_UV
-        assert any("no resistor readings" in line for line in report)
-
-    def test_fit_with_shorts_and_resistors_fits_gain_on_zeroed_carrier(self):
-        zeros = [30.0 + i for i in range(8)]
-        gain = 120.0
-        pts = self._bench(0, zeros)
-        for ohms in (4700, 10000, 47000):
-            pts += self._bench(ohms, [z + ohms / gain for z in zeros])
-        cal, _ = imp.fit_calibration(pts)
-        assert cal.source == "bench"
-        assert cal.lead_gain == pytest.approx(gain)
-        assert cal.lead_offset == pytest.approx(0.0, abs=1e-6)
-        assert cal.lead_ohms(zeros[3] + 10000 / gain, 3) == pytest.approx(10000)
-
-    def test_per_lead_scale_applies_only_with_an_index(self):
-        cal = imp.Calibration(lead_gain=100.0, lead_zero_uv=[30.0, 30.0],
-                              lead_scale=[1.0, 1.1])
-        assert cal.lead_ohms(40.0, 0) == pytest.approx(1000)
-        assert cal.lead_ohms(40.0, 1) == pytest.approx(1100)
-        assert cal.lead_ohms(40.0) == pytest.approx(4000)
-
-    def test_fit_gives_each_lead_its_own_gain(self):
+    def test_fit_gives_each_lead_its_own_slope_zero_and_range(self):
         zeros = [30.0 + i for i in range(8)]
         gains = [150.0, 170.0, 160.0, 165.0, 155.0, 168.0, 158.0, 152.0]
-        pts = self._bench(0, zeros)
+        pts = _bench(0, zeros) + _bench(0, [z + 0.02 for z in zeros])
         for ohms in (1000, 10000, 50000):
-            pts += self._bench(ohms, [z + ohms / g for z, g in zip(zeros, gains)])
+            pts += _bench(ohms, [z + 0.01 + ohms / g for z, g in zip(zeros, gains)])
         cal, report = imp.fit_calibration(pts)
-        assert cal.source == "bench"
-        assert cal.lead_offset == pytest.approx(0.0, abs=1e-6)
-        for i, g in enumerate(gains):
-            assert cal.lead_ohms(zeros[i] + 25000 / g, i) == pytest.approx(25000)
-        assert any("lead scale" in line for line in report)
-        assert any("worst error 0.0%" in line for line in report)
+        assert cal.calibrated and cal.fs == FS
+        for i, (z, g) in enumerate(zip(zeros, gains)):
+            lc = cal.leads[i]
+            assert lc.zero_uv == pytest.approx(z + 0.01)
+            assert lc.ohms_per_uv == pytest.approx(g)
+            assert lc.max_ohms == 50000
+            assert (lc.zero_readings, lc.resistor_readings) == (2, 3)
+            assert lc.worst_error_ohms == pytest.approx(0.0, abs=1e-6)
+        assert len(report) == 9
 
-    def test_leads_without_resistors_keep_scale_1(self):
-        zeros = [30.0] * 8
-        pts = self._bench(0, zeros)
-        pts += [{"pass": "lead", "name": "E1", "ohms": 10000, "carrier_uv": 90.0},
-                {"pass": "lead", "name": "E2", "ohms": 10000, "carrier_uv": 80.0}]
+    def test_a_lead_needs_its_own_short_and_resistor(self):
+        pts = _bench(0, [30.0, 31.0] + [None] * 6)             # E1, E2 shorts
+        pts += _bench(10000, [90.0, None, 95.0] + [None] * 5)  # E1, E3 10k
         cal, report = imp.fit_calibration(pts)
-        assert cal.lead_scale[2:] == [1.0] * 6
-        assert cal.lead_scale[0] < 1.0 < cal.lead_scale[1]
-        assert any("no resistor readings for E3" in line for line in report)
+        assert cal.leads[0] is not None
+        assert cal.leads[1] is None and cal.leads[2] is None
+        assert "E2: not calibrated (no resistor reading)" in report
+        assert "E3: not calibrated (no 0 Ω reading)" in report
 
-    def test_fit_recovers_gain_and_offset(self):
-        pts = [((z + 2200) / 125.0, z) for z in (1000, 4700, 10000, 47000, 100000)]
-        gain, offset, r2, err = imp.fit_line(pts)
-        assert gain == pytest.approx(125.0)
-        assert offset == pytest.approx(2200.0)
-        assert r2 == pytest.approx(1.0)
-        assert err < 1e-9
+    def test_nothing_is_borrowed_from_other_leads(self):
+        pts = _bench(0, [30.0, 30.0] + [None] * 6)
+        for ohms in (1000, 10000, 50000):
+            pts += _bench(ohms, [30.0 + ohms / 160] + [None] * 7)
+        pts += _bench(10000, [None, 30.0 + 10000 / 140] + [None] * 6)
+        cal, _ = imp.fit_calibration(pts)
+        assert cal.leads[0].max_ohms == 50000
+        assert cal.leads[1].max_ohms == 10000
+        assert cal.leads[1].ohms_per_uv == pytest.approx(140)
 
-    def test_fit_error_is_within_10pct_or_1k(self):
-        # a 0 Ω short read as 900 Ω and 100 kΩ read as 109 kΩ both pass
-        pts = [(0.0, 0), (900 / 130.9, 0), (109_000 / 130.9, 100_000),
-               (100_000 / 130.9, 100_000)]
-        *_, err = imp.fit_line(pts)
-        assert err <= 0.1
+    def test_fit_uses_one_sample_rate(self):
+        pts = _bench(0, [30.0] * 8) + _bench(10000, [90.0] * 8)
+        pts += _bench(0, [20.0] * 8, fs=500) + _bench(10000, [99.0] * 8, fs=500)
+        with pytest.raises(ValueError, match="--fs"):
+            imp.fit_calibration(pts)
+        cal, _ = imp.fit_calibration(pts, fs=500)
+        assert cal.fs == 500 and cal.leads[0].zero_uv == pytest.approx(20.0)
 
-    def test_fit_needs_two_values(self):
+    def test_readings_without_a_sample_rate_are_not_used(self):
+        pts = [{"pass": "lead", "name": "E1", "ohms": 0, "carrier_uv": 30.0},
+               {"pass": "lead", "name": "E1", "ohms": 1e4, "carrier_uv": 90.0}]
         with pytest.raises(ValueError):
-            imp.fit_line([(10, 1000), (11, 1000)])
+            imp.fit_calibration(pts)
+
+    def test_resistors_that_read_below_the_short_calibrate_nothing(self):
+        pts = _bench(0, [30.0] + [None] * 7) + _bench(1e4, [29.0] + [None] * 7)
+        cal, report = imp.fit_calibration(pts)
+        assert not cal.calibrated
+        assert "no lead could be calibrated" in report
 
     def test_save_load_roundtrip(self, tmp_path):
         path = tmp_path / "cal.json"
-        cal = imp.Calibration(lead_gain=120.5, lead_offset=1800, source="bench")
+        cal = _cal(zero=33.0, slope=160.0, max_ohms=1e5)
+        cal.leads[5] = None
         imp.save_calibration(cal, path)
         assert imp.load_calibration(path) == cal
 
-    def test_missing_or_corrupt_file_gives_theory(self, tmp_path):
-        assert imp.load_calibration(tmp_path / "none.json").source == "theory"
+    def test_missing_corrupt_or_old_file_calibrates_nothing(self, tmp_path):
+        assert not imp.load_calibration(tmp_path / "none.json").calibrated
         bad = tmp_path / "bad.json"
         bad.write_text("{ nope")
-        assert imp.load_calibration(bad) == imp.Calibration()
+        assert not imp.load_calibration(bad).calibrated
+        old = tmp_path / "old.json"
+        old.write_text('{"lead_gain": 162.0, "source": "bench", '
+                       '"lead_zero_uv": [31.7, 33.2]}')
+        assert not imp.load_calibration(old).calibrated
 
 
 class TestBandsAndFormat:
@@ -212,15 +199,15 @@ class TestBandsAndFormat:
         assert imp.band(ohms) == verdict
 
     @pytest.mark.parametrize("ohms, text", [
-        (None, "off"), (0, "<1 kΩ"), (22, "<1 kΩ"), (820, "<1 kΩ"),
-        (1_000, "1.0 kΩ"), (10_430, "10.4 kΩ"),
-        (220_000, "220 kΩ"), (1e6, ">1 MΩ")])
+        (None, "off"), (0, "0 Ω"), (22, "22 Ω"), (820, "820 Ω"),
+        (10_430, "10.4 kΩ"), (220_000, "220 kΩ"), (1_250_000, "1.25 MΩ")])
     def test_format(self, ohms, text):
         assert imp.format_ohms(ohms) == text
 
 
-def _reading(name, ohms, railed=False):
-    return imp.Reading(name, ohms, 10.0, 0.1, railed)
+def _reading(name, ohms, status=None, limit=None):
+    status = status or (imp.OK if ohms is not None else imp.OFF)
+    return imp.Reading(name, ohms, 10.0, 0.1, False, status, limit)
 
 
 def _dc(p_off=(), n_off=()):
@@ -230,30 +217,40 @@ def _dc(p_off=(), n_off=()):
 
 class TestResult:
     def _result(self):
-        leads = [_reading(f"E{i}", z) for i, z in
-                 enumerate([5000, 7000, 9000, None, 20000, 3e6, 1000, 2000], 1)]
-        return imp.ImpedanceResult(leads, "green", "green", 250.0, "theory")
+        leads = [_reading("E1", 5000), _reading("E2", 7000), _reading("E3", 9000),
+                 _reading("E4", None), _reading("E5", 20000),
+                 _reading("E6", None, imp.ABOVE, 50000), _reading("E7", 1000),
+                 _reading("E8", None, imp.UNCALIBRATED)]
+        return imp.ImpedanceResult(leads, "green", "green", 250.0, "test")
 
     def test_average_over_montage_channels(self):
-        assert self._result().average_ohms([1, 2, 3]) == pytest.approx(7000)
+        assert self._result().average_ohms([1, 2, 3]) == (pytest.approx(7000), 0)
 
-    def test_off_and_huge_leads_count_as_cap(self):
-        avg = self._result().average_ohms([4, 6])
-        assert avg == pytest.approx(imp.CAP_OHMS)
+    def test_unmeasured_leads_are_counted_not_averaged(self):
+        avg, not_measured = self._result().average_ohms([1, 4, 6, 8])
+        assert avg == pytest.approx(5000) and not_measured == 3
+        assert self._result().average_ohms([4, 6]) == (None, 2)
 
     def test_average_of_nothing_is_none(self):
-        assert self._result().average_ohms([]) is None
+        assert self._result().average_ohms([]) == (None, 0)
 
     def test_to_dict_is_json_ready(self):
         import json
         d = self._result().to_dict()
         json.dumps(d)
         assert d["leads"][3]["band"] == "red" and d["ref"] == "green"
+        assert (d["leads"][5]["text"], d["leads"][5]["band"]) == (">50.0 kΩ", "red")
+        assert (d["leads"][7]["text"], d["leads"][7]["band"]) == ("no cal", None)
+        assert d["leads"][0]["status"] == "ok"
+
+    def test_above_a_small_resistor_has_no_band(self):
+        # above 10 kΩ could still be amber or red
+        assert _reading("E1", None, imp.ABOVE, 10000).band is None
 
     def test_no_average_when_readings_were_withheld(self):
         r = self._result()
         r.problem = "GND (BIO) isn't connected"
-        assert r.average_ohms([1, 2, 3]) is None
+        assert r.average_ohms([1, 2, 3]) == (None, 0)
 
 
 class TestAnalyze:
@@ -274,30 +271,31 @@ class TestAnalyze:
 
     def test_connected_leads_read_and_railed_lead_is_off(self):
         r = imp.analyze(self._lead_block([5000, None]), FS, FULL_SCALE,
-                        imp.Calibration(), self._contact())
+                        _cal(), self._contact())
         assert r.leads[0].ohms == pytest.approx(5000, rel=1e-6)
         assert r.leads[1].ohms is None and r.leads[1].railed
+        assert r.leads[1].status == imp.RAILED
         assert (r.ref, r.gnd, r.problem) == ("green", "green", None)
 
     def test_gnd_off_withholds_plausible_looking_values(self):
         # bench: BIO out still gave steady ~9-12 kΩ readings
         block = self._lead_block([9000, 11000])
         contact = self._contact(("red", "red"), ref=None, gnd="red")
-        r = imp.analyze(block, FS, FULL_SCALE, imp.Calibration(), contact)
+        r = imp.analyze(block, FS, FULL_SCALE, _cal(), contact)
         assert all(x.ohms is None for x in r.leads)
         assert r.gnd == "red" and "GND" in r.problem
 
     def test_ref_off_withholds_values(self):
         contact = self._contact(ref="red")
         r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE,
-                        imp.Calibration(), contact)
+                        _cal(), contact)
         assert all(x.ohms is None for x in r.leads) and "REF" in r.problem
 
     def test_lead_flagged_off_by_dc_reads_off_even_if_in_range(self):
         # bench: loose E3/E4/E6 gave an identical bogus 43 kΩ
         contact = self._contact(("green", "red"))
         r = imp.analyze(self._lead_block([5000, 43000]), FS, FULL_SCALE,
-                        imp.Calibration(), contact)
+                        _cal(), contact)
         assert r.leads[0].ohms == pytest.approx(5000, rel=1e-6)
         assert r.leads[1].ohms is None
 
@@ -305,17 +303,52 @@ class TestAnalyze:
         # REF passed the DC check, then drifted during the lead pass.
         block = self._lead_block([5000, 5000])
         block = block - 13000 - 3000 * _t(block.shape[0])[:, None]
-        r = imp.analyze(block, FS, FULL_SCALE, imp.Calibration(),
+        r = imp.analyze(block, FS, FULL_SCALE, _cal(),
                         self._contact())
         assert all(x.ohms is None for x in r.leads)
         assert r.ref == "red" and "came loose" in r.problem
+
+    def test_without_calibration_no_values_but_raw_carriers(self):
+        r = imp.analyze(self._lead_block([5000, 9000]), FS, FULL_SCALE,
+                        imp.Calibration(), self._contact())
+        assert "isn't calibrated" in r.problem and r.calibration is None
+        assert [x.status for x in r.leads] == [imp.UNCALIBRATED] * 2
+        assert all(x.ohms is None for x in r.leads)
+        assert r.leads[1].carrier_uv == pytest.approx(9000 / SLOPE, rel=1e-6)
+
+    def test_calibration_for_another_sample_rate_is_not_used(self):
+        r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE,
+                        _cal(fs=500), self._contact())
+        assert "500 SPS" in r.problem
+        assert all(x.ohms is None for x in r.leads)
+
+    def test_lead_without_its_own_calibration_has_no_value(self):
+        cal = _cal()
+        cal.leads[1] = None
+        r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE, cal,
+                        self._contact())
+        assert r.problem is None and r.leads[0].ohms == pytest.approx(5000)
+        assert (r.leads[1].status, r.leads[1].ohms) == (imp.UNCALIBRATED, None)
+
+    def test_above_the_largest_resistor_is_not_extrapolated(self):
+        r = imp.analyze(self._lead_block([10_150, 30_000]), FS, FULL_SCALE,
+                        _cal(max_ohms=10_000), self._contact())
+        assert r.leads[0].status == imp.OK            # within RANGE_MARGIN
+        assert r.leads[0].ohms == pytest.approx(10_150)
+        assert (r.leads[1].status, r.leads[1].ohms) == (imp.ABOVE, None)
+        assert r.leads[1].limit_ohms == 10_000 and r.leads[1].text == ">10.0 kΩ"
+
+    def test_reading_below_the_short_is_zero(self):
+        r = imp.analyze(self._lead_block([100, 100]), FS, FULL_SCALE,
+                        _cal(zero=1.0), self._contact())
+        assert r.leads[0].ohms == 0.0 and r.leads[0].status == imp.OK
 
     def test_ref_pass_carrier_is_reported_for_bench_use(self):
         n = imp.block_length(FS)
         ref = np.column_stack([np.sin(2 * np.pi * imp.EXCITATION_HZ * _t(n)) * 3.0,
                                np.full(n, FULL_SCALE)])
         r = imp.analyze(self._lead_block([5000, 5000]), FS, FULL_SCALE,
-                        imp.Calibration(), self._contact(), ref_block=ref)
+                        _cal(), self._contact(), ref_block=ref)
         assert r.ref_carrier_uv == pytest.approx(3.0, rel=1e-6)
 
 
@@ -339,7 +372,7 @@ def _run_mock_check(setup=None, check_kwargs=None):
         acq.start()
         try:
             await asyncio.sleep(0.2)
-            check = imp.ImpedanceCheck(acq, calibration=imp.Calibration(),
+            check = imp.ImpedanceCheck(acq, calibration=_cal(),
                                        seconds=1.0, settle_seconds=0.1,
                                        **(check_kwargs or {}))
             result = await check.run()

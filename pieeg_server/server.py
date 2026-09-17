@@ -723,8 +723,11 @@ class PiEEGServer:
             await self._broadcast_json({"status": "impedance", "active": True})
             result = (await ImpedanceCheck(self._acq).run()).to_dict()
             done["results"] = result
+            # Raw carrier/noise (µV) per lead as well, so any check can be
+            # re-examined against the calibration later.
             logger.info("impedance check: %s%s", " ".join(
-                f"{r['name']}={'off' if r['ohms'] is None else round(r['ohms'])}"
+                f"{r['name']}={r['text'].replace(' ', '')}"
+                f"[{r['carrier_uv']:.3f}/{r['noise_uv']:.3f}µV]"
                 for r in result["leads"]),
                 f" ({result['problem']})" if result["problem"] else "")
             return result
