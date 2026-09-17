@@ -54,7 +54,7 @@ def _as_thread(link):
 
 
 def _run_link(fake_viewer, leadoff=None, record_status=None, toggle=None,
-              frames=()):
+              frames=(), impedance=None):
     seen = {}
 
     def run_viewer(frame_queue, **kwargs):
@@ -62,7 +62,8 @@ def _run_link(fake_viewer, leadoff=None, record_status=None, toggle=None,
 
     link = scope_console._ViewerLink(
         {"num_channels": 8, "fs": 250, "title": "t"},
-        leadoff=leadoff, record_status=record_status, toggle_record=toggle)
+        leadoff=leadoff, record_status=record_status, toggle_record=toggle,
+        impedance=impedance)
     original = acq_viewer.run_viewer
     acq_viewer.run_viewer = run_viewer
     try:
@@ -147,6 +148,49 @@ def test_record_error_is_raised_in_the_viewer():
     seen = _run_link(viewer, record_status=lambda: {"recording": False},
                      toggle=toggle)
     assert seen["ok"]
+
+
+def test_impedance_round_trip():
+    calls = []
+
+    def impedance():
+        calls.append(1)
+        fut = concurrent.futures.Future()
+        fut.set_result({"leads": [], "problem": None})
+        return fut
+
+    def viewer(q, kwargs, seen):
+        seen["has_record"] = "record_control" in kwargs
+        fut = kwargs["impedance_control"]["run"]()
+        _wait_for(fut.done)
+        seen["result"] = fut.result()
+
+    seen = _run_link(viewer, impedance=impedance)
+    assert calls == [1] and seen["has_record"] is False
+    assert seen["result"] == {"leads": [], "problem": None}
+
+
+def test_impedance_error_is_raised_in_the_viewer():
+    def impedance():
+        fut = concurrent.futures.Future()
+        fut.set_exception(RuntimeError("stop the recording first"))
+        return fut
+
+    def viewer(q, kwargs, seen):
+        fut = kwargs["impedance_control"]["run"]()
+        _wait_for(fut.done)
+        with pytest.raises(RuntimeError, match="stop the recording"):
+            fut.result()
+        seen["ok"] = True
+
+    assert _run_link(viewer, impedance=impedance)["ok"]
+
+
+def test_no_impedance_control_without_a_handler():
+    def viewer(q, kwargs, seen):
+        seen["has"] = "impedance_control" in kwargs
+
+    assert _run_link(viewer)["has"] is False
 
 
 def test_viewer_crash_is_logged(caplog):

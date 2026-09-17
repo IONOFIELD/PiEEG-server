@@ -55,6 +55,7 @@ import numpy as np
 from scipy import signal
 
 from .hardware import VREF_UV, contact_from_signal
+from .impedance import CAP_OHMS, band as impedance_band, format_ohms
 
 # ── electrode map: chip input (E1..) -> scalp label ──────────────────────────
 # The PiEEG chip streams its inputs in order, and we call them E1, E2, E3 …
@@ -295,7 +296,7 @@ class ContactTracker:
         self._ref = deque(maxlen=window)
         self._gnd = deque(maxlen=window)
 
-    def update(self, status, recent=None, full_scale_uv=VREF_UV / 24):
+    def update(self, status, recent=None, full_scale_uv=VREF_UV / 24, fs=250):
         """Feed one leadoff_status() readout and the recent signal block
         (N x channels µV). Without a signal block (nothing buffered yet) only
         the leads update; REF and GND need the signal to be told apart.
@@ -311,7 +312,7 @@ class ContactTracker:
                 self._hist[i].append(bool(c.get("p_off")))
         if recent is None:
             return
-        verdict = contact_from_signal(status, recent, full_scale_uv)
+        verdict = contact_from_signal(status, recent, full_scale_uv, fs)
         self._ref.append(verdict["ref"])
         self._gnd.append(verdict["gnd"])
 
@@ -543,10 +544,30 @@ class ViewerModel:
         self.filt[-m:] = f
         self.filled = min(self.win, self.filled + m)
 
+    def montage_inputs(self):
+        """1-based chip inputs of the electrodes in the visible rows."""
+        return sorted({self.site_index[site] + 1 for r in self.rows()
+                       if r["on"] for site in r["pair"]
+                       if site in self.site_index})
+
     def derivation(self, pair):
         """Filtered (upper - lower) trace across the window, in microvolts."""
         a, b = pair
         return self.filt[:, self.site_index[a]] - self.filt[:, self.site_index[b]]
+
+
+def average_impedance(result, inputs):
+    """AVG IMP: mean lead impedance (Ω) over 1-based `inputs` from an
+    impedance result dict (ImpedanceResult.to_dict()). An off or railed lead
+    counts as CAP_OHMS, so a lifted electrode shows in the average; REF and
+    GND are never averaged in. None when there's nothing to average or the
+    readings were withheld."""
+    if not result or result.get("problem"):
+        return None
+    wanted = set(inputs)
+    vals = [CAP_OHMS if lead["ohms"] is None else min(lead["ohms"], CAP_OHMS)
+            for i, lead in enumerate(result["leads"], start=1) if i in wanted]
+    return sum(vals) / len(vals) if vals else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -606,7 +627,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                electrodes=None, on_close=None, title="PiEEG Scope",
                auto_shot=None, auto_close_ms=None,
                connect_popup=None, contact_source=None,
-               record_control=None, full_scale_uv=VREF_UV / 24):
+               record_control=None, full_scale_uv=VREF_UV / 24,
+               impedance_control=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -624,6 +646,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     the server's recorder; the Future's result dict ({"started": session} or
     {"stopped": session, "saved": [suffixes], "seconds", "dir"}) is reported in a
     toast. Status is polled each redraw, so a recording a client starts shows too.
+    impedance_control: optional dict {"run": () -> concurrent Future}. When
+    given, an Ω button beside AVG IMP runs the electrode impedance check; the
+    Future's result is ImpedanceResult.to_dict(). Results show in a panel over
+    the traces (tap it to close) and AVG IMP averages the visible montage.
     connect_popup: optional dict {"ip", "port", "mode", "targets"} for the
     "connect to…" info popup; "targets" lists every reachable
     (mode, ip), primary first. When given, a small always-on-top window is raised over
@@ -749,9 +775,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Corner "IP" button: re-open the connection popup on demand (after it has
     # been minimised or closed). Only meaningful when there's a popup to show.
     if connect_popup:
-        ttk.Button(bar2, text="IP", width=3, style="IP.TButton",
+        ttk.Button(bar2, text="IP", width=2, style="IP.TButton",
                    command=lambda: _show_connect_popup()).pack(side="right",
-                                                               padx=(6, 2))
+                                                               padx=(4, 2))
+    # Ω beside IP: run the electrode impedance check (a few seconds). Results
+    # land in the AVG IMP box on the row below and a panel over the traces.
+    imp_btn = None
+    if impedance_control is not None:
+        imp_btn = ttk.Button(bar2, text="Ω", width=2, style="IP.TButton",
+                             command=lambda: _run_impedance())
+        imp_btn.pack(side="right", padx=(4, 0))
 
     # Montage chip: [MONTAGE ⌄  Save  Reset]. The dropdown label grows a "*"
     # (e.g. "Transverse*") whenever the montage has edits that Save hasn't
@@ -801,15 +834,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     lff_var = _menu(fchip, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
                     lambda v: _apply_filters(), width=6)
     hff_var = _menu(fchip, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
-                    lambda v: _apply_filters(), width=6)
+                    lambda v: _apply_filters(), width=5)
     notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
-                      lambda v: _apply_filters(), width=6)
+                      lambda v: _apply_filters(), width=5)
     # Sensitivity chip (display gain, kept separate from the frequency filters;
     # labelled by its unit alone to fit the 800 px panel)
     schip = _chip(bar)
     schip.pack(side="left", pady=1)
     sens_var = _menu(schip, "µV/mm", [str(s) for s in SENS_CHOICES],
-                     str(DEFAULT_SENS), lambda v: None, width=5)
+                     str(DEFAULT_SENS), lambda v: None, width=4)
 
     # One Rec/Stop toggle (saves space): starts the server's crash-safe
     # recording; pressing again stops it and exports the BDF+ file.
@@ -819,30 +852,36 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                              command=lambda: _toggle_record())
         rec_btn.pack(side="left", padx=(6, 0), pady=1)
 
-    # Electrode cluster, right of the filters: REF ●  GND ●  [AVG IMP —].
+    # Electrode cluster, right of the filters: REF OK  GND OK  [AVG —].
     # REF and GND are live, from the lead-off flags plus which channels sit at
     # the rail (ContactTracker). The average impedance in kΩ needs the AC
     # impedance check, so it stays "—" until that is wired into the Scope
     # (docs/IMPEDANCE_CHECK_PLAN.md).
     ref_dot = gnd_dot = imp_lbl = None
-    if contact_source is not None:
+    if contact_source is not None or impedance_control is not None:
         ewrap = tk.Frame(bar, bg=C["surface"])
         ewrap.pack(side="right", padx=(0, 2))
 
         def _elec_dot(text):
+            # [REF OK]: dim label, then the verdict as a coloured word (fixed
+            # width so the row doesn't shift as it changes).
             tk.Label(ewrap, text=text, bg=C["surface"], fg=C["text_dim"],
                      font=("TkDefaultFont", _fs(9))).pack(side="left",
-                                                           padx=(5, 2))
-            dot = tk.Label(ewrap, text="●", bg=C["surface"], fg=C["text_dim"])
-            dot.pack(side="left")
-            return dot
-        ref_dot = _elec_dot("REF")
-        gnd_dot = _elec_dot("GND")
+                                                           padx=(4, 2))
+            word = tk.Label(ewrap, text="—", width=5, anchor="w",
+                            bg=C["surface"], fg=C["text_dim"],
+                            font=(_MONO, _fs(9), "bold"))
+            word.pack(side="left")
+            return word
+        if contact_source is not None:
+            ref_dot = _elec_dot("REF")
+            gnd_dot = _elec_dot("GND")
         ibox = _chip(ewrap)
-        ibox.pack(side="left", padx=(6, 0), pady=1)
-        # Fixed width, sized for the longest reading ("AVG IMP 99.9 kΩ"), so
-        # the row doesn't shift once values arrive.
-        imp_lbl = tk.Label(ibox, text="AVG IMP —", width=15, bg=C["raised"],
+        ibox.pack(side="left", padx=(4, 0), pady=1)
+        # Average impedance of the visible montage (from the Ω check). Fixed
+        # width, sized for the longest reading ("AVG 99.9 kΩ"), so the row
+        # doesn't shift once values arrive.
+        imp_lbl = tk.Label(ibox, text="AVG —", width=11, bg=C["raised"],
                            fg=C["text_dim"], font=(_MONO, _fs(10), "bold"))
         imp_lbl.pack(padx=4, pady=2)
 
@@ -980,6 +1019,136 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         else:
             rec_btn.configure(text="● Rec", style="TButton")
 
+    # ---- impedance check (Ω) --------------------------------------------- #
+    # Results stay in a panel over the traces for IMP_PANEL_S (tap to close);
+    # AVG IMP keeps the latest check, recomputed for the montage on screen,
+    # and dims once it is IMP_STALE_S old.
+    IMP_PANEL_S = 30.0
+    IMP_STALE_S = 300.0
+    _BAND_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
+    _imp = {"future": None, "result": None, "at": 0.0, "panel_until": 0.0,
+            "panel_box": None}
+
+    def _run_impedance():
+        if impedance_control is None or _imp["future"] is not None:
+            return
+        if record_control is not None:
+            try:
+                recording = record_control["status"]().get("recording")
+            except Exception:               # noqa: BLE001 - display only
+                recording = False
+            if recording:
+                _hint("stop the recording before checking impedance",
+                      seconds=6, fg=C["yellow"])
+                return
+        try:
+            _imp["future"] = impedance_control["run"]()
+        except Exception as e:              # noqa: BLE001 - report, don't crash
+            _hint(f"impedance check failed: {e}", seconds=8, fg=C["red"])
+            return
+        _imp["panel_until"] = 0.0
+        imp_btn.configure(text="…")
+
+    def _poll_impedance():
+        fut = _imp["future"]
+        if fut is not None and fut.done():
+            _imp["future"] = None
+            imp_btn.configure(text="Ω")
+            try:
+                res = fut.result()
+            except Exception as e:          # noqa: BLE001
+                _hint(f"impedance check failed: {e}", seconds=10, fg=C["red"])
+            else:
+                _imp.update(result=res, at=time.time(),
+                            panel_until=time.monotonic() + IMP_PANEL_S)
+                if res.get("problem"):
+                    _hint(res["problem"], seconds=10, fg=C["red"])
+        res = _imp["result"]
+        if res is None or imp_lbl is None:
+            return
+        avg = average_impedance(res, model.montage_inputs())
+        if avg is None:
+            imp_lbl.configure(text="AVG —",
+                              fg=C["red"] if res.get("problem") else C["text_dim"])
+        else:
+            stale = time.time() - _imp["at"] > IMP_STALE_S
+            imp_lbl.configure(text=f"AVG {format_ohms(avg)}",
+                              fg=C["text_dim"] if stale
+                              else _BAND_FG[impedance_band(avg)])
+
+    def _draw_impedance(W, H):
+        _imp["panel_box"] = None
+        if _imp["future"] is not None:
+            tid = canvas.create_text(W / 2, H / 2, anchor="center",
+                                     text="MEASURING IMPEDANCE\n"
+                                          "keep hands off the electrodes",
+                                     justify="center", fill=C["text"],
+                                     font=(_MONO, _fs(11), "bold"), tags="trace")
+            x0, y0, x1, y1 = canvas.bbox(tid)
+            box = canvas.create_rectangle(x0 - 16, y0 - 10, x1 + 16, y1 + 10,
+                                          fill=C["surface"],
+                                          outline=C["accent"], tags="trace")
+            canvas.tag_lower(box, tid)
+            return
+        res = _imp["result"]
+        if res is None or time.monotonic() >= _imp["panel_until"]:
+            return
+        lines = [(time.strftime("IMPEDANCE  %H:%M:%S",
+                                time.localtime(_imp["at"])), C["text_sec"])]
+        withheld = bool(res.get("problem"))
+        for site in model.electrodes:
+            i = model.site_index[site]
+            lead = res["leads"][i] if i < len(res["leads"]) else None
+            if lead is None:
+                continue
+            if withheld:
+                value, fg = "—", C["text_dim"]
+            elif lead["ohms"] is None:
+                value, fg = "off", C["red"]
+            else:
+                value = format_ohms(lead["ohms"])
+                fg = _BAND_FG[impedance_band(lead["ohms"])]
+            lines.append((f"{model.elabel(site):<3} {site:<5}{value:>9}", fg))
+        verdict = {"green": "ok", "red": "OFF", None: "?"}
+        lines.append((f"REF {verdict.get(res.get('ref'), '?'):<4}"
+                      f"GND {verdict.get(res.get('gnd'), '?')}",
+                      C["red"] if "red" in (res.get("ref"), res.get("gnd"))
+                      else C["text_sec"]))
+        if withheld:
+            words, row = res["problem"].split(), ""
+            for w in words:
+                if len(row) + len(w) + 1 > 26:
+                    lines.append((row, C["red"]))
+                    row = w
+                else:
+                    row = f"{row} {w}".strip()
+            if row:
+                lines.append((row, C["red"]))
+        lines.append(("tap to close", C["text_dim"]))
+        x, y = W - 12, 40
+        ids = []
+        for text, fg in lines:
+            tid = canvas.create_text(x, y, anchor="ne", text=text, fill=fg,
+                                     font=(_MONO, _fs(9)), tags="trace")
+            ids.append(tid)
+            y = canvas.bbox(tid)[3] + 1
+        boxes = [canvas.bbox(t) for t in ids]
+        x0 = min(b[0] for b in boxes) - 10
+        y0 = boxes[0][1] - 6
+        x1 = max(b[2] for b in boxes) + 10
+        y1 = boxes[-1][3] + 6
+        bg = canvas.create_rectangle(x0, y0, x1, y1, fill=C["surface"],
+                                     outline=C["border_hi"], tags="trace")
+        canvas.tag_lower(bg, ids[0])
+        _imp["panel_box"] = (x0, y0, x1, y1)
+
+    def _close_impedance_panel(evt):
+        box = _imp["panel_box"]
+        if box and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]:
+            _imp["panel_until"] = 0.0
+
+    canvas.bind("<Button-1>", _close_impedance_panel)
+
     def _row_at_y(y):
         """The visible row under a canvas y-coordinate, or None."""
         rows = [r for r in model.rows() if r["on"]]
@@ -1075,30 +1244,40 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if not chunks:
             return 0
         arr = chunks[0] if len(chunks) == 1 else np.concatenate(chunks)
+        if _imp["future"] is not None and model.filled:
+            # An impedance check is running: the channels carry its test
+            # current, not EEG. Hold the last sample (a flat line, no filter
+            # step) instead of scrolling 10 s of 31 Hz blocks across the view.
+            arr = np.repeat(model.raw[-1:], arr.shape[0], axis=0)
         model.push(arr)
         return arr.shape[0]
 
     _CONTACT_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
+    _CONTACT_WORD = {"green": "OK", "amber": "LOOSE", "red": "OFF"}
     # Measured sample rate: frames drained per second, re-estimated ~1 Hz.
     _rate = {"t": time.monotonic(), "n": 0, "sps": None}
 
     _rail_n = max(1, int(fs / 4))           # ~0.25 s of signal per verdict
 
     def _poll_contact():
-        if contact_source is None:
-            return
+        if contact_source is None or _imp["future"] is not None:
+            return                          # no lead-off readout during a check
         recent = model.raw[-_rail_n:] if model.filled >= _rail_n else None
         try:
-            model.contact.update(contact_source(), recent, full_scale_uv)
+            model.contact.update(contact_source(), recent, full_scale_uv, fs)
         except Exception:                   # noqa: BLE001 - display only
             return
-        ref_dot.config(fg=_CONTACT_FG.get(model.contact.ref(), C["text_dim"]))
-        gnd_dot.config(fg=_CONTACT_FG.get(model.contact.gnd(), C["text_dim"]))
+        for word, verdict in ((ref_dot, model.contact.ref()),
+                              (gnd_dot, model.contact.gnd())):
+            word.config(text=_CONTACT_WORD.get(verdict, "—"),
+                        fg=_CONTACT_FG.get(verdict, C["text_dim"]))
 
     def _redraw():
         got = _drain_queue()
         _poll_contact()
         _poll_record()
+        if impedance_control is not None:
+            _poll_impedance()
         _rate["n"] += got
         _now = time.monotonic()
         if _now - _rate["t"] >= 1.0:
@@ -1196,6 +1375,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                          fill=C["surface"],
                                          outline=C["border_hi"], tags="trace")
             canvas.tag_lower(bg, tid)
+        if impedance_control is not None and W > 2 and H > 2:
+            _draw_impedance(W, H)
         pct = int(100 * model.filled / model.win)
         # While the 10 s window fills, show progress; after that, the rate
         # frames actually arrive at (should match the chip's CONFIG1 rate).
@@ -1404,7 +1585,8 @@ class _RemoteFuture:
         return self._payload["result"]
 
 
-def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
+def run_viewer_process(conn, contact=False, record=False, impedance=False,
+                       **viewer_kwargs):
     """Entry point of the Scope's viewer process (multiprocessing, spawn).
 
     The Tk viewer runs in its own process so its drawing never holds the GIL
@@ -1413,8 +1595,9 @@ def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
     fix, corrupting them). The parent sends ("tick", {"frames": (m x nch)
     array or None, "leadoff": leadoff_status() or None, "record": {"recording",
     "started"}}) about 20 times a second, and ("record_result", id, payload)
-    answers. This process sends ("toggle_record", id) and, if the viewer
-    crashes, ("error", traceback). Closing the window ends the process, which
+    or ("impedance_result", id, payload) answers. This process sends
+    ("toggle_record", id) or ("impedance", id) and, if the viewer crashes,
+    ("error", traceback). Closing the window ends the process, which
     the parent treats as the shutdown gesture.
     """
     import itertools
@@ -1444,7 +1627,7 @@ def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
                     frames.put(msg["frames"])
                 state["leadoff"] = msg.get("leadoff")
                 state["record"] = msg.get("record") or state["record"]
-            elif kind == "record_result":
+            elif kind in ("record_result", "impedance_result"):
                 fut = pending.pop(rest[0], None)
                 if fut is not None:
                     fut.set(rest[1])
@@ -1453,11 +1636,11 @@ def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
 
     ids = itertools.count()
 
-    def toggle():
+    def request(kind):
         req = next(ids)
         fut = _RemoteFuture()
         pending[req] = fut
-        send(("toggle_record", req))
+        send((kind, req))
         return fut
 
     def status():
@@ -1471,7 +1654,11 @@ def run_viewer_process(conn, contact=False, record=False, **viewer_kwargs):
     if contact:
         viewer_kwargs["contact_source"] = lambda: state["leadoff"]
     if record:
-        viewer_kwargs["record_control"] = {"status": status, "toggle": toggle}
+        viewer_kwargs["record_control"] = {
+            "status": status, "toggle": lambda: request("toggle_record")}
+    if impedance:
+        viewer_kwargs["impedance_control"] = {
+            "run": lambda: request("impedance")}
     try:
         run_viewer(frames, **viewer_kwargs)
     except Exception:

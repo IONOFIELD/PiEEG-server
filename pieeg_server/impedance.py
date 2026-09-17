@@ -324,6 +324,14 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
         problem = "REF isn't connected: fix the reference before reading impedance"
     elif lead_verdicts and "green" not in lead_verdicts:
         problem = "no electrodes are connected"
+    elif lead_verdicts and contact_from_signal(
+            [{"p_off": v != "green"} for v in lead_verdicts],
+            lead_block, full_scale_uv, fs)["ref"] == "red":
+        # REF was in when the check started but not during the measurement
+        # (a REF that has only just come out can still look connected).
+        ref = "red"
+        problem = ("REF came loose during the check: fix the reference and "
+                   "check again")
     leads = []
     for i in range(lead_block.shape[1]):
         dc_off = i < len(lead_verdicts) and lead_verdicts[i] == "red"
@@ -436,13 +444,14 @@ class ImpedanceCheck:
                                   "check; try again")
 
     async def _dc_contact(self, q, fs, full_scale):
-        """contact_from_signal() over the DC flags and ~0.25 s of DC-mode
-        signal. None without lead-off support."""
+        """contact_from_signal() over the DC flags and ~0.5 s of DC-mode
+        signal (long enough to see a REF that is starting to drift). None
+        without lead-off support."""
         leadoff = getattr(self._acq._hw, "leadoff_status", None)
         status = leadoff() if callable(leadoff) else None
         if not status:
             return None
-        need = max(1, int(fs / 4))
+        need = max(1, int(fs / 2))
         rows = []
         loop = asyncio.get_running_loop()
         deadline = loop.time() + 2.0
@@ -454,12 +463,19 @@ class ImpedanceCheck:
             rows.append(frame["channels"])
         if not rows:
             return None
-        return contact_from_signal(status, rows, full_scale)
+        return contact_from_signal(status, rows, full_scale, fs)
 
     async def run(self):
         reason = unsupported_reason(self._acq)
         if reason:
             raise ImpedanceCheckError(reason)
+        hw = self._acq._hw
+        regs = getattr(hw, "register_state", None) or {}
+        if any((regs.get(r, 0) & 0x07) != 0 for r in getattr(hw, "CH_REGS", ())):
+            # Test signal, shorted inputs, ...: there are no electrodes to
+            # measure, and the identical test signal looks like a floating REF.
+            raise ImpedanceCheckError(
+                "the channels are on an internal signal, not the electrodes")
         fs = self._fs()
         n = block_length(fs, self._seconds)
         full_scale = VREF_UV / (self._acq.pga_gain or 24)

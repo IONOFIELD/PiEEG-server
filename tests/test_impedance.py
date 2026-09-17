@@ -300,6 +300,15 @@ class TestAnalyze:
         assert r.leads[0].ohms == pytest.approx(5000, rel=1e-6)
         assert r.leads[1].ohms is None
 
+    def test_ref_coming_loose_during_the_measurement_withholds_values(self):
+        # REF passed the DC check, then drifted during the lead pass.
+        block = self._lead_block([5000, 5000])
+        block = block - 13000 - 3000 * _t(block.shape[0])[:, None]
+        r = imp.analyze(block, FS, FULL_SCALE, imp.Calibration(),
+                        self._contact())
+        assert all(x.ohms is None for x in r.leads)
+        assert r.ref == "red" and "came loose" in r.problem
+
     def test_ref_pass_carrier_is_reported_for_bench_use(self):
         n = imp.block_length(FS)
         ref = np.column_stack([np.sin(2 * np.pi * imp.EXCITATION_HZ * _t(n)) * 3.0,
@@ -341,6 +350,12 @@ def _run_mock_check(setup=None, check_kwargs=None):
 
 
 class TestMockEndToEnd:
+    def test_refuses_while_channels_are_on_an_internal_signal(self):
+        def setup(hw):
+            hw.configure_registers({reg: 0x05 for reg in hw.CH_REGS})
+        with pytest.raises(imp.ImpedanceCheckError, match="internal signal"):
+            _run_mock_check(setup)
+
     def test_measures_simulated_impedances(self):
         leads = [2000, 4700, 10000, 22000, 47000, 100000, 3300, 8200]
 
