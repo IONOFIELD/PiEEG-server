@@ -234,12 +234,15 @@ def band(ohms):
 
 
 def format_ohms(ohms):
+    """Display text. Under 1 kΩ reads "<1 kΩ": the per-lead zeros drift by
+    ~0.1 µV (~20 Ω), so inputs shorted to REF/BIO read anywhere from 0 to
+    ~20 Ω and ohm digits would make identical shorts look different."""
     if ohms is None:
         return "off"
     if ohms >= CAP_OHMS:
         return ">1 MΩ"
     if ohms < 1000:
-        return f"{ohms:.0f} Ω"
+        return "<1 kΩ"
     if ohms < 100_000:
         return f"{ohms / 1000:.1f} kΩ"
     return f"{ohms / 1000:.0f} kΩ"
@@ -685,7 +688,7 @@ def _record_bench(args, results):
                 added += 1
     BENCH_PATH.parent.mkdir(parents=True, exist_ok=True)
     BENCH_PATH.write_text(json.dumps(points, indent=2))
-    print(f"\nrecorded {added} reading(s) at {format_ohms(args.ohms)} "
+    print(f"\nrecorded {added} reading(s) at {args.ohms:g} Ω "
           f"-> {BENCH_PATH} ({len(points)} total)")
 
 

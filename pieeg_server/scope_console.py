@@ -182,6 +182,10 @@ SCOPE_CHANGELOG = [
             "REF as off, and a REF that has just come loose is caught sooner. "
             "No more skipped samples: the board is now read by its own small "
             "process (0 lost in 50 s with the Scope open, from about 2%)."),
+    ("3.0", "Impedance readings under 1 kΩ now show as <1 kΩ. Electrodes "
+            "plugged straight into REF/BIO read 0 to about 20 Ω, which is "
+            "below what the check can tell apart, so they no longer look "
+            "different from each other."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

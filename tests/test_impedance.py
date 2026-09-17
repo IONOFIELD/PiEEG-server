@@ -212,7 +212,8 @@ class TestBandsAndFormat:
         assert imp.band(ohms) == verdict
 
     @pytest.mark.parametrize("ohms, text", [
-        (None, "off"), (820, "820 Ω"), (10_430, "10.4 kΩ"),
+        (None, "off"), (0, "<1 kΩ"), (22, "<1 kΩ"), (820, "<1 kΩ"),
+        (1_000, "1.0 kΩ"), (10_430, "10.4 kΩ"),
         (220_000, "220 kΩ"), (1e6, ">1 MΩ")])
     def test_format(self, ohms, text):
         assert imp.format_ohms(ohms) == text
