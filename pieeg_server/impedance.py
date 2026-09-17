@@ -152,6 +152,9 @@ class Calibration:
     lead_zero_uv: each lead's carrier with its input shorted (0 Ω). The
     PiEEG-8 reads ~32-36 µV per lead through a dead short (the board's own
     input path), which would otherwise add ~4 kΩ to every reading.
+    lead_scale: each lead's gain relative to lead_gain. The leads' test
+    currents differ by up to ~10% on the PiEEG-8 (bench, 2026-09-16), so one
+    shared gain misses the 10% target; None means 1.0 for every lead.
     source: "theory", "zeroed" (shorts recorded, gain still theory) or
     "bench" (gain fitted from resistors).
     """
@@ -163,13 +166,17 @@ class Calibration:
     source: str = "theory"
     fitted_at: str | None = None
     lead_zero_uv: list[float] | None = None
+    lead_scale: list[float] | None = None
 
     def lead_ohms(self, carrier_uv, index=None):
         uv = float(carrier_uv)
-        if self.lead_zero_uv and index is not None \
-                and 0 <= index < len(self.lead_zero_uv):
-            uv = max(0.0, uv - self.lead_zero_uv[index])
-        return max(0.0, self.lead_gain * uv - self.lead_offset)
+        gain = self.lead_gain
+        if index is not None:
+            if self.lead_zero_uv and 0 <= index < len(self.lead_zero_uv):
+                uv = max(0.0, uv - self.lead_zero_uv[index])
+            if self.lead_scale and 0 <= index < len(self.lead_scale):
+                gain *= self.lead_scale[index]
+        return max(0.0, gain * uv - self.lead_offset)
 
     def ref_ohms(self, carrier_uv):
         return max(0.0, self.ref_gain * float(carrier_uv) - self.ref_offset)
@@ -417,7 +424,9 @@ class ImpedanceCheck:
     async def _pass(self, q, reg_map, n, fs):
         await self._restart(reg_map)
         skip = int(round(self._settle * fs))
-        for _ in range(2):
+        # A late read is skipped every few seconds, and a block needs ~2 s
+        # unbroken, so allow several tries before giving up.
+        for _ in range(6):
             block = await self._collect(q, n, skip, fs)
             if block is not None:
                 return block
@@ -667,9 +676,11 @@ def fit_calibration(points, cal=None):
     """Fit a Calibration from bench points; returns (calibration, report).
 
     points: [{"pass": "lead"|"ref", "name": "E1"|"REF", "ohms", "carrier_uv"}].
-    0 Ω lead points (inputs shorted) set each lead's zero; resistor points
-    then fit gain and offset on the zero-corrected carrier. With shorts only,
-    the gain stays theory and the source becomes "zeroed".
+    0 Ω lead points (inputs shorted) set each lead's zero. Each lead with
+    resistor points gets its own gain (a line through its zero), stored as a
+    scale relative to the mean; the shared gain and offset are then fitted
+    on the zero-corrected, scaled carrier. With shorts only, the gain stays
+    theory and the source becomes "zeroed".
     """
     cal = cal or Calibration()
     report = []
@@ -697,8 +708,36 @@ def fit_calibration(points, cal=None):
                 uv -= cal.lead_zero_uv[idx]
         return uv
 
+    by_lead = {}
+    for q in leads:
+        if q["ohms"] > 0:
+            by_lead.setdefault(int(q["name"][1:]) - 1, []).append(
+                (zeroed(q), q["ohms"]))
+    slopes = {}
+    for idx, pts in by_lead.items():
+        uu = sum(u * u for u, _ in pts)
+        if 0 <= idx < 8 and uu > 0:
+            slope = sum(u * o for u, o in pts) / uu
+            if slope > 0:
+                slopes[idx] = slope
+    if len(slopes) > 1:
+        mean = float(np.mean(list(slopes.values())))
+        cal.lead_scale = [slopes.get(i, mean) / mean for i in range(8)]
+        report.append("lead scale (own gain / mean): " + "  ".join(
+            f"E{i + 1} {cal.lead_scale[i]:.3f}" for i in range(8)))
+        missing = [f"E{i + 1}" for i in range(8) if i not in slopes]
+        if missing:
+            report.append(f"  no resistor readings for {', '.join(missing)} "
+                          "(scale left at 1)")
+
+    def corrected(q):
+        uv = zeroed(q)
+        if q["pass"] == "lead" and cal.lead_scale:
+            uv *= cal.lead_scale[int(q["name"][1:]) - 1]
+        return uv
+
     for kind in ("lead", "ref"):
-        pts = [(zeroed(q), q["ohms"]) for q in points if q["pass"] == kind]
+        pts = [(corrected(q), q["ohms"]) for q in points if q["pass"] == kind]
         if not any(o > 0 for _, o in pts):
             report.append(f"{kind}: no resistor readings; gain stays "
                           f"{getattr(cal, kind + '_gain'):.2f} Ω/µV")
