@@ -190,9 +190,21 @@ CONTACT_RAIL_FRACTION = 0.9
 # gave 1222 µV identical on all 8; REF in gave 0.2-0.4 µV.
 REF_FLOAT_COMMON_UV = 500.0
 REF_FLOAT_COMMON_SHARE = 0.9
+# Mains hum is shared too: REF through 20 kΩ picked up 1.3 mV of 60 Hz on every
+# channel and was called floating. Averaging over 100 ms (a whole number of
+# 50 Hz and 60 Hz cycles) removes it before the shared signal is judged.
+MAINS_AVERAGE_S = 0.1
+# A REF that has only just come out drifts before it gets large: bench
+# 2026-09-16, it read -13 mV shared at first, then -67 to -84 mV over 6 s
+# (2.4-3.8 mV/s). A connected REF gave well under 0.1 mV/s.
+REF_FLOAT_DRIFT_UV_S = 1500.0
+# ... and sits far from zero with every lead at the same level.
+REF_FLOAT_DC_UV = 30_000.0
+REF_FLOAT_DC_SPREAD = 0.2
 
 
-def classify_contact(status, railed, common_uv=0.0):
+def classify_contact(status, railed, common_uv=0.0, drift_uv_s=0.0,
+                     shared_dc_uv=0.0):
     """Lead, REF and GND (BIO) contact from lead-off flags plus signal rails.
 
     Signatures measured on the PiEEG-8 with the leads, REF and BIO wires
@@ -208,8 +220,12 @@ def classify_contact(status, railed, common_uv=0.0):
 
     status: leadoff_status() list. railed: per-channel bools, True when that
     channel's recent signal is at the rail (see CONTACT_RAIL_FRACTION).
-    common_uv: size of the signal shared by the connected leads (see
+    common_uv: size of the slow signal shared by the connected leads (see
     contact_from_signal); REF_FLOAT_COMMON_UV or more means REF is floating.
+    drift_uv_s: how fast that shared signal moves; REF_FLOAT_DRIFT_UV_S or
+    more means REF is floating. shared_dc_uv: the DC level every connected
+    lead shares (0 when they differ); REF_FLOAT_DC_UV or more away from zero
+    means REF is floating.
     Returns {"leads": [...], "ref": v, "gnd": v}; leads are "green"/"red",
     ref and gnd are "green"/"red" or None when the wiring can't tell.
     """
@@ -223,17 +239,21 @@ def classify_contact(status, railed, common_uv=0.0):
         return {"leads": leads, "ref": None,
                 "gnd": "red" if n and in_range * 2 > n else None}
     ref_off = (sum(1 for i in on if at_rail[i]) * 2 > len(on)
-               or common_uv >= REF_FLOAT_COMMON_UV)
+               or common_uv >= REF_FLOAT_COMMON_UV
+               or drift_uv_s >= REF_FLOAT_DRIFT_UV_S
+               or abs(shared_dc_uv) >= REF_FLOAT_DC_UV)
     return {"leads": leads, "ref": "red" if ref_off else "green", "gnd": "green"}
 
 
-def contact_from_signal(status, block, full_scale_uv):
+def contact_from_signal(status, block, full_scale_uv, fs=250):
     """classify_contact() from a recent DC-mode signal block.
 
-    block: (N samples x channels) µV, a fraction of a second is enough.
-    Works out which channels are at the rail and how large the signal shared
-    by the connected leads is (their mean after removing each channel's DC,
-    counted only when it is REF_FLOAT_COMMON_SHARE of their own signal).
+    block: (N samples x channels) µV; 0.25-0.5 s is enough. fs: its sample
+    rate. Works out which channels are at the rail, then, for the connected
+    leads averaged over MAINS_AVERAGE_S (so mains hum doesn't count): how
+    large and how fast-moving their shared signal is (counted only when it is
+    REF_FLOAT_COMMON_SHARE of their own signal), and the DC level they all
+    share (0 when their levels differ).
     """
     import numpy as np
 
@@ -242,14 +262,26 @@ def contact_from_signal(status, block, full_scale_uv):
               >= CONTACT_RAIL_FRACTION * full_scale_uv).tolist()
     on = [i for i, c in enumerate(status)
           if not c.get("p_off") and i < x.shape[1]]
-    common = 0.0
+    common = drift = shared_dc = 0.0
     if len(on) >= 2:
-        y = x[:, on] - x[:, on].mean(axis=0)
+        z = x[:, on]
+        k = int(round(MAINS_AVERAGE_S * fs))
+        if 1 < k < z.shape[0]:
+            c = np.vstack([np.zeros((1, z.shape[1])), np.cumsum(z, axis=0)])
+            z = (c[k:] - c[:-k]) / k
+        dc = z.mean(axis=0)
+        y = z - dc
         own = float(y.std(axis=0).mean())
-        shared = float(y.mean(axis=1).std())
-        if own > 0 and shared / own >= REF_FLOAT_COMMON_SHARE:
-            common = shared
-    return classify_contact(status, railed, common)
+        shared = y.mean(axis=1)
+        if own > 0 and float(shared.std()) / own >= REF_FLOAT_COMMON_SHARE:
+            common = float(shared.std())
+            if shared.size >= 3:
+                drift = abs(float(np.polyfit(np.arange(shared.size) / fs,
+                                             shared, 1)[0]))
+        level = float(np.median(dc))
+        if np.all(np.abs(dc - level) <= REF_FLOAT_DC_SPREAD * abs(level)):
+            shared_dc = level
+    return classify_contact(status, railed, common, drift, shared_dc)
 
 
 def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:
