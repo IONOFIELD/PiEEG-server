@@ -9,6 +9,8 @@
   BIO in turn. The findings changed the design (§7) and gave each lead a measured zero.
 - **Calibrated with resistors on a breadboard (§8):** each lead has its own scale factor.
   Worst error 1.2% from 1 kΩ to 50 kΩ; saved as source `bench`.
+- **REF impedance can't be measured on this board with a cap connected** (§8, REF test).
+  REF stays a contact verdict (green/red).
 - **Next:** the check goes into the Scope (phase 3) and fills the `AVG IMP —` box.
 
 ## 1. The hardware (read off the board)
@@ -79,7 +81,7 @@ fixed series resistance explains. The lead-to-lead differences are the test curr
   late read about once every 8 s when running alone, so 2 tries failed about one run in
   five on the bench.
 4. **REF pass (bench only, `--ref-pass`):** a single N source, `LOFF_SENSN = 0x01`.
-   Reported as a raw carrier, marked unverified (§7).
+   Reported as a raw carrier only. It doesn't measure REF once leads are connected (§8).
 5. **Restore DC lead-off in a `finally`** (`LOFF 0x00`, `SENSP/SENSN 0xFF`), but only if
    a register was switched. The Hampel filter is bypassed during the pass and then
    restored.
@@ -183,10 +185,36 @@ column; the lead in the same column). Unused leads stay unplugged; they aren't e
    all leads connected.
 6. **Readings repeat** within 0.05 µV run to run; noise 0.01–0.07 µV.
 
+**REF test** (same evening; leads on 10 kΩ, REF through 0, 10 or 20 kΩ; carriers are the
+median over connected channels; "all N" = `LOFF_SENSN 0xFF` via a scratch script):
+
+| Leads connected | REF | One N source | All 8 N sources |
+|---|---|---|---|
+| 5 (E4–E8) | 0 Ω | 2.1 µV | 5.6 µV |
+| 5 | 10 kΩ | 6.5 µV | 19.2 µV |
+| 5 | 20 kΩ | 10.6 µV | 32.8 µV |
+| 6 (+E1 at 0 Ω) | 20 kΩ | 4.9 µV | 22.6 µV |
+| 6 (+E1 at 10 kΩ) | 20 kΩ | 4.8 µV | 22.4 µV |
+| 8 | 20 kΩ | 2.9 µV | — |
+| 7 (E2 fell out) | 0 Ω | 3.3 µV | 3.3 µV |
+
+- With few leads connected, the reading follows REF in a straight line (13.6 µV per
+  10 kΩ with all sources on).
+- **Each connected lead takes most of that away** (30% for one more lead), while a lead's
+  own resistance barely matters (1%). The likely cause is that unplugged inputs sit at the
+  rail; not proven.
+- **With 7–8 leads connected it reads ~3 µV whether REF is 0 or 20 kΩ,** and one source
+  or all eight give the same value, so the signal isn't current through REF.
+- **Verdict:** REF impedance isn't measurable with a cap on. REF stays green/red. The tool
+  keeps its single-source REF pass as a bench curiosity; no REF points are recorded.
+- **Side effects seen:** REF on 20 kΩ pulled every lead's reading ~3% low (9.5–9.7 kΩ on
+  10 kΩ) and let in up to 1.3 mV of shared 60 Hz hum, which the DC classifier took for
+  "REF not connected". A REF that had fallen out was still rated connected while its
+  drift was only −13 mV (it reached −84 mV within 6 s). Both belong to phase 3 reliability.
+
 **Not tested yet:**
 
 - Above 50 kΩ (the red band; the parts on hand stop at ten 10 kΩ).
-- The REF experiment (REF through a resistor, `measure --ref-pass`).
 - 500 SPS (`PIEEG_CONFIG1=0x95`).
 - On a person with the gel cap: values in 1–20 kΩ, five repeats within ±10%, lifting an
   electrode turns its lead red.
@@ -236,7 +264,8 @@ this session); `fit` rebuilds the calibration from all of them.
 
 ## 11. Open questions
 
-1. Is REF impedance measurable on this board? (the REF experiment, not tested yet; §8)
+1. ~~Is REF impedance measurable on this board?~~ No, not with a cap connected (§8 REF
+   test). REF stays a contact verdict.
 2. ~~Is the ~33 µV built-in offset series resistance or a current difference?~~ Series
    resistance, ~5.4 kΩ on every input; the currents differ (§8).
 3. Does BIAS_STAT mean anything here? It read "connected" with nothing attached; it needs
@@ -246,6 +275,8 @@ this session); `fit` rebuilds the calibration from all of them.
 6. With the Scope open, the acquisition skips ~0.3% of samples, so a 2 s unbroken block
    succeeds only about one try in five. Phase 3 needs either a measurement that tolerates
    a missing sample or a check that pauses the viewer.
+7. The DC REF verdict gives false alarms on mains hum through a high-impedance REF and
+   misses a REF that has only just come out (slow drift). See §8 REF test.
 
 ## References
 

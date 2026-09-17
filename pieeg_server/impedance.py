@@ -11,8 +11,10 @@ WHAT THIS MEASURES
         reads V(P) - V(SRB1); the body potential cancels, so each channel
         carries its own lead's impedance.
       * REF pass (bench only, --ref-pass): current into ONE N input, meant to
-        flow through REF via the shared SRB1. Unverified on the PiEEG-8: it
-        read ~0.4 µV with GND in or out.
+        flow through REF via the shared SRB1. It does NOT measure REF on the
+        PiEEG-8 with a cap connected: with 7-8 leads connected it reads ~3 µV
+        whether REF is on 0 or 20 kΩ, and the same with 1 or 8 N sources
+        (breadboard, 2026-09-16). REF is a contact verdict only.
       * Before switching, the DC wiring is classified (hardware.contact_from_signal):
         GND (BIO) or REF missing withholds the values, because on the bench a
         missing GND still produced steady, plausible-looking kΩ readings.
@@ -306,8 +308,7 @@ def analyze(lead_block, fs, full_scale_uv, calibration, contact=None,
     GND out the bench still gave steady, plausible 9-12 kΩ values, and with
     REF out the connected leads rail. Leads the DC flags call off read off.
     ref_block: optional REF pass; its carrier is reported for bench work only
-    (on the PiEEG-8 it read ~0.4 µV with GND in or out, so it isn't a proven
-    REF measurement).
+    (on the PiEEG-8 it doesn't follow REF once the leads are connected).
     """
     lead_block = np.asarray(lead_block, dtype=float)
     rail = RAIL_FRACTION * full_scale_uv
