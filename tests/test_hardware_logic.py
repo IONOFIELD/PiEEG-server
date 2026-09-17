@@ -583,6 +583,30 @@ class TestContactFromSignal:
         block = np.random.default_rng(0).normal(0, 1500, (62, 8))
         assert contact_from_signal(self._status(), block, self.FS)["ref"] == "green"
 
+    def test_mains_hum_through_a_connected_ref_is_not_floating(self):
+        # REF through 20 kΩ on the bench: 1.3 mV p-p of 60 Hz on every channel.
+        import numpy as np
+        rng = np.random.default_rng(0)
+        for mains in (50, 60):
+            hum = 650 * np.sin(2 * np.pi * mains * self._t()) - 390
+            block = hum[:, None] + rng.normal(0, 3, (62, 8))
+            r = contact_from_signal(self._status(), block, self.FS)
+            assert r["ref"] == "green", mains
+
+    def test_ref_that_just_came_out_is_caught_by_its_drift(self):
+        # -13 mV and moving ~3 mV/s: not yet large or far from zero.
+        import numpy as np
+        rng = np.random.default_rng(0)
+        drift = -13000 - 3000 * self._t()
+        block = drift[:, None] + rng.normal(0, 3, (62, 8))
+        assert contact_from_signal(self._status(), block, self.FS)["ref"] == "red"
+
+    def test_different_electrode_offsets_are_not_a_floating_ref(self):
+        import numpy as np
+        offsets = np.array([-40, -25, -10, 5, 20, 35, 50, 60]) * 1000.0
+        block = offsets + np.random.default_rng(0).normal(0, 5, (62, 8))
+        assert contact_from_signal(self._status(), block, self.FS)["ref"] == "green"
+
     def test_railed_lead_and_loose_lead(self):
         import numpy as np
         block = np.random.default_rng(0).normal(0, 0.3, (62, 8))
