@@ -272,9 +272,9 @@ this session); `fit` rebuilds the calibration from all of them.
    the register read-back helper.
 4. Should connected clients be able to start a check? (phase 4)
 5. PiEEG-16 (two chips) is out of scope unless you move to that board.
-6. With the Scope open, the acquisition skips ~0.3% of samples, so a 2 s unbroken block
-   succeeds only about one try in five. Phase 3 needs either a measurement that tolerates
-   a missing sample or a check that pauses the viewer.
+6. ~~With the Scope open, the acquisition skips ~0.3% of samples.~~ Fixed: an 8-channel
+   PiEEG is now read by a separate realtime process (`drdy_reader.py`); 0 of 12,182 samples
+   lost in 50 s with the Scope open, against 257 with the old in-thread reader.
 7. The DC REF verdict gives false alarms on mains hum through a high-impedance REF and
    misses a REF that has only just come out (slow drift). See §8 REF test.
 
