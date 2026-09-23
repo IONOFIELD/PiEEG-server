@@ -383,7 +383,9 @@ class TestPerSampleFastPath:
         got = np.array([mf.apply_sample(list(row)) for row in x])
         sos = signal.butter(5, [1.0, 40.0], btype="band", fs=SAMPLE_RATE,
                             output="sos")
-        want = signal.sosfilt(sos, x, axis=0)
+        # both start at the steady state for the first sample
+        zi = signal.sosfilt_zi(sos)[:, :, None] * x[0]
+        want, _ = signal.sosfilt(sos, x, axis=0, zi=zi)
         assert np.allclose(got, want, atol=1e-9)
 
     def test_sample_and_block_share_state(self):
@@ -395,3 +397,23 @@ class TestPerSampleFastPath:
         mixed = [b.apply_sample(list(r)) for r in x[:300]]
         mixed += b.apply_block(x[300:].tolist())
         assert np.allclose(whole, np.array(mixed), atol=1e-9)
+
+
+def test_server_filters_do_not_ring_on_an_electrode_offset():
+    """A DC offset present from the first sample must not ring through the
+    bandpass or the notch (a zero initial state sees it as a step)."""
+    from pieeg_server.filters import (MultichannelNotchFilter,
+                                      _PyMultichannelFilter)
+    fs = 250
+    t = np.arange(0, 4, 1 / fs)
+    sig = 20 * np.sin(2 * np.pi * 10 * t)
+    offset = 30000.0
+    bp = _PyMultichannelFilter(num_channels=2, lowcut=1.0, highcut=40.0, fs=fs)
+    notch = MultichannelNotchFilter(num_channels=2, freq=60.0, fs=fs)
+    out = [notch.apply_sample(bp.apply_sample([offset + s, -offset + s]))
+           for s in sig]
+    assert np.abs(np.asarray(out)).max() < 25.0
+    # the notch alone keeps the offset (DC gain 1) and adds nothing
+    notch = MultichannelNotchFilter(num_channels=1, freq=60.0, fs=fs)
+    out = notch.apply_block([[offset + s] for s in sig])
+    assert np.abs(np.asarray(out)[:, 0] - offset).max() < 25.0
