@@ -106,6 +106,30 @@ def notes(journal):
                   key=lambda a: int(a["frame"]))
 
 
+def cal_breaks(uv, annotations, fs):
+    """Samples where the input switched to or from the calibration signal.
+
+    A calibration switch jumps every channel between its electrode offset
+    (tens of mV) and the chip's square wave. The "Calibration on/off" note
+    (type CAL) is saved just after the switch, so the jump is looked for
+    in the half second before the note (and a little after): the sample
+    where the summed step across channels is largest. Filtering the review
+    in pieces split there keeps that jump from ringing through the filters,
+    as the live view restarts its filters at each switch. Sorted, unique."""
+    n = uv.shape[0]
+    out = set()
+    for a in annotations:
+        if a.get("type") != "CAL":
+            continue
+        f = int(a["frame"])
+        lo, hi = max(1, f - int(0.5 * fs)), min(n, f + int(0.1 * fs))
+        if hi - lo < 2:
+            continue
+        step = np.abs(np.diff(uv[lo - 1:hi], axis=0)).sum(axis=1)
+        out.add(lo + int(np.argmax(step)))
+    return sorted(out)
+
+
 def add_note(journal, frame, text, kind, meta):
     """Add a note on sample `frame` (0-based journal index) and save the
     annotation file at once. Same fields as a note made while recording;

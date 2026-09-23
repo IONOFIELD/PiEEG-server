@@ -115,7 +115,7 @@ DEFAULT_NOTCH = "60 Hz"   # local mains (US grid)
 HFF_ORDER = 4
 # LFF roll-off: first order, like an analog RC coupling (time constant).
 LFF_ORDER = 1
-DEFAULT_SENS = 7          # microvolts per millimetre
+DEFAULT_SENS = 15         # microvolts per millimetre
 
 WINDOW_SECONDS = 10.0     # initial strip-chart length; the timebase sets it
 PX_PER_MM = 4.0           # fallback pixels per mm when the screen size is unknown
@@ -1182,16 +1182,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # REC: its own red-bordered black box; solid red while recording. Tap to
     # start the server's crash-safe recording, tap again to stop and export
     # the EDF+ into the recording's folder.
-    # Files: the recordings list (open one to review it, or delete it).
-    files_lbl = None
-    if recordings_dir is not None:
-        fbox = _chip(ewrap)
-        fbox.pack(side="left", padx=(0, 4), pady=1)
-        files_lbl = tk.Label(fbox, text="Files", bg=C["raised"], fg=C["text"],
-                             cursor="hand2", font=(_MONO, _fs(10), "bold"))
-        files_lbl.pack(padx=4, pady=2)
-        files_lbl.bind("<Button-1>", lambda e: _files_panel())
-
     rec_btn = None
     if record_control is not None:
         rec_box = tk.Frame(ewrap, bg=C["bg"], highlightthickness=1,
@@ -1274,7 +1264,45 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     # ---- full-width chart (no left column) -------------------------------- #
     canvas = tk.Canvas(root, bg=C["canvas_bg"], highlightthickness=0)
-    canvas.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
+    canvas.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
+
+    # ---- footer: always there, under the chart ---------------------------- #
+    #   [Files] [Live]                                   LIVE / REVIEW 09-23 15:30
+    # Files lists the recordings (open one to review it, or delete it); Live
+    # is lit while the chart is live and goes back to it from a review.
+    footer = tk.Frame(root, bg=C["surface"])
+    footer.pack(side="bottom", fill="x", padx=8, pady=(0, 6), before=canvas)
+
+    def _foot_btn(text, cb):
+        box = _chip(footer)
+        box.pack(side="left", padx=(0, 4), pady=1)
+        lbl = tk.Label(box, text=text, width=6, bg=C["raised"], fg=C["text"],
+                       cursor="hand2", font=(_MONO, _fs(10), "bold"))
+        lbl.pack(padx=2, pady=2)
+        lbl.bind("<Button-1>", lambda e: cb())
+        return box, lbl
+
+    if recordings_dir is not None:
+        _foot_btn("Files", lambda: _files_panel())
+    live_box, live_lbl = _foot_btn("Live", lambda: _exit_review())
+    mode_lbl = tk.Label(footer, text="", bg=C["surface"],
+                        font=(_MONO, _fs(10), "bold"))
+    mode_lbl.pack(side="right", padx=(0, 4))
+
+    def _mode_face():
+        if _rev["on"]:
+            sx = _rev["info"]
+            when = (sx["start"].strftime("%m-%d %H:%M") if sx["start"]
+                    else sx["session"])
+            mode_lbl.configure(text=f"REVIEW {when}", fg=C["accent_lt"])
+            live_box.configure(highlightbackground=C["border_hi"],
+                               highlightcolor=C["border_hi"], bg=C["raised"])
+            live_lbl.configure(bg=C["raised"], fg=C["text"])
+        else:
+            mode_lbl.configure(text="● LIVE", fg=C["green"])
+            live_box.configure(highlightbackground=C["accent"],
+                               highlightcolor=C["accent"], bg=C["accent"])
+            live_lbl.configure(bg=C["accent"], fg="#ffffff")
 
     # ---- review: a recording shown page by page ---------------------------- #
     # _rev["on"] while a recording from Files is open. The chart then shows
@@ -1284,9 +1312,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _rev = {"on": False, "info": None, "uv": None, "filt": None,
             "meta": None, "notes": [], "start": 0, "win": None, "gen": 0}
     rev_bar = tk.Frame(root, bg=C["surface"])
-    rev_title = tk.Label(rev_bar, text="", bg=C["surface"], fg=C["accent_lt"],
-                         font=(_MONO, _fs(10), "bold"))
-    rev_title.pack(side="left", padx=(0, 6))
     ttk.Button(rev_bar, text="◀", width=2,
                command=lambda: _rev_step(-1)).pack(side="left")
     ttk.Button(rev_bar, text="▶", width=2,
@@ -1305,9 +1330,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                              fg=C["text"], activebackground=C["accent"],
                              activeforeground="#ffffff", bd=0)
     rev_notes_mb["menu"] = rev_notes_menu
-    rev_notes_mb.pack(side="left", padx=(0, 4))
-    ttk.Button(rev_bar, text="Live", width=5,
-               command=lambda: _exit_review()).pack(side="left")
+    rev_notes_mb.pack(side="left")
+    _mode_face()
     # Right-click a lead to edit the montage (rename / hide / reorder …).
     # Button-3 is the right button on X11; Button-2 covers the middle/right
     # button on some trackpads.
@@ -2218,13 +2242,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     notes=review_store.notes(sx["journal"]))
         _rev_refilter()
         _rev_page()
-        when = (sx["start"].strftime("%m-%d %H:%M") if sx["start"]
-                else sx["session"])
-        rev_title.configure(text=f"REVIEW {when}")
+        _mode_face()
         _rev_notes_menu()
         if ann_bar is not None:
             ann_bar.place_forget()
-        rev_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 6),
+        # just above the footer (packed after it, from the bottom)
+        rev_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 4),
                      before=canvas)
         _overlay["marks"] = None
         _hint(f"{sx['session']} · {_mmss(sx['seconds'])} · double-click to "
@@ -2236,15 +2259,25 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _rev.update(on=False, info=None, uv=None, filt=None, meta=None,
                     notes=[])
         rev_bar.pack_forget()
+        _mode_face()
         _meas["box"], _meas["rows"] = None, []
         model.unfreeze()
         _sweep_reset()
         _overlay["marks"] = None
 
     def _rev_refilter():
-        f = StreamingFilter(model.nch, model.fs)
-        f.set_cutoffs(*model.cutoffs)
-        _rev["filt"] = f.process(_rev["uv"])
+        # in pieces split at each calibration switch, each with fresh
+        # filters primed to its own level (as live does at a switch)
+        uv = _rev["uv"]
+        cuts = [0] + review_store.cal_breaks(uv, _rev["notes"], model.fs) \
+            + [uv.shape[0]]
+        out = np.empty_like(uv)
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            if b > a:
+                f = StreamingFilter(model.nch, model.fs)
+                f.set_cutoffs(*model.cutoffs)
+                out[a:b] = f.process(uv[a:b])
+        _rev["filt"] = out
 
     def _rev_page():
         """Hold the page starting at _rev["start"] (clamped) on the chart.
@@ -2289,12 +2322,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                              "the EEG to add one",
                                        state="disabled")
         rev_notes_mb.configure(text=f"Notes {len(_rev['notes'])}")
-
-    def _rev_note_label(a):
-        kind = a.get("type")
-        if kind in {k for k, _ in NOTE_KINDS} | {"CAL"}:
-            return kind
-        return str(a.get("text", ""))[:12]
 
     def _rev_frame_at_x(x):
         """Recording sample under canvas x, or None past the recording end."""
@@ -2567,37 +2594,55 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _marks[:] = [m for m in _marks
                      if total - m["total"] < win - gap or m["future"]]
         shown = [m for m in _marks if total - m["total"] < win - gap]
-        sig = (W, H, win, tuple((m["total"], m["label"]) for m in shown))
+        sig = (W, H, win, tuple((m["total"], m["text"]) for m in shown))
         if sig == _overlay["marks"]:
             return
         _overlay["marks"] = sig
+        _draw_flags([(((m["total"] - 1) % win + 0.5) * W / win, m["text"])
+                     for m in shown], W, H)
+
+    def _draw_flags(flags, W, H):
+        """Notes on the EEG: a yellow line at each note's sample with its
+        text in a box at the top. A box that would run into the one before
+        drops a level (three levels, then back to the top)."""
         canvas.delete("marks")
-        for m in shown:
-            x = ((m["total"] - 1) % win + 0.5) * W / win
-            canvas.create_line(x, 0, x, H, fill=C["yellow"], dash=(4, 3),
-                               tags="marks")
-            canvas.create_text(x + 3, 3, text=m["label"], anchor="nw",
-                               fill=C["yellow"], font=(_MONO, _fs(9), "bold"),
-                               tags="marks")
+        font = (_MONO, _fs(9), "bold")
+        ends = []                           # right edge of the last box per level
+        for x, text in sorted(flags):
+            text = str(text)
+            if len(text) > 28:
+                text = text[:27] + "…"
+            canvas.create_line(x, 0, x, H, fill=C["yellow"], tags="marks")
+            level = next((k for k, e in enumerate(ends) if x > e + 4),
+                         len(ends) if len(ends) < 3 else 0)
+            y = 3 + level * 18
+            right = x + 4 < W - 60          # label right of the line if room
+            tid = canvas.create_text(x + 5 if right else x - 5, y + 2,
+                                     text=text, anchor="nw" if right else "ne",
+                                     fill=C["yellow"], font=font, tags="marks")
+            bx0, by0, bx1, by1 = canvas.bbox(tid)
+            bg = canvas.create_rectangle(bx0 - 3, by0 - 2, bx1 + 3, by1 + 2,
+                                         fill=C["canvas_bg"],
+                                         outline=C["yellow"], tags="marks")
+            canvas.tag_lower(bg, tid)
+            if level < len(ends):
+                ends[level] = max(ends[level], bx1 + 3)
+            else:
+                ends.append(bx1 + 3)
+        canvas.tag_raise("marks")
+        canvas.tag_raise("toast")
 
     def _draw_review_marks(W, H):
         s, win = _rev["start"], model.win
         m = model.frozen["filled"]
         shown = [a for a in _rev["notes"] if s <= a["frame"] < s + m]
         sig = ("rev", W, H, win, s,
-               tuple((a.get("id"), a["frame"], _rev_note_label(a))
-                     for a in shown))
+               tuple((a.get("id"), a["frame"], a.get("text")) for a in shown))
         if sig == _overlay["marks"]:
             return
         _overlay["marks"] = sig
-        canvas.delete("marks")
-        for a in shown:
-            x = (a["frame"] - s + 0.5) * W / win
-            canvas.create_line(x, 0, x, H, fill=C["yellow"], dash=(4, 3),
-                               tags="marks")
-            canvas.create_text(x + 3, 3, text=_rev_note_label(a), anchor="nw",
-                               fill=C["yellow"], font=(_MONO, _fs(9), "bold"),
-                               tags="marks")
+        _draw_flags([((a["frame"] - s + 0.5) * W / win, a.get("text", ""))
+                     for a in shown], W, H)
 
     def _draw_static(rows, W, H, row_h, half, sens, box_w, box_x):
         sig = (W, H, sens, model.win, tuple((r["pair"], model.epair_name(r["pair"]),
@@ -2653,6 +2698,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                            fill=C["axis"], font=(_MONO, _fs(8)), tags="deco")
         canvas.create_text(x0 + cal_s + 4, y0, text="1 s", anchor="w",
                            fill=C["axis"], font=(_MONO, _fs(8)), tags="deco")
+        canvas.tag_raise("marks")           # notes stay over the lead boxes
 
     def _draw_dots():
         # contact dots flanking the electrode pair: left = upper electrode,

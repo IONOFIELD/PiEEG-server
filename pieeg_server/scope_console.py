@@ -268,6 +268,13 @@ SCOPE_CHANGELOG = [
             "of a recording, where it adds \"Calibration on/off\" notes. Each "
             "switch drops ~40 ms of samples. Live traces are grey-blue, and "
             "strong blue while recording."),
+    ("4.5", "Notes show on the EEG as flags: a yellow line with the note's "
+            "full text boxed at the top (live and in review; neighbours step "
+            "down so they don't overlap). A footer under the chart holds "
+            "Files and Live (lit while live) and says LIVE or REVIEW; a "
+            "review's scroll bar sits just above it. Review restarts its "
+            "filters at each calibration switch, so the jump back to the "
+            "electrodes doesn't ring. Sensitivity starts at 15 µV/mm."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
