@@ -58,6 +58,7 @@ from scipy import signal
 
 from .hardware import GND_OFF_MAINS_UV, VREF_UV, contact_from_signal
 from .impedance import band as impedance_band, format_ohms
+from . import review as review_store
 
 # ── electrode map: chip input (E1..) -> scalp label ──────────────────────────
 # The PiEEG chip streams its inputs in order, and we call them E1, E2, E3 …
@@ -945,7 +946,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                connect_popup=None, contact_source=None,
                record_control=None, full_scale_uv=VREF_UV / 24,
                impedance_control=None, stop_event=None,
-               annotate_control=None):
+               annotate_control=None, recordings_dir=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -967,6 +968,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     given, an Ω button beside AVG IMP runs the electrode impedance check; the
     Future's result is ImpedanceResult.to_dict(). Results show in a panel over
     the traces (tap it to close) and AVG IMP averages the visible montage.
+    recordings_dir: optional folder of recordings. When given, a Files
+    button lists them (open / delete); an opened recording is shown page by
+    page in the chart, with the same montage, filters, speed and
+    sensitivity, and a double-click adds a note to its annotation file.
     connect_popup: optional dict {"ip", "port", "mode", "targets"} for the
     "connect to…" info popup; "targets" lists every reachable
     (mode, ip), primary first. When given, a small always-on-top window is raised over
@@ -1153,6 +1158,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # REC: its own red-bordered black box; solid red while recording. Tap to
     # start the server's crash-safe recording, tap again to stop and export
     # the EDF+ into the recording's folder.
+    # Files: the recordings list (open one to review it, or delete it).
+    files_lbl = None
+    if recordings_dir is not None:
+        fbox = _chip(ewrap)
+        fbox.pack(side="left", padx=(0, 4), pady=1)
+        files_lbl = tk.Label(fbox, text="Files", bg=C["raised"], fg=C["text"],
+                             cursor="hand2", font=(_MONO, _fs(10), "bold"))
+        files_lbl.pack(padx=4, pady=2)
+        files_lbl.bind("<Button-1>", lambda e: _files_panel())
+
     rec_btn = None
     if record_control is not None:
         rec_box = tk.Frame(ewrap, bg=C["bg"], highlightthickness=1,
@@ -1236,6 +1251,39 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # ---- full-width chart (no left column) -------------------------------- #
     canvas = tk.Canvas(root, bg=C["canvas_bg"], highlightthickness=0)
     canvas.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 8))
+
+    # ---- review: a recording shown page by page ---------------------------- #
+    # _rev["on"] while a recording from Files is open. The chart then shows
+    # a held page of it (model.frozen, built by _rev_page) instead of the live
+    # sweep; acquisition, the stream and REC carry on underneath. The bar
+    # under the chart pages through it and goes back to live.
+    _rev = {"on": False, "info": None, "uv": None, "filt": None,
+            "meta": None, "notes": [], "start": 0, "win": None, "gen": 0}
+    rev_bar = tk.Frame(root, bg=C["surface"])
+    rev_title = tk.Label(rev_bar, text="", bg=C["surface"], fg=C["accent_lt"],
+                         font=(_MONO, _fs(10), "bold"))
+    rev_title.pack(side="left", padx=(0, 6))
+    ttk.Button(rev_bar, text="◀", width=2,
+               command=lambda: _rev_step(-1)).pack(side="left")
+    ttk.Button(rev_bar, text="▶", width=2,
+               command=lambda: _rev_step(1)).pack(side="left", padx=(2, 6))
+    rev_pos = tk.DoubleVar(value=0.0)
+    rev_scale = ttk.Scale(rev_bar, from_=0, to=1, variable=rev_pos,
+                          orient="horizontal",
+                          command=lambda v: _rev_goto(int(float(v))))
+    rev_scale.pack(side="left", fill="x", expand=True)
+    rev_time = tk.Label(rev_bar, text="", width=18, bg=C["surface"],
+                        fg=C["text"], font=(_MONO, _fs(9)))
+    rev_time.pack(side="left", padx=4)
+    rev_notes_mb = ttk.Menubutton(rev_bar, text="Notes", width=7,
+                                  style="Bar.TMenubutton")
+    rev_notes_menu = tk.Menu(rev_notes_mb, tearoff=0, bg=C["raised"],
+                             fg=C["text"], activebackground=C["accent"],
+                             activeforeground="#ffffff", bd=0)
+    rev_notes_mb["menu"] = rev_notes_menu
+    rev_notes_mb.pack(side="left", padx=(0, 4))
+    ttk.Button(rev_bar, text="Live", width=5,
+               command=lambda: _exit_review()).pack(side="left")
     # Right-click a lead to edit the montage (rename / hide / reorder …).
     # Button-3 is the right button on X11; Button-2 covers the middle/right
     # button on some trackpads.
@@ -1365,10 +1413,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return
         if ann_bar is not None:
             shown = bool(ann_bar.winfo_manager())
-            if st.get("recording") and not shown:
+            if st.get("recording") and not shown and not _rev["on"]:
                 # left of the stream readout in the chart's bottom-right
                 ann_bar.place(relx=1.0, rely=1.0, x=-96, y=-3, anchor="se")
-            elif not st.get("recording") and shown:
+            elif (not st.get("recording") or _rev["on"]) and shown:
                 ann_bar.place_forget()
         if _rec["future"] is not None:
             _rec_face("saving…" if st.get("recording") else "starting…",
@@ -1547,7 +1595,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _close_impedance_panel(evt)
             return
         _meas["start"] = (evt.x, evt.y)
-        if model.frozen is None:
+        if model.frozen is None and not _rev["on"]:
             model.freeze()
 
     def _meas_drag(evt):
@@ -1565,7 +1613,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _meas["start"] = None
         if abs(evt.x - x0) < _TAP_PX and abs(evt.y - y0) < _TAP_PX:
             _meas["box"], _meas["rows"] = None, []      # tap: resume
-            model.unfreeze()
+            if not _rev["on"]:
+                model.unfreeze()
         else:
             _meas_drag(evt)
 
@@ -1576,7 +1625,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _draw_measure(W, H):
         if _meas["box"] is None:
-            if model.frozen is not None:        # pressed, not yet dragged
+            if model.frozen is not None and not _rev["on"]:  # pressed
                 canvas.create_text(W / 2, H - 10, anchor="s",
                                    text="HOLD · drag a box · tap to resume",
                                    fill=C["yellow"], font=(_MONO, _fs(9)),
@@ -1595,7 +1644,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                          f"{m['pp']:6.1f} µVpp  "
                          f"{m['max']:+6.1f}/{m['min']:+6.1f}  "
                          f"{hz:>8}  {m['seconds']:.2f} s")
-        lines.append("tap to resume")
+        lines.append("tap to clear" if _rev["on"] else "tap to resume")
         # readout above the box, or below it if there is no room
         top = min(y0, y1)
         ytxt = top - 6 if top > 16 * len(lines) + 12 else max(y0, y1) + 6
@@ -1816,6 +1865,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         return total if total - c >= win - gap else c
 
     def _note_box(evt):
+        if _rev["on"]:
+            _rev_note_box(evt)
+            return
         if annotate_control is None:
             return
         try:
@@ -1828,12 +1880,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return
         at = _sample_at_x(evt.x)
         ago = (model.total - at) / model.fs
-        win, body = _popup("Note" if ago < 0.5 else f"Note  −{ago:.1f} s")
 
         def put(short, text, kind):
             _annotate(short, text, kind, total=at)
             _close_popup()
+        _note_form("Note" if ago < 0.5 else f"Note  −{ago:.1f} s", put, evt)
 
+    def _note_form(title, put, evt):
+        """The note popup: EC / EO / MVMT, or typed text. put(short, text,
+        kind) saves the choice."""
+        win, body = _popup(title)
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(2, 4))
         for short, text in NOTE_KINDS:
@@ -1860,6 +1916,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         hff = dict(HFF_CHOICES)[hff_var.get()]
         notch = dict(NOTCH_CHOICES)[notch_var.get()]
         model.set_filters(lff, hff, notch)
+        if _rev["on"]:
+            _rev_refilter()
+            _rev_page()
 
     def _filters_changed():
         model.set_montage_filters(lff_var.get(), hff_var.get(),
@@ -1876,6 +1935,350 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _apply_filters()
 
     _apply_filters()
+
+    # ---- Files: recordings list, review, notes ----------------------------- #
+    def _mmss(sec):
+        sec = max(0, int(sec))
+        return (f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}"
+                if sec >= 3600 else f"{sec // 60:02d}:{sec % 60:02d}")
+
+    def _active_session():
+        if record_control is None:
+            return None
+        try:
+            return record_control["status"]().get("session")
+        except Exception:                   # noqa: BLE001 - display only
+            return None
+
+    # EDF+ rebuilds after a note is added or removed run on one worker
+    # thread, so the window never waits on them; each rebuild reads the
+    # notes file as it is then, so quick edits coalesce into one.
+    _exp = {"pending": [], "current": None, "lock": threading.Lock(),
+            "msgs": deque()}
+
+    def _export_worker():
+        while True:
+            with _exp["lock"]:
+                if not _exp["pending"]:
+                    _exp["current"] = None
+                    return
+                journal = _exp["current"] = _exp["pending"].pop(0)
+            try:
+                edf = review_store.rebuild_exports(journal)
+                _exp["msgs"].append(
+                    (True, f"EDF+ updated · {edf.name}" if edf
+                     else "notes saved"))
+            except Exception as e:          # noqa: BLE001 - report, don't crash
+                _exp["msgs"].append((False, f"EDF+ not updated: {e}"))
+
+    def _schedule_export(journal):
+        with _exp["lock"]:
+            if journal not in _exp["pending"]:
+                _exp["pending"].append(journal)
+            if _exp["current"] is not None:
+                return                      # the running worker picks it up
+            _exp["current"] = journal
+        # not a daemon: closing the window lets a rebuild finish
+        threading.Thread(target=_export_worker, name="edf-rebuild").start()
+
+    def _export_busy(journal):
+        with _exp["lock"]:
+            return journal == _exp["current"] or journal in _exp["pending"]
+
+    def _poll_exports():
+        while _exp["msgs"]:
+            ok, text = _exp["msgs"].popleft()
+            _hint(text, seconds=5, fg=C["green"] if ok else C["red"])
+
+    def _files_panel():
+        win, body = _popup("Recordings")
+        sessions = []
+        box = tk.Frame(body, bg=C["raised"])
+        box.pack(fill="both", expand=True, pady=(4, 4))
+        lb = tk.Listbox(box, width=44, height=7, bg=C["surface"],
+                        fg=C["text"], selectbackground=C["accent"],
+                        selectforeground="#ffffff", highlightthickness=0,
+                        relief="flat", activestyle="none",
+                        font=(_MONO, _fs(10)))
+        sb = tk.Scrollbar(box, orient="vertical", command=lb.yview, width=18,
+                          bg=C["raised"], troughcolor=C["surface"],
+                          relief="flat", bd=0)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side="left", fill="both", expand=True)
+        sb.pack(side="left", fill="y")
+        # two lines always, so the box never changes size under a finger
+        info = tk.Label(body, text="", anchor="nw", justify="left", height=2,
+                        bg=C["raised"], fg=C["text_sec"], wraplength=400,
+                        font=(_MONO, _fs(9)))
+        info.pack(fill="x")
+        btns = tk.Frame(body, bg=C["raised"])
+        btns.pack(fill="x", pady=(4, 0))
+        del_btn = ttk.Button(btns, text="Delete", width=18)
+        del_btn.pack(side="left")
+        ttk.Button(btns, text="Open", width=8,
+                   command=lambda: open_sel()).pack(side="right")
+        armed = {"session": None, "after": None}
+
+        def fill():
+            sessions[:] = review_store.list_sessions(recordings_dir)
+            active = _active_session()
+            lb.delete(0, "end")
+            for sx in sessions:
+                when = (sx["start"].strftime("%m-%d %H:%M:%S") if sx["start"]
+                        else sx["session"])
+                n = sx["notes"]
+                tag = ("  ● REC" if sx["session"] == active
+                       else f"  {n} note{'' if n == 1 else 's'}")
+                lb.insert("end", f"{when}  {_mmss(sx['seconds']):>7}{tag}")
+            if not sessions:
+                info.configure(text=f"no recordings in {recordings_dir}",
+                               fg=C["text_sec"])
+            else:
+                info.configure(text=f"{len(sessions)} in {recordings_dir}",
+                               fg=C["text_sec"])
+            disarm()
+
+        def selected():
+            cur = lb.curselection()
+            return sessions[cur[0]] if cur else None
+
+        def on_select(_e=None):
+            sx = selected()
+            if sx is not None:
+                info.configure(
+                    text=f"{sx['session']} · {sx['bytes'] / 1e6:.1f} MB · "
+                         f"{sx['nch']} ch {sx['fs']:.0f} SPS",
+                    fg=C["text_sec"])
+            disarm()
+
+        def disarm():
+            if armed["after"] is not None:
+                root.after_cancel(armed["after"])
+            armed.update(session=None, after=None)
+            if del_btn.winfo_exists():
+                del_btn.configure(text="Delete")
+
+        def open_sel():
+            sx = selected()
+            if sx is None:
+                return
+            if sx["session"] == _active_session():
+                info.configure(text="still recording: stop it first",
+                               fg=C["yellow"])
+                return
+            _close_popup()
+            _enter_review(sx)
+
+        def delete_sel():
+            sx = selected()
+            if sx is None:
+                return
+            if sx["session"] == _active_session():
+                info.configure(text="still recording: stop it first",
+                               fg=C["yellow"])
+                return
+            if _export_busy(sx["journal"]):
+                info.configure(text="its EDF+ is still updating: try again "
+                                    "in a moment", fg=C["yellow"])
+                return
+            if armed["session"] != sx["session"]:
+                # first tap arms; a second tap within 5 s deletes
+                disarm()
+                armed["session"] = sx["session"]
+                armed["after"] = root.after(5000, disarm)
+                del_btn.configure(text="Tap again to delete")
+                info.configure(
+                    text=f"Delete {sx['session']}?\nEDF+, notes and raw "
+                         f"files, {sx['bytes'] / 1e6:.1f} MB — permanent",
+                    fg=C["red"])
+                return
+            if _rev["on"] and _rev["info"]["journal"] == sx["journal"]:
+                _exit_review()
+            try:
+                review_store.delete_session(sx["journal"], recordings_dir)
+            except Exception as e:          # noqa: BLE001 - report, don't crash
+                info.configure(text=f"not deleted: {e}", fg=C["red"])
+                disarm()
+                return
+            fill()
+            info.configure(text=f"deleted {sx['session']}", fg=C["green"])
+
+        del_btn.configure(command=delete_sel)
+        lb.bind("<<ListboxSelect>>", on_select)
+        lb.bind("<Double-Button-1>", lambda e: open_sel())
+        fill()
+        if sessions:
+            lb.selection_set(0)
+            on_select()
+        # centred over the chart
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        at = type("At", (), {})()
+        at.x_root = canvas.winfo_rootx() + (canvas.winfo_width() - w) // 2
+        at.y_root = canvas.winfo_rooty() + max(0, (canvas.winfo_height()
+                                                   - h) // 2)
+        _show_popup(win, at, focus=lb)
+
+    def _enter_review(sx):
+        try:
+            uv, meta = review_store.load(sx["journal"])
+        except Exception as e:              # noqa: BLE001 - report, don't crash
+            _hint(f"can't open {sx['session']}: {e}", seconds=8, fg=C["red"])
+            return
+        if uv.shape[1] != model.nch or float(meta["sample_rate"]) != model.fs:
+            _hint(f"{sx['session']}: {uv.shape[1]} ch at "
+                  f"{meta['sample_rate']} SPS — the Scope shows {model.nch} "
+                  f"at {model.fs:g}", seconds=8, fg=C["red"])
+            return
+        if uv.shape[0] < 2:
+            _hint(f"{sx['session']} has no samples", fg=C["yellow"])
+            return
+        _meas["box"], _meas["rows"] = None, []
+        _rev.update(on=True, info=sx, uv=uv, meta=meta, start=0,
+                    notes=review_store.notes(sx["journal"]))
+        _rev_refilter()
+        _rev_page()
+        when = (sx["start"].strftime("%m-%d %H:%M") if sx["start"]
+                else sx["session"])
+        rev_title.configure(text=f"REVIEW {when}")
+        _rev_notes_menu()
+        if ann_bar is not None:
+            ann_bar.place_forget()
+        rev_bar.pack(side="bottom", fill="x", padx=8, pady=(0, 6),
+                     before=canvas)
+        _overlay["marks"] = None
+        _hint(f"{sx['session']} · {_mmss(sx['seconds'])} · double-click to "
+              f"add a note", seconds=6)
+
+    def _exit_review():
+        if not _rev["on"]:
+            return
+        _rev.update(on=False, info=None, uv=None, filt=None, meta=None,
+                    notes=[])
+        rev_bar.pack_forget()
+        _meas["box"], _meas["rows"] = None, []
+        model.unfreeze()
+        _sweep_reset()
+        _overlay["marks"] = None
+
+    def _rev_refilter():
+        f = StreamingFilter(model.nch, model.fs)
+        f.set_cutoffs(*model.cutoffs)
+        _rev["filt"] = f.process(_rev["uv"])
+
+    def _rev_page():
+        """Hold the page starting at _rev["start"] (clamped) on the chart.
+        The page's samples sit at the end of the held window with the sweep
+        head just past them, so the view draws them from the left edge."""
+        uv, win = _rev["uv"], model.win
+        n = uv.shape[0]
+        start = min(max(0, int(_rev["start"])), max(0, n - win))
+        m = min(win, n - start)
+        raw = np.zeros((win, model.nch))
+        filt = np.zeros((win, model.nch))
+        raw[win - m:] = uv[start:start + m]
+        filt[win - m:] = _rev["filt"][start:start + m]
+        model.frozen = {"raw": raw, "filt": filt, "head": m % win,
+                        "filled": m, "total": start + m}
+        _rev.update(start=start, win=win, gen=_rev["gen"] + 1)
+        rev_scale.configure(to=max(1, n - win))
+        rev_pos.set(start)
+        fs = model.fs
+        rev_time.configure(text=f"{_mmss(start / fs)}–{_mmss((start + m) / fs)}"
+                                f" /{_mmss(n / fs)}")
+
+    def _rev_goto(start):
+        if _rev["on"] and int(start) != _rev["start"]:
+            _rev["start"] = int(start)
+            _rev_page()
+
+    def _rev_step(k):
+        if _rev["on"]:
+            _rev_goto(_rev["start"] + k * model.win)
+
+    def _rev_notes_menu():
+        rev_notes_menu.delete(0, "end")
+        fs = model.fs
+        for a in _rev["notes"]:
+            rev_notes_menu.add_command(
+                label=f"{_mmss(a['frame'] / fs)}  {a.get('text', '')}",
+                command=lambda f=int(a["frame"]): _rev_goto(
+                    max(0, f - model.win // 2)))
+        if not _rev["notes"]:
+            rev_notes_menu.add_command(label="no notes yet · double-click "
+                                             "the EEG to add one",
+                                       state="disabled")
+        rev_notes_mb.configure(text=f"Notes {len(_rev['notes'])}")
+
+    def _rev_note_label(a):
+        kind = a.get("type")
+        if kind in {k for k, _ in NOTE_KINDS}:
+            return kind
+        return str(a.get("text", ""))[:12]
+
+    def _rev_frame_at_x(x):
+        """Recording sample under canvas x, or None past the recording end."""
+        W = max(1, canvas.winfo_width())
+        pos = int(x / W * model.win)
+        if not 0 <= pos < model.frozen["filled"]:
+            return None
+        return _rev["start"] + pos
+
+    def _rev_note_box(evt):
+        W = max(1, canvas.winfo_width())
+        px = W / model.win
+        near = [a for a in _rev["notes"]
+                if abs((a["frame"] - _rev["start"] + 0.5) * px - evt.x) <= 8]
+        journal = _rev["info"]["journal"]
+        if near:
+            a = min(near, key=lambda a: abs(
+                (a["frame"] - _rev["start"] + 0.5) * px - evt.x))
+            win, body = _popup(f"Note  {_mmss(a['frame'] / model.fs)}")
+            tk.Label(body, text=a.get("text", ""), bg=C["raised"],
+                     fg=C["text"], wraplength=220, justify="left",
+                     font=(_MONO, _fs(10))).pack(anchor="w", pady=(2, 6))
+
+            def remove():
+                _close_popup()
+                try:
+                    review_store.remove_note(journal, a.get("id"))
+                except Exception as e:      # noqa: BLE001
+                    _hint(f"note not removed: {e}", seconds=8, fg=C["red"])
+                    return
+                _rev_notes_changed(journal)
+                _hint(f"removed {a.get('text', '')} · updating EDF+…",
+                      fg=C["yellow"])
+            ttk.Button(body, text="Remove note", command=remove).pack(
+                anchor="e")
+            _show_popup(win, evt)
+            return
+        frame = _rev_frame_at_x(evt.x)
+        if frame is None:
+            return
+
+        def put(short, text, kind):
+            _close_popup()
+            try:
+                review_store.add_note(journal, frame, text, kind,
+                                      _rev["meta"])
+            except Exception as e:          # noqa: BLE001
+                _hint(f"{text} not saved: {e}", seconds=8, fg=C["red"])
+                return
+            _rev_notes_changed(journal)
+            _hint(f"{text} at {_mmss(frame / model.fs)} · updating EDF+…",
+                  fg=C["yellow"])
+        _note_form(f"Note  {_mmss(frame / model.fs)}", put, evt)
+
+    def _rev_notes_changed(journal):
+        if _rev["on"] and _rev["info"]["journal"] == journal:
+            _rev["notes"] = review_store.notes(journal)
+            _rev_notes_menu()
+            _overlay["marks"] = None
+        _schedule_export(journal)
+
+    for _key, _k in (("<Left>", -1), ("<Right>", 1), ("<Prior>", -1),
+                     ("<Next>", 1)):
+        root.bind(_key, lambda e, k=_k: _rev_step(k))
 
     # ---- draw loop -------------------------------------------------------- #
     def _drain_queue():
@@ -1961,7 +2364,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ncol = max(1, min(W, model.win))
         vfilt, head, _ = model.view()
         sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
-               id(model.frozen), model.win)
+               id(model.frozen), model.win, _rev["on"] and _rev["gen"])
+        if _rev["on"]:
+            if sig != _sw["sig"]:
+                _sweep_reset()
+                _sw["sig"] = sig
+                _review_draw(rows, W, row_h, half, sens, ncol, vfilt, head)
+            return
         if sig != _sw["sig"]:
             _sweep_reset()
             _sw["sig"] = sig
@@ -2035,6 +2444,23 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             for rid in rects:
                 canvas.tag_raise(rid, "sweep")
 
+    def _review_draw(rows, W, row_h, half, sens, ncol, vfilt, head):
+        # whole columns only: a column part-past the recording's end would
+        # take in the zeros that pad the held window
+        used = model.frozen["filled"] * ncol // model.win
+        if used < 2:
+            return
+        xs = np.repeat((np.arange(used) + 0.5) * W / ncol, 2)
+        for k, r in enumerate(rows):
+            vals, _ = sweep_envelope(model.derivation(r["pair"], vfilt),
+                                     head, ncol)
+            y = trace_y(vals[:2 * used], k * row_h + row_h / 2.0, sens,
+                        _px_mm["y"], half)
+            co = np.empty(2 * xs.size)
+            co[0::2], co[1::2] = xs, y
+            canvas.tag_lower(canvas.create_line(*co.tolist(), fill=C["curve"],
+                                                width=1, tags="sweep"))
+
     # ---- static chart layer ------------------------------------------------ #
     # Row lines, label boxes, labels and the calibration marker only change
     # with the layout, so they stay on the canvas (tag "deco") and are rebuilt
@@ -2044,6 +2470,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _overlay = {"toast": None, "stream": None, "marks": None}
 
     def _draw_marks(W, H):
+        if _rev["on"]:
+            _draw_review_marks(W, H)
+            return
         # Sample c (1 = first) sits at sweep position (c - 1) % win; drop a
         # mark once the sweep's erase gap reaches it a lap later.
         win = model.win
@@ -2063,6 +2492,25 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             canvas.create_line(x, 0, x, H, fill=C["yellow"], dash=(4, 3),
                                tags="marks")
             canvas.create_text(x + 3, 3, text=m["label"], anchor="nw",
+                               fill=C["yellow"], font=(_MONO, _fs(9), "bold"),
+                               tags="marks")
+
+    def _draw_review_marks(W, H):
+        s, win = _rev["start"], model.win
+        m = model.frozen["filled"]
+        shown = [a for a in _rev["notes"] if s <= a["frame"] < s + m]
+        sig = ("rev", W, H, win, s,
+               tuple((a.get("id"), a["frame"], _rev_note_label(a))
+                     for a in shown))
+        if sig == _overlay["marks"]:
+            return
+        _overlay["marks"] = sig
+        canvas.delete("marks")
+        for a in shown:
+            x = (a["frame"] - s + 0.5) * W / win
+            canvas.create_line(x, 0, x, H, fill=C["yellow"], dash=(4, 3),
+                               tags="marks")
+            canvas.create_text(x + 3, 3, text=_rev_note_label(a), anchor="nw",
                                fill=C["yellow"], font=(_MONO, _fs(9), "bold"),
                                tags="marks")
 
@@ -2150,6 +2598,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _poll_contact()
         _poll_record()
         _poll_marks()
+        _poll_exports()
         if impedance_control is not None:
             _poll_impedance()
         _rate["n"] += got
@@ -2175,6 +2624,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _deco["sig"], _deco["dot_sig"], _deco["dots"] = None, None, []
         if W > 2 and H > 2 and n > 0:
             _apply_timebase(W)
+            if _rev["on"] and (model.frozen is None
+                               or _rev["win"] != model.win):
+                _rev_page()                         # new speed: re-page
             sens = float(sens_var.get())            # uV per mm
             row_h = H / n
             half = row_h * 0.45
@@ -2220,8 +2672,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _stream["text"] = f"{_rate['sps']:.0f} sps"
         _stream["fg"] = (C["green"] if got > 0
                          else C["yellow"] if model.filled > 0 else C["red"])
-        sig = ((_stream["text"], _stream["fg"], W, H) if W > 2 and H > 2
-               else None)
+        # (reviewing: the bar under the chart says where you are instead)
+        sig = ((_stream["text"], _stream["fg"], W, H)
+               if W > 2 and H > 2 and not _rev["on"] else None)
         if sig != _overlay["stream"]:
             _overlay["stream"] = sig
             canvas.delete("stream")
@@ -2492,7 +2945,8 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
         recording = bool(rec.get("recording"))
         return {"recording": recording,
                 "elapsed": time.time() - started if recording and started
-                else None}
+                else None,
+                "session": rec.get("session") if recording else None}
 
     if contact:
         viewer_kwargs["contact_source"] = lambda: state["leadoff"]

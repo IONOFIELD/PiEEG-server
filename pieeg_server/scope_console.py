@@ -253,6 +253,15 @@ SCOPE_CHANGELOG = [
             "once to <session>/<session>.annotations.json (and into the EDF+). "
             "REC moved right into its own red box, solid red while recording; "
             "the Ω box is smaller and µV/mm has room for 100."),
+    ("4.3", "Files: the recordings on the USB drive, newest first. Open one to "
+            "review it page by page in the chart (◀ ▶, the slider, the Notes "
+            "list or the arrow keys; montage, filters, mm/s and µV/mm all "
+            "apply, and the measure box works); Live goes back. Double-click "
+            "to add a note (EC, EO, MVMT or text) or on a note to remove it: "
+            "the recording's <session>.annotations.json is updated at once "
+            "and its EDF+ and summary rebuilt with the notes. Delete removes "
+            "a recording for good after a second tap; the one recording now "
+            "is locked."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -734,7 +743,10 @@ def main(argv=None):
         started = server._record_start_time
         return {"recording": recording, "started": started,
                 "elapsed": (time.time() - started) if recording and started
-                else None}
+                else None,
+                # the session being written: the review screen won't open
+                # or delete it
+                "session": server._last_session if recording else None}
 
     async def _toggle_record():
         status = _record_status()
@@ -820,6 +832,7 @@ def main(argv=None):
                             "targets": targets, "version": SCOPE_VERSION,
                             "changelog": SCOPE_CHANGELOG},
              full_scale_uv=VREF_UV / (acq.pga_gain or 24),
+             recordings_dir=str(args.recordings_dir),
              auto_close_ms=(int(args.seconds * 1000) if args.seconds else None)),
         leadoff=_contact_source(hw),
         record_status=_record_status,
