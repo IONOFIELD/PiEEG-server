@@ -16,6 +16,8 @@ import threading
 import time
 
 from . import drdy_reader
+from .decimate import Decimator
+from .hardware import VREF_UV
 from .spike_filter import HampelFilter
 
 logger = logging.getLogger("pieeg.acquisition")
@@ -75,6 +77,8 @@ class AcquisitionLoop:
         self._reader_announced = False
         self._nominal_ns = 1_000_000_000 / SAMPLE_RATE
         self._prev_edge_ns = None
+        # Oversampling (hw.oversample > 1): chip samples in, decimated out.
+        self._decimator: Decimator | None = None
         # Device-agnostic Hampel spike filter (runs in acquisition thread)
         self._hampel = HampelFilter(num_channels=hardware.num_channels)
         # Default both spike filters to OFF (user can enable via dashboard)
@@ -96,6 +100,14 @@ class AcquisitionLoop:
         gain actually programmed on the chip, never a hard-coded guess.
         """
         return getattr(self._hw, "pga_gain", None)
+
+    @property
+    def prefilter(self) -> str | None:
+        """What the samples went through before they were handed on, for
+        recording headers: the decimation FIR when oversampling, else None
+        (raw chip output)."""
+        d = self._decimator
+        return d.describe() if d is not None else None
 
     @property
     def hampel(self) -> HampelFilter:
@@ -146,7 +158,9 @@ class AcquisitionLoop:
         self.stop()
         self._hw.configure_registers(reg_map)
         self._hampel.reset()
-        self._settle_remaining = _SETTLE_FRAMES
+        # settling is counted in chip frames: same time with oversampling
+        self._settle_remaining = _SETTLE_FRAMES * getattr(self._hw,
+                                                          "oversample", 1)
         self.start()
 
     def _make_realtime(self):
@@ -181,6 +195,10 @@ class AcquisitionLoop:
             self._run_serial()
         elif self._interrupt:
             self._run_hardware_interrupt()
+        elif getattr(self._hw, "oversample", 1) > 1:
+            # only the DRDY-interrupt path decimates
+            logger.error("oversampling needs interrupt acquisition; not "
+                         "streaming (unset PIEEG_OVERSAMPLE)")
         else:
             self._run_hardware()
 
@@ -277,8 +295,12 @@ class AcquisitionLoop:
         for the GIL long enough to skip ~0.3% of samples. Other boards, and a
         reader that can't start or dies, use the same loop in this thread.
         """
-        fs = getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE
+        # DRDY edges come at the chip's conversion rate, which is higher than
+        # sample_rate when oversampling.
+        fs = (getattr(self._hw, "chip_rate", None)
+              or getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE)
         self._nominal_ns = 1_000_000_000 / fs
+        self._setup_decimator(fs)
         # None on the first edge of every run, including after
         # restart_with_config(): the pause for the register write is not an
         # interval, and not a drop.
@@ -316,27 +338,65 @@ class AcquisitionLoop:
                 # pure jitter is not miscounted as a drop.
                 missed = round(interval / self._nominal_ns - 1.0)
                 if missed > 0:
-                    self._dropped_frames += missed
+                    self._lost(missed)
                     self._gap_count += 1
                     logger.warning("DRDY gap: %.2f ms (~%d missed)",
                                    interval / 1e6, missed)
         self._last_event_ns = ts_ns
         self._prev_edge_ns = ts_ns
 
+    def _setup_decimator(self, chip_rate):
+        """A fresh (or reset) decimator for this run, or None without
+        oversampling."""
+        k = getattr(self._hw, "oversample", 1)
+        if k <= 1:
+            self._decimator = None
+            return
+        d = self._decimator
+        if d is None or d.k != k or d.chip_rate != float(chip_rate):
+            gain = getattr(self._hw, "pga_gain", None)
+            self._decimator = Decimator(
+                k, chip_rate, self._hw.num_channels,
+                limit_uv=VREF_UV / gain if gain else None)
+            logger.info("oversampling: chip %d SPS, FIR %d taps, decimated "
+                        "x%d to %d SPS (delay %.0f ms, taken off timestamps)",
+                        chip_rate, len(self._decimator.taps), k,
+                        chip_rate // k, self._decimator.delay_s * 1000)
+        else:
+            d.reset()
+
+    def _lost(self, n):
+        """n chip samples that never arrived (late, torn, rejected or a
+        missed edge). Without oversampling they are simply gone; with it the
+        decimator holds the last sample in their place, so the output stays
+        on its 250 SPS time grid (counted in capture_stats "held_samples")."""
+        self._dropped_frames += n
+        if self._decimator is not None:
+            for sample, t in self._decimator.hold(n):
+                self._emit(sample, t)
+
     def _deliver(self, sample, t):
         """Pass one read on: count a rejected read, drop settling frames,
-        otherwise filter, number and enqueue it."""
+        otherwise decimate (when oversampling), filter, number, enqueue."""
         if sample is None:
-            self._dropped_frames += 1
             self._bad_frames += 1
+            self._lost(1)
             return
         # Discard settling frames after a register-config restart.
         if self._settle_remaining > 0:
             self._settle_remaining -= 1
             return
+        self._frames_read += 1
+        if self._decimator is not None:
+            out = self._decimator.push(sample, t)
+            if out is None:
+                return
+            sample, t = out
+        self._emit(sample, t)
+
+    def _emit(self, sample, t):
         sample = self._hampel.apply(sample)
         self._sample_count += 1
-        self._frames_read += 1
         frame = {
             "t": round(t, 6),
             "n": self._sample_count,
@@ -375,14 +435,14 @@ class AcquisitionLoop:
                 # Newer edges already queued: this edge's data was overwritten.
                 newer = self._hw.wait_drdy_event(timeout=0)
                 while newer is not None:
-                    self._dropped_frames += 1
+                    self._lost(1)
                     self._late_skips += 1
                     self._account_edge(newer)
                     ts_ns = newer
                     newer = self._hw.wait_drdy_event(timeout=0)
 
                 if time.monotonic_ns() - ts_ns > read_deadline_ns:
-                    self._dropped_frames += 1
+                    self._lost(1)
                     self._late_skips += 1
                     continue
 
@@ -393,7 +453,7 @@ class AcquisitionLoop:
                     pending = nxt
                     if nxt <= read_end_ns:
                         # The next conversion landed during the read.
-                        self._dropped_frames += 1
+                        self._lost(1)
                         self._torn_reads += 1
                         continue
                 self._deliver(sample, time.time())
@@ -493,10 +553,10 @@ class AcquisitionLoop:
             return
         self._account_edge(ts_ns)
         if kind == drdy_reader.LATE:
-            self._dropped_frames += 1
+            self._lost(1)
             self._late_skips += 1
         elif kind == drdy_reader.TORN:
-            self._dropped_frames += 1
+            self._lost(1)
             self._torn_reads += 1
         else:
             # Wall-clock time of the edge itself, not of this (later) decode.
@@ -526,6 +586,9 @@ class AcquisitionLoop:
             "bad_frames": self._bad_frames,
             "reader": self._reader_mode,
             "realtime": self.realtime,
+            "oversample": getattr(self._hw, "oversample", 1),
+            "held_samples": (self._decimator.held
+                             if self._decimator is not None else 0),
         }
 
     def _enqueue(self, frame: dict):

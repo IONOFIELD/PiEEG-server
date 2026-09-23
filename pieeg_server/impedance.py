@@ -52,7 +52,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .hardware import (BIAS_DRIVE_OFF, LOFF, LOFF_DC_95_5, LOFF_SENSE_ALL,
+from .hardware import (BIAS_DRIVE_OFF, CONFIG1, LOFF, LOFF_DC_95_5,
+                       LOFF_SENSE_ALL, OVERSAMPLE_CONFIG1,
                        LOFF_SENSN, LOFF_SENSP, VREF_UV, contact_from_signal)
 
 logger = logging.getLogger("pieeg.impedance")
@@ -90,8 +91,21 @@ DC_RESTORE = {LOFF: LOFF_DC_95_5, LOFF_SENSP: LOFF_SENSE_ALL,
 
 def restore_registers(hw):
     """DC_RESTORE plus the bias registers `hw` normally runs with (none for
-    hardware that doesn't report them, e.g. the mock)."""
-    return {**DC_RESTORE, **(getattr(hw, "bias_registers", None) or {})}
+    hardware that doesn't report them, e.g. the mock), and its streaming
+    CONFIG1 when it oversamples (the passes run the chip at 250 SPS)."""
+    regs = {**DC_RESTORE, **(getattr(hw, "bias_registers", None) or {})}
+    if getattr(hw, "oversample", 1) > 1:
+        regs[CONFIG1] = hw.config1
+    return regs
+
+
+def at_output_rate(hw, reg_map):
+    """`reg_map` for a pass the check drives itself. With oversampling the
+    chip streams faster than 250 SPS, but the carrier (fs/8 = 31.25 Hz) and
+    the calibration are at 250 SPS, so the pass puts CONFIG1 back to 250."""
+    if getattr(hw, "oversample", 1) > 1:
+        return {**reg_map, CONFIG1: OVERSAMPLE_CONFIG1[1]}
+    return dict(reg_map)
 
 # ── display bands (wet gel) ──────────────────────────────────────────────────
 GREEN_MAX_OHMS = 10_000
@@ -575,6 +589,8 @@ def unsupported_reason(acq):
         return "this hardware can't switch lead-off modes"
     if hw.num_channels != 8:
         return "the impedance check supports the 8-channel PiEEG only"
+    if getattr(hw, "oversample", 1) > 1 and not can_measure_from_start(hw):
+        return "with oversampling the check has to drive the chip itself"
     return None
 
 
@@ -727,10 +743,13 @@ class ImpedanceCheck:
         ref = ref_k0 = None
         await loop.run_in_executor(None, self._acq.stop)
         try:
-            lead, k0 = await self._own_pass(lead_pass(mask), n, fs)
+            hw = self._acq._hw
+            lead, k0 = await self._own_pass(
+                at_output_rate(hw, lead_pass(mask)), n, fs)
             if self._ref_pass:
                 logger.info("impedance check: REF pass")
-                ref, ref_k0 = await self._own_pass(REF_PASS, n, fs)
+                ref, ref_k0 = await self._own_pass(
+                    at_output_rate(hw, REF_PASS), n, fs)
         finally:
             await loop.run_in_executor(None, self._restore_and_restart)
         return analyze(lead, fs, full_scale, self._cal, contact,

@@ -1,0 +1,137 @@
+"""Oversampling end to end without a board: chip-rate samples through the
+acquisition loop come out at 250 SPS, alias-free, on a steady time grid,
+and the impedance check runs its passes at 250 SPS."""
+import asyncio
+
+import numpy as np
+import pytest
+
+from pieeg_server import hardware
+from pieeg_server.acquisition import AcquisitionLoop
+from pieeg_server.decimate import chip_response
+from pieeg_server.impedance import (at_output_rate, lead_pass,
+                                    restore_registers)
+
+
+class _ChipStub:
+    num_channels = 8
+    oversample = 4
+    chip_rate = 1000
+    sample_rate = 250
+    config1 = 0x94
+    spike_threshold = -1
+
+
+@pytest.fixture
+def loop():
+    lp = asyncio.new_event_loop()
+    yield lp
+    lp.close()
+
+
+def _acq(loop):
+    acq = AcquisitionLoop(_ChipStub(), loop)
+    acq._setup_decimator(1000)
+    return acq
+
+
+def _drain(acq, loop):
+    loop.run_until_complete(asyncio.sleep(0))
+    frames = []
+    while not acq.queue.empty():
+        frames.append(acq.queue.get_nowait())
+    return frames
+
+
+def test_chip_rate_in_250_out_without_the_alias(loop):
+    acq = _acq(loop)
+    t = np.arange(4000) / 1000.0
+    alpha = 20.0 * float(chip_response(10.0, 1000)) * np.sin(2 * np.pi * 10 * t)
+    mains3 = 1000.0 * float(chip_response(180.0, 1000)) * np.sin(
+        2 * np.pi * 180 * t)            # would fold to 70 Hz at 250 SPS
+    for i, ti in enumerate(t):
+        acq._deliver([alpha[i] + mains3[i]] * 8, 100.0 + ti)
+    frames = _drain(acq, loop)
+    assert len(frames) == 1000
+    assert [f["n"] for f in frames] == list(range(1, 1001))
+    y = np.array([f["channels"][0] for f in frames])[250:]
+    ts = np.array([f["t"] for f in frames])[250:]
+    want = 20.0 * np.sin(2 * np.pi * 10 * (ts - 100.0))
+    assert np.abs(y - want).max() < 0.05          # µV: 10 Hz exact, 180 Hz gone
+
+
+def test_lost_chip_samples_are_held_in_place(loop):
+    acq = _acq(loop)
+    for i in range(400):
+        acq._deliver([1.0] * 8, i / 1000.0)
+    acq._lost(3)                                   # e.g. three late reads
+    for i in range(403, 800):
+        acq._deliver([1.0] * 8, i / 1000.0)
+    frames = _drain(acq, loop)
+    assert len(frames) == 200
+    assert np.allclose(np.diff([f["t"] for f in frames]), 0.004, atol=1e-6)
+    stats = acq.capture_stats()
+    assert stats["held_samples"] == 3 and stats["dropped_frames"] == 3
+    assert stats["oversample"] == 4
+
+
+def test_oversample_env(monkeypatch):
+    monkeypatch.delenv("PIEEG_OVERSAMPLE", raising=False)
+    monkeypatch.delenv("PIEEG_CONFIG1", raising=False)
+    assert hardware.oversample_factor(8) == 4       # default on the PiEEG-8
+    assert hardware.oversample_factor(16) == 1
+    monkeypatch.setenv("PIEEG_CONFIG1", "0x95")     # rate picked by hand
+    assert hardware.oversample_factor(8) == 1
+    monkeypatch.delenv("PIEEG_CONFIG1")
+    monkeypatch.setenv("PIEEG_OVERSAMPLE", "1")
+    assert hardware.oversample_factor(8) == 1
+    monkeypatch.setenv("PIEEG_OVERSAMPLE", "4")
+    assert hardware.oversample_factor(8) == 4
+    with pytest.raises(ValueError):
+        hardware.oversample_factor(16)
+    monkeypatch.setenv("PIEEG_OVERSAMPLE", "3")
+    with pytest.raises(ValueError):
+        hardware.oversample_factor(8)
+
+
+def test_rates_split_between_chip_and_output():
+    hw = object.__new__(hardware.PiEEGHardware)
+    hw._config1, hw._oversample = 0x94, 4
+    assert (hw.chip_rate, hw.sample_rate) == (1000, 250)
+    hw._config1, hw._oversample = 0x96, 1
+    assert (hw.chip_rate, hw.sample_rate) == (250, 250)
+
+
+def test_impedance_passes_run_at_250_and_restore_the_fast_rate():
+    hw = _ChipStub()
+    regs = at_output_rate(hw, lead_pass(0x01))
+    assert regs[hardware.CONFIG1] == 0x96
+    assert restore_registers(hw)[hardware.CONFIG1] == 0x94
+    hw.oversample = 1
+    assert hardware.CONFIG1 not in at_output_rate(hw, lead_pass(0x01))
+    assert hardware.CONFIG1 not in restore_registers(hw)
+
+
+def test_rail_to_rail_step_is_clipped_to_full_scale():
+    from pieeg_server.decimate import Decimator
+    fs_uv = 4.5e6 / 24
+    dec = Decimator(4, 1000, 1, limit_uv=fs_uv)
+    ys = []
+    for i in range(2000):
+        r = dec.push([fs_uv if (i // 500) % 2 else -fs_uv], i / 1000)
+        if r is not None:
+            ys.append(r[0][0])
+    assert max(ys) <= fs_uv and min(ys) >= -fs_uv
+    assert max(ys) == fs_uv                         # it did overshoot, clipped
+
+
+def test_journal_sidecar_records_the_prefilter(loop, tmp_path):
+    import json
+    from pieeg_server.journal import JournalWriter
+    acq = _acq(loop)
+    assert acq.prefilter.startswith("AA FIR flat 0-100Hz")
+    j = JournalWriter(acq, tmp_path, session_name="s", num_channels=8,
+                      prefilter=acq.prefilter)
+    j._write_sidecar()
+    assert json.loads((tmp_path / "s.json").read_text())["prefilter"] == \
+        acq.prefilter
