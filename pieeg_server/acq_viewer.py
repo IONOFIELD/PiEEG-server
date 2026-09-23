@@ -1134,7 +1134,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     speed_var = tk.StringVar(value=str(DEFAULT_TIMEBASE))
     sens_var = tk.StringVar(value=str(DEFAULT_SENS))
     speed_mb, speed_menu = _dropdown(bar, 7)
-    sens_mb, sens_menu = _dropdown(bar, 7)
+    sens_mb, sens_menu = _dropdown(bar, 9)          # fits "100 µV/mm"
     for _mb, _menu_, _var, _vals, _unit in (
             (speed_mb, speed_menu, speed_var, TIMEBASE_CHOICES, "mm/s"),
             (sens_mb, sens_menu, sens_var, SENS_CHOICES, "µV/mm")):
@@ -1145,18 +1145,33 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                    variable=_var, command=_face)
         _face()
 
-    # One Rec/Stop toggle: starts the server's crash-safe recording; pressing
-    # again stops it and exports the EDF+ into the recording's folder.
-    rec_btn = None
-    if record_control is not None:
-        rec_btn = ttk.Button(bar, text="● Rec", width=6,
-                             command=lambda: _toggle_record())
-        rec_btn.pack(side="left", padx=(0, 4), pady=1)
-
-    # Right side: REF / GND contact words, IP, and the AVG box (tap = Ω check).
+    # Right side: [● REC] [Ω avg] [IP] REF GND.
     ref_dot = gnd_dot = imp_lbl = None
     ewrap = tk.Frame(bar, bg=C["surface"])
     ewrap.pack(side="right")
+
+    # REC: its own red-bordered black box; solid red while recording. Tap to
+    # start the server's crash-safe recording, tap again to stop and export
+    # the EDF+ into the recording's folder.
+    rec_btn = None
+    if record_control is not None:
+        rec_box = tk.Frame(ewrap, bg=C["bg"], highlightthickness=1,
+                           highlightbackground=C["red"],
+                           highlightcolor=C["red"])
+        rec_box.pack(side="left", padx=(0, 4), pady=1)
+        rec_btn = tk.Label(rec_box, text="● REC", width=7, bg=C["bg"],
+                           fg=C["red"], cursor="hand2",
+                           font=(_MONO, _fs(10), "bold"))
+        rec_btn.pack(padx=1, pady=2)
+        rec_btn.bind("<Button-1>", lambda e: _toggle_record())
+
+        def _rec_face(text, on, _last=[None]):
+            if _last[0] == (text, on):
+                return                      # polled every frame: no churn
+            _last[0] = (text, on)
+            bg, fg = (C["red"], "#ffffff") if on else (C["bg"], C["red"])
+            rec_box.configure(bg=bg)
+            rec_btn.configure(text=text, bg=bg, fg=fg)
 
     def _elec_dot(text):
         # [REF OK]: dim label, then the verdict as a coloured word (fixed
@@ -1175,8 +1190,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ibox.pack(side="left", padx=(0, 2), pady=1)
         # Average impedance of the visible montage's measured electrodes; a
         # tap runs the check. Fixed width for the longest reading
-        # ("Ω AVG 99.9k·3"), so the row doesn't shift once values arrive.
-        imp_lbl = tk.Label(ibox, text="Ω AVG —", width=12, bg=C["raised"],
+        # ("Ω 99.9k·3"), so the row doesn't shift once values arrive.
+        imp_lbl = tk.Label(ibox, text="Ω —", width=8, bg=C["raised"],
                            fg=C["text_dim"], cursor="hand2",
                            font=(_MONO, _fs(10), "bold"))
         imp_lbl.pack(padx=2, pady=2)
@@ -1236,14 +1251,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ann_bar = tk.Frame(canvas, bg=C["canvas_bg"])
         for short, text in ANNOTATIONS:
             ttk.Button(ann_bar, text=short, width=3,
-                       command=lambda s=short, t=text: _annotate(s, t)
+                       command=lambda s=short, t=text: _annotate(s, t, s)
                        ).pack(side="left", padx=(0, 4))
 
-    def _annotate(short, text):
-        mark = {"total": model.total, "label": short, "text": text,
+    def _annotate(short, text, kind=None, total=None):
+        # total: the sweep sample the note belongs to (default: the newest);
+        # the server gets its wall-clock time, so it lands on that sample.
+        total = model.total if total is None else total
+        mark = {"total": total, "label": short, "text": text,
                 "future": None}
+        unix_t = time.time() - (model.total - total) / model.fs
         try:
-            mark["future"] = annotate_control["add"](text, time.time())
+            mark["future"] = annotate_control["add"](text, unix_t,
+                                                     kind or short)
         except Exception as e:              # noqa: BLE001 - report, don't crash
             _hint(f"mark failed: {e}", seconds=8, fg=C["red"])
             return
@@ -1351,14 +1371,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             elif not st.get("recording") and shown:
                 ann_bar.place_forget()
         if _rec["future"] is not None:
-            rec_btn.configure(text="saving…" if st.get("recording")
-                              else "starting…", style="TButton")
+            _rec_face("saving…" if st.get("recording") else "starting…",
+                      bool(st.get("recording")))
         elif st.get("recording"):
             secs = int(st.get("elapsed") or 0)
-            rec_btn.configure(text=f"■ {secs // 60:02d}:{secs % 60:02d}",
-                              style="RecOn.TButton")
+            _rec_face(f"■ {secs // 60:02d}:{secs % 60:02d}", True)
         else:
-            rec_btn.configure(text="● Rec", style="TButton")
+            _rec_face("● REC", False)
 
     # ---- impedance check (Ω) --------------------------------------------- #
     # Results stay in a panel over the traces for IMP_PANEL_S (tap to close);
@@ -1388,14 +1407,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _hint(f"impedance check failed: {e}", seconds=8, fg=C["red"])
             return
         _imp["panel_until"] = 0.0
-        imp_lbl.configure(text="Ω checking…", fg=C["text_sec"])
+        imp_lbl.configure(text="Ω …", fg=C["text_sec"])
 
     def _poll_impedance():
         fut = _imp["future"]
         if fut is not None and fut.done():
             _imp["future"] = None
             if _imp["result"] is None:
-                imp_lbl.configure(text="Ω AVG —", fg=C["text_dim"])
+                imp_lbl.configure(text="Ω —", fg=C["text_dim"])
             try:
                 res = fut.result()
             except Exception as e:          # noqa: BLE001
@@ -1418,11 +1437,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         avg, not_measured = average_impedance(res, model.montage_inputs())
         stale = time.time() - _imp["at"] > IMP_STALE_S
         if avg is None:
-            imp_lbl.configure(text="Ω AVG —",
+            imp_lbl.configure(text="Ω —",
                               fg=C["red"] if res.get("problem") else C["text_dim"])
         else:
-            text = (f"Ω AVG {_compact_ohms(avg)}·{not_measured}"
-                    if not_measured else f"Ω AVG {format_ohms(avg)}")
+            text = (f"Ω {_compact_ohms(avg)}·{not_measured}"
+                    if not_measured else f"Ω {_compact_ohms(avg)}")
             imp_lbl.configure(text=text, fg=C["text_dim"] if stale
                               else _BAND_FG[impedance_band(avg)])
 
@@ -1551,6 +1570,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _meas_drag(evt)
 
     canvas.bind("<ButtonPress-1>", _meas_press)
+    canvas.bind("<Double-Button-1>", lambda e: _note_box(e))
     canvas.bind("<B1-Motion>", _meas_drag)
     canvas.bind("<ButtonRelease-1>", _meas_release)
 
@@ -1601,46 +1621,76 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         k = int(y // (H / len(rows)))
         return rows[k] if 0 <= k < len(rows) else None
 
+    # ---- small popups at the pointer (channel box, note box) ------------- #
+    # Borderless, so the window manager can't move them: the corner sits at
+    # the pointer, kept on screen. Esc, ✕ or a tap outside closes; one at a
+    # time.
     _box = {"win": None}
 
-    def _close_channel_box():
+    def _close_popup():
         win = _box["win"]
         _box["win"] = None
         if win is not None and win.winfo_exists():
             win.grab_release()
             win.destroy()
 
-    def _channel_box(evt):
-        # One small square box, opened AT the pointer, edits the channel
-        # under it — name, the two electrodes it is made of, order,
-        # hide/remove — or adds one. It edits YOUR copy of the current
-        # montage: every change marks it dirty ("*") until Save keeps it, and
-        # Reset brings back the factory montage. Borderless, so the window
-        # manager can't move it; Esc, ✕ or a tap outside closes it.
-        _close_channel_box()
-        rows = model.rows()
-        r = _row_at_y(evt.y)
-        i = next((k for k, row in enumerate(rows) if row is r), None)
-        vis = [k for k, row in enumerate(rows) if row["on"]]
-        hidden = [k for k, row in enumerate(rows) if not row["on"]]
-
+    def _popup(title):
+        """A new popup with a title and ✕: returns (win, body)."""
+        _close_popup()
         win = tk.Toplevel(root, bg=C["raised"], highlightthickness=1,
                           highlightbackground=C["border_hi"])
         win.overrideredirect(True)
         _box["win"] = win
         body = tk.Frame(win, bg=C["raised"])
         body.pack(padx=6, pady=(2, 6))
-        pad = dict(pady=2)
-
         head = tk.Frame(body, bg=C["raised"])
         head.pack(fill="x")
-        tk.Label(head, text=model.row_label(r) if r else "New channel",
-                 bg=C["raised"], fg=C["text"],
+        tk.Label(head, text=title, bg=C["raised"], fg=C["text"],
                  font=(_MONO, _fs(10), "bold")).pack(side="left")
         close = tk.Label(head, text="✕", bg=C["raised"], fg=C["text_sec"],
                          cursor="hand2", font=("TkDefaultFont", _fs(11)))
         close.pack(side="right")
-        close.bind("<Button-1>", lambda e: _close_channel_box())
+        close.bind("<Button-1>", lambda e: _close_popup())
+        win.bind("<Escape>", lambda e: _close_popup())
+
+        def outside(e):
+            # with the grab, taps anywhere land here: outside the box closes
+            if not (0 <= e.x_root - win.winfo_rootx() < win.winfo_width()
+                    and 0 <= e.y_root - win.winfo_rooty()
+                    < win.winfo_height()):
+                _close_popup()
+        win.bind("<ButtonPress-1>", outside, add="+")
+        return win, body
+
+    def _show_popup(win, evt, focus=None):
+        """Place `win` with its corner at the pointer, grab, focus."""
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = min(max(0, evt.x_root), root.winfo_screenwidth() - w)
+        y = min(max(0, evt.y_root), root.winfo_screenheight() - h)
+        win.geometry(f"+{x}+{y}")
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass                            # not viewable yet: no grab
+        if focus is not None:
+            focus.focus_force()
+
+    def _channel_box(evt):
+        # One small square box, opened AT the pointer, edits the channel
+        # under it — name, the two electrodes it is made of, order,
+        # hide/remove — or adds one. It edits YOUR copy of the current
+        # montage: every change marks it dirty ("*") until Save keeps it, and
+        # Reset brings back the factory montage.
+        rows = model.rows()
+        r = _row_at_y(evt.y)
+        i = next((k for k, row in enumerate(rows) if row is r), None)
+        vis = [k for k, row in enumerate(rows) if row["on"]]
+        hidden = [k for k, row in enumerate(rows) if not row["on"]]
+
+        win, body = _popup(model.row_label(r) if r else "New channel")
+        pad = dict(pady=2)
 
         name_var = tk.StringVar(value=model.row_label(r) if r else "")
         name_ent = tk.Entry(body, textvariable=name_var, width=16,
@@ -1675,7 +1725,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         def done(fn):
             fn()
             _edited()
-            _close_channel_box()
+            _close_popup()
 
         def ok():
             p = pair()
@@ -1693,7 +1743,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 model.set_row_pair(r, *p)
                 model.set_row_label(r, name)
             _edited()
-            _close_channel_box()
+            _close_popup()
 
         def add_new():
             p = pair()
@@ -1702,7 +1752,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             model.insert_row(None if i is None else i + 1, *p)
             _hint(f"added {model.epair_name(p)} below")
             _edited()
-            _close_channel_box()
+            _close_popup()
 
         if r is not None:
             vpos = vis.index(i)
@@ -1742,28 +1792,68 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                        ).pack(side="left")
 
         win.bind("<Return>", lambda e: ok())
-        win.bind("<Escape>", lambda e: _close_channel_box())
+        _show_popup(win, evt, focus=name_ent)
 
-        def outside(e):
-            # with the grab, taps anywhere land here: outside the box closes
-            if not (0 <= e.x_root - win.winfo_rootx() < win.winfo_width()
-                    and 0 <= e.y_root - win.winfo_rooty()
-                    < win.winfo_height()):
-                _close_channel_box()
-        win.bind("<ButtonPress-1>", outside, add="+")
+    # ---- note box: double-click the EEG ----------------------------------- #
+    # Double-click (double-tap) anywhere on the traces while recording: a
+    # small box at the pointer with one-tap EC / EO / MVMT and a text field
+    # for anything else. The note goes on the sample under the pointer (at
+    # the sweep head that is "now"; further back, the moment already drawn
+    # there), a marker shows at that spot, and the server saves it at once to
+    # <session>/<session>.annotations.json (and into the EDF+ on Stop).
+    NOTE_KINDS = (("EC", "Eyes closed"), ("EO", "Eyes open"),
+                  ("MVMT", "Movement"))
 
-        # top-left corner at the pointer, kept on screen
-        win.update_idletasks()
-        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
-        x = min(max(0, evt.x_root), root.winfo_screenwidth() - w)
-        y = min(max(0, evt.y_root), root.winfo_screenheight() - h)
-        win.geometry(f"+{x}+{y}")
-        win.lift()
+    def _sample_at_x(x):
+        """Sweep sample count under canvas x (the newest one drawn there);
+        a spot in the erase gap, ahead of the sweep, counts as now."""
+        W, win = max(1, canvas.winfo_width()), model.win
+        total = model.total if model.frozen is None else model.frozen["total"]
+        pos = min(win - 1, max(0, int(x / W * win)))
+        c = total - ((total - 1 - pos) % win)
+        ncol = max(1, min(W, win))
+        gap = (max(2, ncol // 100) + 1) * win / ncol
+        return total if total - c >= win - gap else c
+
+    def _note_box(evt):
+        if annotate_control is None:
+            return
         try:
-            win.grab_set()
-        except tk.TclError:
-            pass                            # not viewable yet: no grab
-        name_ent.focus_force()
+            recording = record_control["status"]().get("recording")
+        except Exception:                   # noqa: BLE001 - display only
+            recording = False
+        if not recording:
+            _hint("press REC first — notes are saved with the recording",
+                  seconds=5, fg=C["yellow"])
+            return
+        at = _sample_at_x(evt.x)
+        ago = (model.total - at) / model.fs
+        win, body = _popup("Note" if ago < 0.5 else f"Note  −{ago:.1f} s")
+
+        def put(short, text, kind):
+            _annotate(short, text, kind, total=at)
+            _close_popup()
+
+        quick = tk.Frame(body, bg=C["raised"])
+        quick.pack(fill="x", pady=(2, 4))
+        for short, text in NOTE_KINDS:
+            ttk.Button(quick, text=short, width=5,
+                       command=lambda s=short, t=text: put(s, t, s)
+                       ).pack(side="left", padx=(0, 4))
+        note_var = tk.StringVar()
+        ent = tk.Entry(body, textvariable=note_var, width=20, bg=C["surface"],
+                       fg=C["text"], insertbackground=C["text"],
+                       relief="flat", font=(_MONO, _fs(10)))
+        ent.pack(fill="x", pady=2)
+
+        def add_text():
+            text = note_var.get().strip()
+            if text:
+                put(text[:12], text, "note")
+        ttk.Button(body, text="Add note", command=add_text).pack(
+            anchor="e", pady=(4, 0))
+        win.bind("<Return>", lambda e: add_text())
+        _show_popup(win, evt, focus=ent)
 
     def _apply_filters():
         lff = dict(LFF_CHOICES)[lff_var.get()]
@@ -2414,7 +2504,8 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
             "run": lambda: request("impedance")}
     if annotate:
         viewer_kwargs["annotate_control"] = {
-            "add": lambda text, unix_t: request("annotate", text, unix_t)}
+            "add": lambda text, unix_t, kind=None: request(
+                "annotate", text, unix_t, kind)}
     try:
         run_viewer(frames, **viewer_kwargs)
     except Exception:

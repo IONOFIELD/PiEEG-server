@@ -247,6 +247,12 @@ SCOPE_CHANGELOG = [
             "The channel box is smaller and opens right at the pointer; Esc, "
             "✕ or a tap outside closes it."),
     ("4.1", "The filter menu is simply labelled \"Filters\"."),
+    ("4.2", "Notes: double-click the EEG while recording for a small box with "
+            "EC, EO and MVMT buttons and a text field. The note goes on the "
+            "spot you double-clicked, shows as a marker there, and is saved at "
+            "once to <session>/<session>.annotations.json (and into the EDF+). "
+            "REC moved right into its own red box, solid red while recording; "
+            "the Ω box is smaller and µV/mm has room for 100."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -828,8 +834,8 @@ def main(argv=None):
                 server.run_impedance_check(), loop)),
         # EC / EO marks in the running recording (same no-mock rule as Rec)
         annotate=None if args.mock else (
-            lambda text, unix_t: asyncio.run_coroutine_threadsafe(
-                server._add_annotation(text, unix_t), loop)))
+            lambda text, unix_t, kind=None: asyncio.run_coroutine_threadsafe(
+                server._add_annotation(text, unix_t, kind), loop)))
     try:
         link_ref["link"] = link
         link.start()

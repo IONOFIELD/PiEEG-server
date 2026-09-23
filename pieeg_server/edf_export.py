@@ -99,9 +99,14 @@ def _channel_labels(meta, nch):
 # BDF+ 24-bit  (primary, lossless)
 # --------------------------------------------------------------------------- #
 def annotations_path(journal_path):
-    """The session's annotation file: ``<session>.csv.annotations.json``,
-    the name the dashboard's session viewer uses for the same recording."""
+    """The session's annotation (notes) file.
+
+    Folder layout (journal in <session>/raw/): <session>/<session>.annotations
+    .json, beside the EDF+. Older flat sessions: <session>.csv.annotations.json
+    next to the journal (the dashboard session viewer's name)."""
     journal_path = Path(journal_path)
+    if journal_path.parent.name == "raw":
+        return journal_path.parent.parent / f"{journal_path.stem}.annotations.json"
     return journal_path.with_name(journal_path.stem + ".csv.annotations.json")
 
 
@@ -318,7 +323,8 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         "reference": "all inputs against one shared REF electrode (SRB1)",
         "channels": channels,
         "annotations": [{"time": round(int(a["frame"]) / fs, 3),
-                         "frame": int(a["frame"]), "text": a.get("text", "")}
+                         "frame": int(a["frame"]), "text": a.get("text", ""),
+                         "type": a.get("type", "note")}
                         for a in sorted(read_annotations(journal_path),
                                         key=lambda a: a["frame"])],
         "raw": {"journal": rel(journal_path),

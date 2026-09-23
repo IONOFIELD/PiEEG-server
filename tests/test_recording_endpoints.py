@@ -200,13 +200,14 @@ async def test_annotations_saved_during_recording_and_in_edf(tmp_path):
     ec = await srv._add_annotation("Eyes closed", journal._last_t - 0.4)
     assert abs(ec["frame"] - (newest - 100)) <= 1
     await asyncio.sleep(0.4)
-    eo = await srv._add_annotation("Eyes open")
+    eo = await srv._add_annotation("Eyes open", kind="EO")
     assert eo["frame"] > ec["frame"]
     session = srv._last_session
-    saved = json.loads((tmp_path / session / "raw" /
-                        f"{session}.csv.annotations.json")
+    # notes live in the recording's folder, beside the EDF+
+    saved = json.loads((tmp_path / session / f"{session}.annotations.json")
                        .read_text())["annotations"]
     assert [a["text"] for a in saved] == ["Eyes closed", "Eyes open"]
+    assert [a["type"] for a in saved] == ["note", "EO"]
     await srv._stop_recording()
     acq.stop()
     with pyedflib.EdfReader(str(tmp_path / session / f"{session}.edf")) as r:
