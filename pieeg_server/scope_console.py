@@ -226,6 +226,10 @@ SCOPE_CHANGELOG = [
             "the recording and carried into the BDF+/EDF+ as annotations; a "
             "dashed marker shows on the trace. The sps readout is no longer "
             "repainted every frame."),
+    ("3.7", "Filters belong to the montage: LFF, HFF and Notch are saved with "
+            "the montage (Save keeps leads + filters) and come back whenever "
+            "you pick it. Changing a filter marks the montage edited (*); "
+            "Reset returns it to the default filters."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
