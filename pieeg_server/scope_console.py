@@ -215,11 +215,12 @@ SCOPE_CHANGELOG = [
             "ring at start-up or after a filter change when an electrode has "
             "a DC offset. The sweep head always shows the same small gap. The "
             "sps readout averages over 10 s, so it no longer jumps between "
-            "248 and 263. Negative is drawn up. LFF is a single-pole "
-            "(time-constant) filter: TC = 1/(2π·LFF). The chip now samples at "
-            "1000 SPS and is filtered down to 250: flat to 100 Hz (the chip's "
-            "roll-off corrected), and mains harmonics no longer fold below "
-            "125 Hz. Traces run ~68 ms later than before."),
+            "248 and 263."),
+    ("3.5", "Negative is drawn up. LFF is a single-pole (time-constant) "
+            "filter: TC = 1/(2π·LFF). The chip now samples at 1000 SPS and is "
+            "filtered down to 250: flat to 100 Hz (the chip's roll-off "
+            "corrected), and mains harmonics no longer fold below 125 Hz. "
+            "Traces run ~68 ms later than before."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
