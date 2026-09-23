@@ -669,13 +669,14 @@ class PiEEGServer:
         stop_info.update(edf_info)
         await self._broadcast_record_status(stop_info=stop_info)
 
-    async def _add_annotation(self, text, unix_t=None):
+    async def _add_annotation(self, text, unix_t=None, kind=None):
         """Mark an event (e.g. "Eyes closed") in the running recording.
 
-        Placed on the journal sample taken at ``unix_t`` (the press time; now
-        if None) and saved at once to ``<session>.csv.annotations.json``, the
-        file the dashboard's session viewer reads and writes, so a crash keeps
-        every mark. The BDF+/EDF+ export carries them as annotations.
+        Placed on the journal sample taken at ``unix_t`` (now if None) and
+        saved at once to ``<session>/<session>.annotations.json``
+        (edf_export.annotations_path), so a crash keeps every note. ``kind``
+        is the note's type ("EC", "EO", "MVMT" or "note"). The EDF+/BDF+
+        export carries them as annotations.
         Raises RuntimeError when nothing is recording.
         """
         journal = self._journal
@@ -686,6 +687,7 @@ class PiEEGServer:
         fs = self._sample_rate()
         anno = {"id": int(unix_t * 1000), "frame": frame,
                 "time": round(frame / fs, 3), "text": str(text),
+                "type": str(kind or "note"),
                 "timestamp": datetime.fromtimestamp(unix_t, timezone.utc)
                 .isoformat()}
         path = edf_export.annotations_path(journal.journal_path)

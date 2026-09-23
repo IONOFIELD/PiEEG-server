@@ -153,19 +153,19 @@ def test_record_error_is_raised_in_the_viewer():
 def test_annotation_round_trip_carries_text_and_time():
     calls = []
 
-    def annotate(text, unix_t):
-        calls.append((text, unix_t))
+    def annotate(text, unix_t, kind=None):
+        calls.append((text, unix_t, kind))
         fut = concurrent.futures.Future()
         fut.set_result({"frame": 500, "time": 2.0, "text": text})
         return fut
 
     def viewer(q, kwargs, seen):
-        fut = kwargs["annotate_control"]["add"]("Eyes closed", 1234.5)
+        fut = kwargs["annotate_control"]["add"]("Eyes closed", 1234.5, "EC")
         _wait_for(fut.done)
         seen["result"] = fut.result()
 
     seen = _run_link(viewer, annotate=annotate)
-    assert calls == [("Eyes closed", 1234.5)]
+    assert calls == [("Eyes closed", 1234.5, "EC")]
     assert seen["result"]["frame"] == 500
 
 
