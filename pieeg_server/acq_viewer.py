@@ -1041,6 +1041,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
               bordercolor=[("active", C["border_hi"])])
     style.configure("TMenubutton", background=C["surface"], foreground=C["text"],
                     bordercolor=C["border"], relief="flat", arrowcolor=C["text_sec"])
+    # toolbar dropdowns: tighter padding so the one row fits 800 px
+    style.configure("Bar.TMenubutton", padding=(4, 2))
     style.map("TMenubutton",
               background=[("active", C["raised"])],
               bordercolor=[("active", C["border_hi"])])
@@ -1059,62 +1061,52 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # controls are the TOP row, the signal filters the row below it. There is
     # no shutdown button — closing the window is the shutdown. Labels, padding
     # and dropdown widths are kept tight on purpose.
-    def _menu(parent, label, values, initial, cb, width=None):
-        # Uppercase micro-label in dim text — the Geist toolbar-label convention.
-        # Label bg matches its parent so it blends inside a chip or on a bar.
-        # (µ is kept: str.upper() turns it into Greek capital Mu, which reads
-        # as "MV" — millivolts.)
-        tk.Label(parent, text=label.upper().replace("\u039c", "µ"),
-                 bg=parent["bg"], fg=C["text_dim"],
-                 font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(6, 2))
-        var = tk.StringVar(value=initial)
-        om = ttk.OptionMenu(parent, var, initial, *values,
-                            command=lambda _v: cb(var.get()))
-        if width:
-            om.configure(width=width)
-        om.pack(side="left", padx=(0, 4))
-        return var
-
     def _chip(parent):
         # A hairline-bordered raised container that visually groups a cluster of
         # related controls into one unit — the segmentation used across the bar.
         return tk.Frame(parent, bg=C["raised"], highlightbackground=C["border_hi"],
                         highlightcolor=C["border_hi"], highlightthickness=1)
 
-    # ---- row 1 (top): montage controls ----------------------------------- #
-    # The montage picker + Save/Reset and the timebase. Channels themselves
-    # are edited in the box a right-click on a lead opens. Each cluster lives
-    # in its own bordered chip.
-    bar2 = tk.Frame(root, bg=C["surface"])
-    bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
+    # ---- toolbar: ONE row, so the chart gets the height ------------------ #
+    # Each group is one compact dropdown whose face shows its setting:
+    #   [Montage* ⌄][1–70 Hz N60 ⌄][30 mm/s ⌄][7 µV/mm ⌄][● Rec] … [Ω AVG][IP] REF GND
+    # Montage Save/Reset live at the bottom of the montage menu; LFF/HFF/Notch
+    # are submenus of the filter menu; the AVG box runs the impedance check.
+    # Channels are edited in the box a right-click on a lead opens.
+    bar = tk.Frame(root, bg=C["surface"])
+    bar.pack(side="top", fill="x", padx=8, pady=(6, 4))
 
-    # Corner "IP" button: re-open the connection popup on demand (after it has
-    # been minimised or closed). Only meaningful when there's a popup to show.
-    if connect_popup:
-        ttk.Button(bar2, text="IP", width=2, style="IP.TButton",
-                   command=lambda: _show_connect_popup()).pack(side="right",
-                                                               padx=(4, 2))
-    # Ω beside IP: run the electrode impedance check (a few seconds). Results
-    # land in the AVG IMP box on the row below and a panel over the traces.
-    imp_btn = None
-    if impedance_control is not None:
-        imp_btn = ttk.Button(bar2, text="Ω", width=2, style="IP.TButton",
-                             command=lambda: _run_impedance())
-        imp_btn.pack(side="right", padx=(4, 0))
+    def _dropdown(parent, width):
+        mb = ttk.Menubutton(parent, width=width, style="Bar.TMenubutton")
+        menu = tk.Menu(mb, tearoff=0, bg=C["raised"], fg=C["text"],
+                       activebackground=C["accent"],
+                       activeforeground="#ffffff", selectcolor=C["text"], bd=0)
+        mb["menu"] = menu
+        mb.pack(side="left", padx=(0, 4), pady=1)
+        return mb, menu
 
-    # Montage chip: [MONTAGE ⌄  Save  Reset]. The dropdown label grows a "*"
-    # (e.g. "Transverse*") whenever the montage has edits that Save hasn't
-    # persisted yet; Save writes them to disk so they come back after reboot.
-    mchip = _chip(bar2)
-    mchip.pack(side="left", padx=(0, 6), pady=1)
-    montage_var = _menu(mchip, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
-                        lambda v: _switch_montage(v), width=11)
-    ttk.Button(mchip, text="Save", width=4,
-               command=lambda: _save_montage()).pack(side="left", padx=(2, 0),
-                                                      pady=2)
-    ttk.Button(mchip, text="Reset", width=4,
-               command=lambda: _reset_montage()).pack(side="left", padx=(2, 4),
-                                                       pady=2)
+    def _submenu(menu, label, var, choices, cb):
+        sub = tk.Menu(menu, tearoff=0, bg=C["raised"], fg=C["text"],
+                      activebackground=C["accent"],
+                      activeforeground="#ffffff", selectcolor=C["text"], bd=0)
+        for text in choices:
+            sub.add_radiobutton(label=text, value=text, variable=var,
+                                command=cb)
+        menu.add_cascade(label=label, menu=sub)
+
+    # Montage: the list, then Save / Reset. The face grows a "*"
+    # ("Transverse*") while the montage has edits Save hasn't kept.
+    montage_var = tk.StringVar(value=DEFAULT_MONTAGE)
+    mont_mb, mont_menu = _dropdown(bar, 13)
+    mont_mb.configure(textvariable=montage_var)
+    for _name in MONTAGE_NAMES:
+        mont_menu.add_command(label=_name,
+                              command=lambda n=_name: _switch_montage(n))
+    mont_menu.add_separator()
+    mont_menu.add_command(label="Save montage (leads + filters)",
+                          command=lambda: _save_montage())
+    mont_menu.add_command(label="Reset to factory",
+                          command=lambda: _reset_montage())
 
     # Each electrode is shown as "E1  Fp1" — the chip input AND its scalp site —
     # so you select by the physical electrode you seated on the head.
@@ -1122,82 +1114,88 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     elec_display = [d for d, _ in elec_choices]
     _disp_to_site = dict(elec_choices)
     _site_to_disp = {site: d for d, site in elec_choices}
-    # Channels (which electrodes, name, order, add/remove) are edited in the
-    # box a right-click on a lead opens, not on the toolbar, to keep the
-    # bars small.
 
-    # Timebase chip: [MM/S ⌄] — real millimetres of screen per second, from
-    # the panel's physical size, so 30 mm/s is 30 mm/s on the glass.
-    tchip = _chip(bar2)
-    tchip.pack(side="left", padx=(0, 0), pady=1)
-    speed_var = _menu(tchip, "mm/s", [str(v) for v in TIMEBASE_CHOICES],
-                      str(DEFAULT_TIMEBASE), lambda v: None, width=2)
-
-    # ---- row 2 (below): signal filters (+ live status) -------------------- #
-    bar = tk.Frame(root, bg=C["surface"])
-    bar.pack(side="top", fill="x", padx=8, pady=(0, 4))
-
-    # Filters chip: [LFF ⌄ HFF ⌄ NOTCH ⌄]
-    fchip = _chip(bar)
-    fchip.pack(side="left", padx=(0, 6), pady=1)
     # Filters belong to the montage: they start as the montage's saved ones,
     # a change marks it edited ("*"), and Save keeps them with its rows.
     _lff0, _hff0, _notch0 = model.montage_filters()
-    lff_var = _menu(fchip, "LFF", [c[0] for c in LFF_CHOICES], _lff0,
-                    lambda v: _filters_changed(), width=6)
-    hff_var = _menu(fchip, "HFF", [c[0] for c in HFF_CHOICES], _hff0,
-                    lambda v: _filters_changed(), width=5)
-    notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], _notch0,
-                      lambda v: _filters_changed(), width=5)
-    # Sensitivity chip (display gain, kept separate from the frequency filters;
-    # labelled by its unit alone to fit the 800 px panel)
-    schip = _chip(bar)
-    schip.pack(side="left", pady=1)
-    sens_var = _menu(schip, "µV/mm", [str(s) for s in SENS_CHOICES],
-                     str(DEFAULT_SENS), lambda v: None, width=4)
+    lff_var = tk.StringVar(value=_lff0)
+    hff_var = tk.StringVar(value=_hff0)
+    notch_var = tk.StringVar(value=_notch0)
+    filt_mb, filt_menu = _dropdown(bar, 13)
+    _submenu(filt_menu, "LFF (low cut)", lff_var, [c[0] for c in LFF_CHOICES],
+             lambda: _filters_changed())
+    _submenu(filt_menu, "HFF (high cut)", hff_var,
+             [c[0] for c in HFF_CHOICES], lambda: _filters_changed())
+    _submenu(filt_menu, "Notch", notch_var, [c[0] for c in NOTCH_CHOICES],
+             lambda: _filters_changed())
 
-    # One Rec/Stop toggle (saves space): starts the server's crash-safe
-    # recording; pressing again stops it and exports the BDF+ file.
+    def _filters_face():
+        # "1–70 Hz N60": LFF–HFF, then the notch when it is on
+        lf = lff_var.get().replace(" Hz", "")
+        hf = hff_var.get().replace(" Hz", "")
+        notch = notch_var.get().replace(" Hz", "")
+        filt_mb.configure(text=f"{lf}–{hf} Hz"
+                          + ("" if notch == "Off" else f" N{notch}"))
+
+    # Timebase (real mm of glass per second) and sensitivity: value + unit.
+    speed_var = tk.StringVar(value=str(DEFAULT_TIMEBASE))
+    sens_var = tk.StringVar(value=str(DEFAULT_SENS))
+    speed_mb, speed_menu = _dropdown(bar, 7)
+    sens_mb, sens_menu = _dropdown(bar, 7)
+    for _mb, _menu_, _var, _vals, _unit in (
+            (speed_mb, speed_menu, speed_var, TIMEBASE_CHOICES, "mm/s"),
+            (sens_mb, sens_menu, sens_var, SENS_CHOICES, "µV/mm")):
+        def _face(mb=_mb, var=_var, unit=_unit):
+            mb.configure(text=f"{var.get()} {unit}")
+        for _v in _vals:
+            _menu_.add_radiobutton(label=f"{_v} {_unit}", value=str(_v),
+                                   variable=_var, command=_face)
+        _face()
+
+    # One Rec/Stop toggle: starts the server's crash-safe recording; pressing
+    # again stops it and exports the EDF+ into the recording's folder.
     rec_btn = None
     if record_control is not None:
-        rec_btn = ttk.Button(bar, text="● Rec", width=7,
+        rec_btn = ttk.Button(bar, text="● Rec", width=6,
                              command=lambda: _toggle_record())
-        rec_btn.pack(side="left", padx=(6, 0), pady=1)
+        rec_btn.pack(side="left", padx=(0, 4), pady=1)
 
-    # Electrode cluster, right of the filters: REF OK  GND OK  [AVG —].
-    # REF and GND are live, from the lead-off flags plus which channels sit at
-    # the rail (ContactTracker). The average impedance in kΩ needs the AC
-    # impedance check, so it stays "—" until that is wired into the Scope
-    # (docs/IMPEDANCE_CHECK_PLAN.md).
+    # Right side: REF / GND contact words, IP, and the AVG box (tap = Ω check).
     ref_dot = gnd_dot = imp_lbl = None
-    if contact_source is not None or impedance_control is not None:
-        ewrap = tk.Frame(bar, bg=C["surface"])
-        ewrap.pack(side="right", padx=(0, 2))
+    ewrap = tk.Frame(bar, bg=C["surface"])
+    ewrap.pack(side="right")
 
-        def _elec_dot(text):
-            # [REF OK]: dim label, then the verdict as a coloured word (fixed
-            # width so the row doesn't shift as it changes).
-            tk.Label(ewrap, text=text, bg=C["surface"], fg=C["text_dim"],
-                     font=("TkDefaultFont", _fs(9))).pack(side="left",
-                                                           padx=(4, 2))
-            word = tk.Label(ewrap, text="—", width=5, anchor="w",
-                            bg=C["surface"], fg=C["text_dim"],
-                            font=(_MONO, _fs(9), "bold"))
-            word.pack(side="left")
-            return word
-        if contact_source is not None:
-            ref_dot = _elec_dot("REF")
-            gnd_dot = _elec_dot("GND")
+    def _elec_dot(text):
+        # [REF OK]: dim label, then the verdict as a coloured word (fixed
+        # width so the row doesn't shift as it changes).
+        tk.Label(ewrap, text=text, bg=C["surface"], fg=C["text_dim"],
+                 font=("TkDefaultFont", _fs(9))).pack(side="left",
+                                                       padx=(4, 1))
+        word = tk.Label(ewrap, text="—", width=4, anchor="w",
+                        bg=C["surface"], fg=C["text_dim"],
+                        font=(_MONO, _fs(9), "bold"))
+        word.pack(side="left")
+        return word
+
+    if impedance_control is not None:
         ibox = _chip(ewrap)
-        ibox.pack(side="left", padx=(4, 0), pady=1)
-        # Average impedance of the visible montage's measured electrodes (from
-        # the Ω check). Fixed width, sized for the longest reading
-        # ("AVG 99.9 kΩ"), so the row doesn't shift once values arrive. Row 2
-        # is full at 800 px, so electrodes that weren't measured are counted
-        # inside the same label ("AVG 19.5k·3"), not in a field of their own.
-        imp_lbl = tk.Label(ibox, text="AVG —", width=11, bg=C["raised"],
-                           fg=C["text_dim"], font=(_MONO, _fs(10), "bold"))
-        imp_lbl.pack(padx=4, pady=2)
+        ibox.pack(side="left", padx=(0, 2), pady=1)
+        # Average impedance of the visible montage's measured electrodes; a
+        # tap runs the check. Fixed width for the longest reading
+        # ("Ω AVG 99.9k·3"), so the row doesn't shift once values arrive.
+        imp_lbl = tk.Label(ibox, text="Ω AVG —", width=12, bg=C["raised"],
+                           fg=C["text_dim"], cursor="hand2",
+                           font=(_MONO, _fs(10), "bold"))
+        imp_lbl.pack(padx=2, pady=2)
+        imp_lbl.bind("<Button-1>", lambda e: _run_impedance())
+    # "IP": re-open the connection popup after it was minimised or closed.
+    if connect_popup:
+        ttk.Button(ewrap, text="IP", width=2, style="IP.TButton",
+                   command=lambda: _show_connect_popup()).pack(
+                       side="left", padx=(2, 0))
+    if contact_source is not None:
+        ref_dot = _elec_dot("REF")
+        gnd_dot = _elec_dot("GND")
 
     # Stream health (signal dot + measured sample rate) is drawn on the chart's
     # bottom-right corner, not the toolbar, so no unlabelled dot sits by REF.
@@ -1397,13 +1395,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _hint(f"impedance check failed: {e}", seconds=8, fg=C["red"])
             return
         _imp["panel_until"] = 0.0
-        imp_btn.configure(text="…")
+        imp_lbl.configure(text="Ω checking…", fg=C["text_sec"])
 
     def _poll_impedance():
         fut = _imp["future"]
         if fut is not None and fut.done():
             _imp["future"] = None
-            imp_btn.configure(text="Ω")
+            if _imp["result"] is None:
+                imp_lbl.configure(text="Ω AVG —", fg=C["text_dim"])
             try:
                 res = fut.result()
             except Exception as e:          # noqa: BLE001
@@ -1421,16 +1420,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                               "measured — see the panel", seconds=8,
                               fg=C["yellow"])
         res = _imp["result"]
-        if res is None or imp_lbl is None:
+        if res is None or imp_lbl is None or _imp["future"] is not None:
             return
         avg, not_measured = average_impedance(res, model.montage_inputs())
         stale = time.time() - _imp["at"] > IMP_STALE_S
         if avg is None:
-            imp_lbl.configure(text="AVG —",
+            imp_lbl.configure(text="Ω AVG —",
                               fg=C["red"] if res.get("problem") else C["text_dim"])
         else:
-            text = (f"AVG {_compact_ohms(avg)}·{not_measured}" if not_measured
-                    else f"AVG {format_ohms(avg)}")
+            text = (f"Ω AVG {_compact_ohms(avg)}·{not_measured}"
+                    if not_measured else f"Ω AVG {format_ohms(avg)}")
             imp_lbl.configure(text=text, fg=C["text_dim"] if stale
                               else _BAND_FG[impedance_band(avg)])
 
@@ -1619,11 +1618,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             win.destroy()
 
     def _channel_box(evt):
-        # One small box edits the channel under the pointer — its name, the
-        # two electrodes it is made of, its place in the list, hide/remove —
-        # or adds a new one. It edits YOUR copy of the current montage: every
-        # change marks it dirty (the "*" on the picker) until Save keeps it,
-        # and Reset brings back the factory montage.
+        # One small square box, opened AT the pointer, edits the channel
+        # under it — name, the two electrodes it is made of, order,
+        # hide/remove — or adds one. It edits YOUR copy of the current
+        # montage: every change marks it dirty ("*") until Save keeps it, and
+        # Reset brings back the factory montage. Borderless, so the window
+        # manager can't move it; Esc, ✕ or a tap outside closes it.
         _close_channel_box()
         rows = model.rows()
         r = _row_at_y(evt.y)
@@ -1633,39 +1633,44 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
         win = tk.Toplevel(root, bg=C["raised"], highlightthickness=1,
                           highlightbackground=C["border_hi"])
+        win.overrideredirect(True)
         _box["win"] = win
-        win.title(f"Channel {model.row_label(r)}" if r else "Add channel")
-        win.transient(root)
-        win.resizable(False, False)
-        win.protocol("WM_DELETE_WINDOW", _close_channel_box)
-        win.bind("<Escape>", lambda e: _close_channel_box())
-        pad = dict(padx=6, pady=3)
+        body = tk.Frame(win, bg=C["raised"])
+        body.pack(padx=6, pady=(2, 6))
+        pad = dict(pady=2)
 
-        def label(text, row_):
-            tk.Label(win, text=text.upper(), bg=C["raised"], fg=C["text_dim"],
-                     font=("TkDefaultFont", _fs(9))).grid(
-                         row=row_, column=0, sticky="w", **pad)
+        head = tk.Frame(body, bg=C["raised"])
+        head.pack(fill="x")
+        tk.Label(head, text=model.row_label(r) if r else "New channel",
+                 bg=C["raised"], fg=C["text"],
+                 font=(_MONO, _fs(10), "bold")).pack(side="left")
+        close = tk.Label(head, text="✕", bg=C["raised"], fg=C["text_sec"],
+                         cursor="hand2", font=("TkDefaultFont", _fs(11)))
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: _close_channel_box())
 
-        label("Name", 0)
         name_var = tk.StringVar(value=model.row_label(r) if r else "")
-        name_ent = tk.Entry(win, textvariable=name_var, width=18,
+        name_ent = tk.Entry(body, textvariable=name_var, width=16,
                             bg=C["surface"], fg=C["text"],
                             insertbackground=C["text"], relief="flat",
                             font=(_MONO, _fs(10)))
-        name_ent.grid(row=0, column=1, columnspan=3, sticky="we", **pad)
+        name_ent.pack(fill="x", **pad)
 
-        label("Electrodes", 1)
         a0, b0 = (r["pair"] if r else
                   (model.electrodes[0], model.electrodes[min(
                       2, len(model.electrodes) - 1)]))
         a_var = tk.StringVar(value=_site_to_disp[a0])
         b_var = tk.StringVar(value=_site_to_disp[b0])
-        ttk.OptionMenu(win, a_var, a_var.get(), *elec_display).grid(
-            row=1, column=1, sticky="w", **pad)
-        tk.Label(win, text="–", bg=C["raised"], fg=C["text_sec"]).grid(
-            row=1, column=2)
-        ttk.OptionMenu(win, b_var, b_var.get(), *elec_display).grid(
-            row=1, column=3, sticky="w", **pad)
+        epair = tk.Frame(body, bg=C["raised"])
+        epair.pack(fill="x", **pad)
+        ttk.OptionMenu(epair, a_var, a_var.get(), *elec_display).pack(
+            side="left")
+        tk.Label(epair, text="–", bg=C["raised"], fg=C["text_sec"]).pack(
+            side="left", padx=2)
+        ttk.OptionMenu(epair, b_var, b_var.get(), *elec_display).pack(
+            side="left")
+        for om in epair.winfo_children()[::2]:
+            om.configure(width=6)
 
         def pair():
             a, b = _disp_to_site[a_var.get()], _disp_to_site[b_var.get()]
@@ -1706,62 +1711,66 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _edited()
             _close_channel_box()
 
-        btns = tk.Frame(win, bg=C["raised"])
-        btns.grid(row=2, column=0, columnspan=4, sticky="we", **pad)
         if r is not None:
             vpos = vis.index(i)
-            ttk.Button(btns, text="▲", width=2,
+            acts = tk.Frame(body, bg=C["raised"])
+            acts.pack(fill="x", **pad)
+            ttk.Button(acts, text="▲", width=2,
                        state="normal" if vpos > 0 else "disabled",
                        command=lambda: done(lambda: model.move_row(
                            i, vis[vpos - 1]))).pack(side="left")
-            ttk.Button(btns, text="▼", width=2,
+            ttk.Button(acts, text="▼", width=2,
                        state="normal" if vpos < len(vis) - 1 else "disabled",
                        command=lambda: done(lambda: model.move_row(
-                           i, vis[vpos + 1]))).pack(side="left", padx=(2, 8))
-            ttk.Button(btns, text="Hide", width=5,
-                       command=lambda: done(lambda: model.toggle_row(i))
-                       ).pack(side="left")
-            ttk.Button(btns, text="Remove", width=7,
+                           i, vis[vpos + 1]))).pack(side="left", padx=(2, 0))
+            ttk.Button(acts, text="Remove", width=6,
                        command=lambda: done(lambda: model.remove_row(i))
-                       ).pack(side="left", padx=(2, 0))
+                       ).pack(side="right")
+            ttk.Button(acts, text="Hide", width=4,
+                       command=lambda: done(lambda: model.toggle_row(i))
+                       ).pack(side="right", padx=(0, 2))
 
-        next_row = 3
         if hidden:
-            label("Show hidden", next_row)
             names = [model.row_label(rows[k]) for k in hidden]
-            show_var = tk.StringVar(value="—")
+            show_var = tk.StringVar(value="Show hidden…")
 
             def show(name):
                 k = hidden[names.index(name)]
                 done(lambda: model.toggle_row(k))
-            ttk.OptionMenu(win, show_var, "—", *names,
-                           command=show).grid(row=next_row, column=1,
-                                              columnspan=3, sticky="w", **pad)
-            next_row += 1
+            ttk.OptionMenu(body, show_var, "Show hidden…", *names,
+                           command=show).pack(fill="x", **pad)
 
-        foot = tk.Frame(win, bg=C["raised"])
-        foot.grid(row=next_row, column=0, columnspan=4, sticky="we", **pad)
-        if r is not None:
-            ttk.Button(foot, text="+ Add as new", command=add_new
-                       ).pack(side="left")
+        foot = tk.Frame(body, bg=C["raised"])
+        foot.pack(fill="x", pady=(4, 0))
         ttk.Button(foot, text="OK" if r else "Add", width=5,
                    command=ok).pack(side="right")
-        ttk.Button(foot, text="Cancel", width=6,
-                   command=_close_channel_box).pack(side="right", padx=(0, 4))
-        win.bind("<Return>", lambda e: ok())
+        if r is not None:
+            ttk.Button(foot, text="+ New", width=6, command=add_new
+                       ).pack(side="left")
 
-        # beside the pointer, kept on screen
+        win.bind("<Return>", lambda e: ok())
+        win.bind("<Escape>", lambda e: _close_channel_box())
+
+        def outside(e):
+            # with the grab, taps anywhere land here: outside the box closes
+            if not (0 <= e.x_root - win.winfo_rootx() < win.winfo_width()
+                    and 0 <= e.y_root - win.winfo_rooty()
+                    < win.winfo_height()):
+                _close_channel_box()
+        win.bind("<ButtonPress-1>", outside, add="+")
+
+        # top-left corner at the pointer, kept on screen
         win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
-        x = min(max(0, evt.x_root + 8), root.winfo_screenwidth() - w)
-        y = min(max(0, evt.y_root - h // 2), root.winfo_screenheight() - h)
+        x = min(max(0, evt.x_root), root.winfo_screenwidth() - w)
+        y = min(max(0, evt.y_root), root.winfo_screenheight() - h)
         win.geometry(f"+{x}+{y}")
-        win.attributes("-topmost", True)
         win.lift()
         try:
             win.grab_set()
         except tk.TclError:
             pass                            # not viewable yet: no grab
+        name_ent.focus_force()
 
     def _apply_filters():
         lff = dict(LFF_CHOICES)[lff_var.get()]
@@ -1772,6 +1781,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _filters_changed():
         model.set_montage_filters(lff_var.get(), hff_var.get(),
                                   notch_var.get())
+        _filters_face()
         _apply_filters()
         _refresh_montage_label()
 
@@ -1781,8 +1791,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         lff_var.set(lff)
         hff_var.set(hff)
         notch_var.set(notch)
+        _filters_face()
         _apply_filters()
 
+    _filters_face()
     _apply_filters()
 
     # ---- draw loop -------------------------------------------------------- #

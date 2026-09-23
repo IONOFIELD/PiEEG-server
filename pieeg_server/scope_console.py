@@ -240,6 +240,12 @@ SCOPE_CHANGELOG = [
             "down, hide or remove it, show a hidden one, or add a new channel "
             "below it (right-click an empty chart adds one). The Bipolar "
             "builder is gone from the top bar."),
+    ("4.0", "One toolbar row, so the chart gets the height: Montage (Save / "
+            "Reset at the bottom of its menu), Filters (LFF / HFF / Notch "
+            "submenus; the face reads e.g. \"1–70 Hz N60\"), mm/s, µV/mm, Rec, "
+            "then the AVG box (tap it to check impedance), IP, REF and GND. "
+            "The channel box is smaller and opens right at the pointer; Esc, "
+            "✕ or a tap outside closes it."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
