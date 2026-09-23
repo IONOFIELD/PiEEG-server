@@ -53,3 +53,38 @@ def test_negative_is_drawn_up():
                 half=40.0)
     assert list(y) == [75.0, 100.0, 125.0]          # canvas y grows downward
     assert list(trace_y([-1e6, 1e6], 100.0, 10.0, 5.0, 40.0)) == [60.0, 140.0]
+
+
+def _block(mains_uv, fs=250, seconds=2.0, seed=0):
+    rng = np.random.default_rng(seed)
+    t = np.arange(0, seconds, 1 / fs)
+    # 8 leads, each its own DC offset, mains of about `mains_uv` rms
+    dc = rng.uniform(-60000, 20000, 8)
+    amp = mains_uv * np.sqrt(2) * rng.uniform(0.5, 1.5, 8)
+    return dc + amp * np.sin(2 * np.pi * 60 * t)[:, None]
+
+
+def test_gnd_stays_off_on_wall_power_between_flashes():
+    from pieeg_server.acq_viewer import ContactTracker
+    on = [{"ch": i + 1, "p_off": False} for i in range(8)]
+    off = [{"ch": i + 1, "p_off": True} for i in range(8)]
+    tr = ContactTracker(8, clock=lambda: 0.0)
+    for _ in range(8):
+        tr.update(on, _block(3.0))
+    assert tr.gnd() == "green"
+    tr.update(off, _block(3000.0))          # BIO out: one all-off flash
+    for i in range(8):                      # flags back on, mains stays
+        tr.update(on, _block(3000.0, seed=i))
+    assert tr.gnd() == "red"
+    for i in range(8):                      # BIO back: mains gone
+        tr.update(on, _block(3.0, seed=i))
+    assert tr.gnd() == "green"
+
+
+def test_ref_out_mains_alone_does_not_turn_gnd_off():
+    from pieeg_server.acq_viewer import ContactTracker
+    on = [{"ch": i + 1, "p_off": False} for i in range(8)]
+    tr = ContactTracker(8, clock=lambda: 0.0)
+    for i in range(8):                      # no all-off flash, just mains
+        tr.update(on, _block(3000.0, seed=i))
+    assert tr.gnd() == "green"
