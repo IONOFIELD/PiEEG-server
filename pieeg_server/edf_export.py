@@ -324,9 +324,16 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
             "edf_step_uv": round((pmax - pmin) / (_EDF_DIG_MAX - _EDF_DIG_MIN),
                                  6)})
     rel = lambda p: os.path.relpath(p, out_path.parent)   # noqa: E731
+    # the operator's name for the recording (set in the Scope's Files list)
+    # outlives a rebuild of this file
+    try:
+        nickname = json.loads(out_path.read_text()).get("nickname")
+    except (OSError, ValueError, AttributeError):
+        nickname = None
     summary = {
         "format": "pieeg-recording-v1",
         "session": journal_path.stem,
+        **({"nickname": nickname} if nickname else {}),
         "edf_file": rel(edf_path),
         "start_iso": meta.get("start_iso"),
         "duration_sec": round(counts.shape[0] / fs, 3),

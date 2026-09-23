@@ -275,6 +275,11 @@ SCOPE_CHANGELOG = [
             "review's scroll bar sits just above it. Review restarts its "
             "filters at each calibration switch, so the jump back to the "
             "electrodes doesn't ring. Sensitivity starts at 15 µV/mm."),
+    ("4.6", "Recording names: in Files, pick a recording, type a Name and Save "
+            "(Enter works). The name shows in the list and in the footer while "
+            "reviewing, and is kept in the recording's summary JSON (files and "
+            "folder keep their session names). Find filters the list by name, "
+            "date or session as you type."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
