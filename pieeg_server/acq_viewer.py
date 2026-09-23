@@ -45,6 +45,8 @@ import argparse
 import json
 import os
 import queue
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -106,11 +108,17 @@ SENS_CHOICES = [3, 5, 7, 10, 15, 20, 30, 50, 70, 100]
 
 DEFAULT_HFF = "70 Hz"
 DEFAULT_LFF = "1 Hz"
-DEFAULT_NOTCH = "Off"
+DEFAULT_NOTCH = "60 Hz"   # local mains (US grid)
+# HFF roll-off: 4th-order Butterworth (-24 dB/octave). 2nd order left the
+# 70 Hz setting only -1.3 dB at 60 Hz and -5.9 dB at 80 Hz.
+HFF_ORDER = 4
 DEFAULT_SENS = 7          # microvolts per millimetre
 
-WINDOW_SECONDS = 10.0     # width of the strip-chart
-PX_PER_MM = 4.0           # screen pixels per "millimetre" for sensitivity
+WINDOW_SECONDS = 10.0     # initial strip-chart length; the timebase sets it
+PX_PER_MM = 4.0           # fallback pixels per mm when the screen size is unknown
+# Timebase in mm/s of real screen width: the window shows W_mm / speed seconds.
+TIMEBASE_CHOICES = [10, 15, 20, 30, 60]
+DEFAULT_TIMEBASE = 30
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
 SWEEP_CHUNK = 8           # trace columns per persistent canvas line
 # Preferred window size. Smaller screens (the Pi's 7" 800x480 DSI panel) get
@@ -180,7 +188,7 @@ class StreamingFilter:
             self._hp = signal.butter(2, lff / nyq, btype="highpass")
         self._lp = None
         if hff is not None and 0 < hff < nyq:
-            self._lp = signal.butter(2, hff / nyq, btype="lowpass")
+            self._lp = signal.butter(HFF_ORDER, hff / nyq, btype="lowpass")
         self._notch = None
         if notch is not None and 0 < notch < nyq:
             self._notch = signal.iirnotch(notch, Q=30.0, fs=self._fs)
@@ -577,6 +585,22 @@ class ViewerModel:
         self.filt[-m:] = f
         self.filled = min(self.win, self.filled + m)
 
+    def set_window(self, seconds):
+        """Change the strip length (the timebase), keeping the newest data."""
+        win = max(2, int(round(seconds * self.fs)))
+        if win == self.win:
+            return
+        keep = min(win, self.win)
+
+        def resize(a):
+            out = np.zeros((win, self.nch), dtype=np.float64)
+            out[win - keep:] = a[self.win - keep:]
+            return out
+        self.raw, self.filt = resize(self.raw), resize(self.filt)
+        self.filled = min(self.filled, keep)
+        self.win = win
+        self.frozen = None
+
     def sweep_head(self):
         """Sweep position (0..win-1) the next sample will be written to."""
         return self.total % self.win
@@ -639,6 +663,41 @@ def dominant_hz(x, fs, lff=None, hff=None):
         if d != 0:
             return float(f[k] + 0.5 * (a - c) / d * (f[1] - f[0]))
     return float(f[k])
+
+
+def screen_px_per_mm(root=None):
+    """(x, y) pixels per real millimetre of the screen the Scope is on.
+
+    PIEEG_SCREEN_MM="154x86" overrides. Otherwise the compositor's reported
+    physical size (wlr-randr) for the output matching the screen resolution;
+    Tk's own figure is a 96-dpi guess on this panel (212 mm for 154 mm), so
+    it is only the last resort, then PX_PER_MM."""
+    w_px = h_px = None
+    if root is not None:
+        w_px, h_px = root.winfo_screenwidth(), root.winfo_screenheight()
+    env = os.environ.get("PIEEG_SCREEN_MM", "")
+    m = re.fullmatch(r"\s*([\d.]+)\s*x\s*([\d.]+)\s*", env)
+    if m and w_px:
+        return w_px / float(m.group(1)), h_px / float(m.group(2))
+    if w_px:
+        try:
+            out = subprocess.run(["wlr-randr"], capture_output=True, text=True,
+                                 timeout=2).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        for block in re.split(r"\n(?=\S)", out):
+            size = re.search(r"Physical size:\s*(\d+)x(\d+)\s*mm", block)
+            cur = re.search(r"(\d+)x(\d+) px[^\n]*current", block)
+            if (size and cur and int(size.group(1)) > 0
+                    and (int(cur.group(1)), int(cur.group(2))) == (w_px, h_px)):
+                return w_px / int(size.group(1)), h_px / int(size.group(2))
+        try:
+            mm = root.winfo_fpixels("1m")
+            if mm > 0:
+                return mm, mm
+        except Exception:                   # noqa: BLE001 - Tk error, fall back
+            pass
+    return PX_PER_MM, PX_PER_MM
 
 
 def sweep_chunks(first, last, ncol, size):
@@ -935,11 +994,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     mchip = _chip(bar2)
     mchip.pack(side="left", padx=(0, 6), pady=1)
     montage_var = _menu(mchip, "Montage", MONTAGE_NAMES, DEFAULT_MONTAGE,
-                        lambda v: _switch_montage(v), width=14)
-    ttk.Button(mchip, text="Save", width=5,
+                        lambda v: _switch_montage(v), width=11)
+    ttk.Button(mchip, text="Save", width=4,
                command=lambda: _save_montage()).pack(side="left", padx=(2, 0),
                                                       pady=2)
-    ttk.Button(mchip, text="Reset", width=5,
+    ttk.Button(mchip, text="Reset", width=4,
                command=lambda: _reset_montage()).pack(side="left", padx=(2, 4),
                                                        pady=2)
 
@@ -959,13 +1018,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
              font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 4))
     a_var = tk.StringVar(value=elec_display[0])
     ttk.OptionMenu(grp, a_var, elec_display[0], *elec_display).pack(side="left")
+    grp.winfo_children()[-1].configure(width=7)
     tk.Label(grp, text="–", bg=C["raised"], fg=C["text_sec"]).pack(side="left",
                                                                    padx=4)
     b_var = tk.StringVar(value=_b_default)
     ttk.OptionMenu(grp, b_var, _b_default, *elec_display).pack(side="left")
+    grp.winfo_children()[-1].configure(width=7)
     ttk.Button(grp, text="+", width=2,
                command=lambda: _add_bipolar()).pack(side="left", padx=(6, 4),
                                                      pady=2)
+
+    # Timebase chip: [MM/S ⌄] — real millimetres of screen per second, from
+    # the panel's physical size, so 30 mm/s is 30 mm/s on the glass.
+    tchip = _chip(bar2)
+    tchip.pack(side="left", padx=(6, 0), pady=1)
+    speed_var = _menu(tchip, "mm/s", [str(v) for v in TIMEBASE_CHOICES],
+                      str(DEFAULT_TIMEBASE), lambda v: None, width=2)
 
     # ---- row 2 (below): signal filters (+ live status) -------------------- #
     bar = tk.Frame(root, bg=C["surface"])
@@ -1518,6 +1586,18 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             word.config(text=_CONTACT_WORD.get(verdict, "—"),
                         fg=_CONTACT_FG.get(verdict, C["text_dim"]))
 
+    _px_mm = dict(zip(("x", "y"), screen_px_per_mm(root)))
+    _tb = {"key": None}
+
+    def _apply_timebase(W):
+        # window seconds = screen width in mm / speed in mm/s
+        key = (W, speed_var.get())
+        if key == _tb["key"]:
+            return
+        _tb["key"] = key
+        model.set_window(W / _px_mm["x"] / float(speed_var.get()))
+        _meas["box"], _meas["rows"] = None, []
+
     # ---- sweep trace layer ------------------------------------------------ #
     # Behind the sweep nothing changes, so trace lines are persistent canvas
     # items (tag "sweep") drawn SWEEP_CHUNK columns at a time: each frame
@@ -1535,7 +1615,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ncol = max(1, min(W, model.win))
         vfilt, head, _ = model.view()
         sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
-               id(model.frozen))
+               id(model.frozen), model.win)
         if sig != _sw["sig"]:
             _sweep_reset()
             _sw["sig"] = sig
@@ -1548,7 +1628,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
                                        head, ncol)
             base = k * row_h + row_h / 2.0
-            ys.append(base - np.clip(vals / sens * PX_PER_MM, -half, half))
+            ys.append(base - np.clip(vals / sens * _px_mm["y"], -half, half))
         gap = max(2, ncol // 100)                 # erase gap, ~0.1 s
 
         def draw(a, b):
@@ -1594,7 +1674,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _deco = {"sig": None, "dots": [], "dot_sig": None}
 
     def _draw_static(rows, W, H, row_h, half, sens, box_w, box_x):
-        sig = (W, H, sens, tuple((r["pair"], model.epair_name(r["pair"]),
+        sig = (W, H, sens, model.win, tuple((r["pair"], model.epair_name(r["pair"]),
                                   model.row_label(r)) for r in rows))
         if sig == _deco["sig"]:
             return
@@ -1636,8 +1716,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _deco["dots"].append(((r["pair"][0], tx0 - 7, base),
                                   (r["pair"][1], tx1 + 7, base)))
         # calibration marker: 100 uV vertical, 1 s horizontal
-        cal_uv = 100.0 / sens * PX_PER_MM
-        cal_s = W / WINDOW_SECONDS
+        cal_uv = 100.0 / sens * _px_mm["y"]
+        cal_s = W * model.fs / model.win
         x0, y0 = 40, H - 16
         canvas.create_line(x0, y0, x0, y0 - cal_uv, fill=C["text_dim"],
                            tags="deco")
@@ -1693,6 +1773,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             canvas.delete("deco", "dots")
             _deco["sig"], _deco["dot_sig"], _deco["dots"] = None, None, []
         if W > 2 and H > 2 and n > 0:
+            _apply_timebase(W)
             sens = float(sens_var.get())            # uV per mm
             row_h = H / n
             half = row_h * 0.45

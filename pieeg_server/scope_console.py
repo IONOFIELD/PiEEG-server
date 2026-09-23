@@ -205,6 +205,11 @@ SCOPE_CHANGELOG = [
             "drag a box on the chart to hold the display and read each "
             "boxed channel's peak-to-peak and max/min µV, dominant Hz and "
             "span; tap to resume."),
+    ("3.3", "Timebase in mm/s (MM/S, default 30 mm/s, about 5 s across the "
+            "7-inch panel), measured from the panel's real size; µV/mm now "
+            "uses real millimetres too (it assumed 4 px/mm, so traces were "
+            "drawn ~28% small). HFF is 4th order, and Notch defaults to "
+            "60 Hz."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

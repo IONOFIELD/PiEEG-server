@@ -94,3 +94,44 @@ def test_box_across_the_sweep_gap_uses_contiguous_samples():
     # older side is measured on its own, never spliced to the newest
     r = m.measure(("Fp1", "O1"), 0.40, 0.65)
     assert r["pp"] == 0.0 and abs(r["seconds"] - 1.5) < 0.01
+
+
+def test_timebase_window_keeps_newest_data():
+    m = _model()
+    m.push(np.arange(m.win, dtype=float)[:, None].repeat(8, axis=1))
+    newest = m.raw[-1, 0]
+    m.set_window(5.0)                                 # 30 mm/s on the panel
+    assert m.win == 1250 and m.filled == 1250
+    assert m.raw[-1, 0] == newest and m.raw[0, 0] == newest - 1249
+    m.set_window(15.0)                                # grow: old part is empty
+    assert m.win == 3750 and m.filled == 1250
+    assert m.raw[-1, 0] == newest and m.raw[0, 0] == 0.0
+
+
+def test_screen_mm_override(monkeypatch):
+    from pieeg_server.acq_viewer import screen_px_per_mm
+
+    class Root:
+        def winfo_screenwidth(self): return 800
+        def winfo_screenheight(self): return 480
+    monkeypatch.setenv("PIEEG_SCREEN_MM", "154x86")
+    x, y = screen_px_per_mm(Root())
+    assert abs(x - 800 / 154) < 1e-9 and abs(y - 480 / 86) < 1e-9
+
+
+def test_screen_mm_from_compositor(monkeypatch):
+    from pieeg_server import acq_viewer
+
+    class Root:
+        def winfo_screenwidth(self): return 800
+        def winfo_screenheight(self): return 480
+        def winfo_fpixels(self, _): return 3.77
+    out = ('HDMI-A-1 "x"\n  Physical size: 600x340 mm\n  Modes:\n'
+           '    1920x1080 px, 60.0 Hz (preferred, current)\n'
+           'DSI-1 "(null)"\n  Physical size: 154x86 mm\n  Modes:\n'
+           '    800x480 px, 60.028999 Hz (preferred, current)\n')
+    monkeypatch.delenv("PIEEG_SCREEN_MM", raising=False)
+    monkeypatch.setattr(acq_viewer.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"stdout": out})())
+    x, y = acq_viewer.screen_px_per_mm(Root())
+    assert abs(x - 800 / 154) < 1e-9 and abs(y - 480 / 86) < 1e-9
