@@ -107,6 +107,27 @@ def default_labels(num_channels):
     return [f"ch{i}" for i in range(1, num_channels + 1)]
 
 
+def measured_rate(n, first_t, last_t, min_span_s=10.0):
+    """Samples per second actually recorded, from the first and last frame
+    timestamps (DRDY edge times, so jitter is ~0.1 ms) — None under
+    `min_span_s`. The chip's own clock sets the rate and runs ~0.1% off the
+    nominal sample_rate; this lets a reader line the file up with other
+    clocks (video, a second device). Assumes no samples were lost."""
+    if n < 2 or first_t is None or last_t is None:
+        return None
+    span = last_t - first_t
+    if span < min_span_s:
+        return None
+    return round((n - 1) / span, 4)
+
+
+def referential_labels(sites):
+    """EDF+ labels for referential channels: every PiEEG input is measured
+    against the one shared REF electrode (SRB1), so input i on site S is
+    "EEG S-REF" (EDF+ signal-type prefix; fits the 16-character field)."""
+    return [f"EEG {site}-REF" for site in sites]
+
+
 class JournalWriter:
     """Async consumer that appends raw counts to a crash-safe binary journal.
 
@@ -145,6 +166,7 @@ class JournalWriter:
 
         self.samples_written = 0
         self._start_time = None
+        self._first_t = self._last_t = None     # first/last frame times
 
     # ---- sidecar -------------------------------------------------------- #
     def _write_sidecar(self, extra=None):
@@ -160,6 +182,8 @@ class JournalWriter:
             "byte_order": "little",
             "channel_count": self._nch,
             "channel_labels": self._labels,
+            # the chip input each column came from (E1 = first input)
+            "channel_inputs": [f"E{i}" for i in range(1, self._nch + 1)],
             "sample_rate": self._fs,
             # gain + lsb_uv both come from the same source (the hardware
             # readback passed into __init__), so register and metadata cannot
@@ -214,6 +238,11 @@ class JournalWriter:
                 ).astype(JOURNAL_DTYPE)
                 fh.write(counts.tobytes())
                 self.samples_written += 1
+                t = frame.get("t")
+                if t is not None:
+                    if self._first_t is None:
+                        self._first_t = t
+                    self._last_t = t
 
                 # Durability: force the bytes to the platter roughly once a
                 # second. buffering=0 already avoids Python-side buffering.
@@ -233,6 +262,8 @@ class JournalWriter:
                     "samples_written": self.samples_written,
                     "stop_unix": time.time(),
                     "duration_sec": round(time.time() - self._start_time, 3),
+                    "measured_rate_hz": measured_rate(
+                        self.samples_written, self._first_t, self._last_t),
                 })
             except OSError as exc:
                 logger.warning("Could not finalize sidecar: %s", exc)

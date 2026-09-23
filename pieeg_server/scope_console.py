@@ -594,6 +594,7 @@ def main(argv=None):
     from .acquisition import AcquisitionLoop
     from .hardware import VREF_UV
     from .impedance import unsupported_reason
+    from .journal import referential_labels
     from .server import PiEEGServer
     from . import profiles
 
@@ -647,8 +648,10 @@ def main(argv=None):
                           interrupt=not (args.mock or ble or serial))
 
     # ---- server (plain ws://) + optional dashboard ------------------------- #
+    # Recordings carry the same input -> site map the viewer shows.
     server = PiEEGServer(acq, host=args.host, port=args.port,
-                         num_channels=acq.num_channels)
+                         num_channels=acq.num_channels,
+                         channel_labels=referential_labels(electrodes))
     server._lsl_groups = profiles.load_lsl_groups()
     server._recordings_dir = args.recordings_dir
     server.enable_webhooks()
