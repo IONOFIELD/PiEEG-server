@@ -135,3 +135,22 @@ def test_screen_mm_from_compositor(monkeypatch):
                         lambda *a, **k: type("R", (), {"stdout": out})())
     x, y = acq_viewer.screen_px_per_mm(Root())
     assert abs(x - 800 / 154) < 1e-9 and abs(y - 480 / 86) < 1e-9
+
+
+def test_ref_not_judged_while_gnd_is_off_or_settling(monkeypatch):
+    from pieeg_server import acq_viewer
+    clock = {"t": 0.0}
+    ct = acq_viewer.ContactTracker(8, clock=lambda: clock["t"])
+    verdicts = iter([{"ref": None, "gnd": "red"},      # BIO pulled
+                     {"ref": "red", "gnd": "green"},   # socket handled: glitch
+                     {"ref": "green", "gnd": "green"}])  # settled, 3 s later
+    monkeypatch.setattr(acq_viewer, "contact_from_signal",
+                        lambda *a, **k: {"leads": [], **next(verdicts)})
+    st = [{"ch": i + 1, "p_off": False} for i in range(8)]
+    ct.update(st, np.zeros((63, 8)))
+    clock["t"] = 1.0
+    ct.update(st, np.zeros((63, 8)))
+    assert ct.ref() is None                          # no false REF OFF
+    clock["t"] = 1.0 + acq_viewer.REF_SETTLE_AFTER_GND_S
+    ct.update(st, np.zeros((63, 8)))
+    assert ct.ref() == "green"

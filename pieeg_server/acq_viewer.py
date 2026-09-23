@@ -127,6 +127,13 @@ WINDOW_W, WINDOW_H = 1000, 640
 # Electrode contact is judged over this many redraws (~0.5 s): a lead-off
 # flag that flickers within the window reads as intermittent (amber).
 CONTACT_WINDOW = 8
+# REF can't be judged while GND (BIO) is off or settling: with the bias drive
+# on, a BIO socket being handled makes some lead-off flags recover for a
+# moment while the leads slide to a new level, and that slide looks like a
+# floating REF (on-person 2026-09-22: 5 false REF-off readings in 30 s of BIO
+# handling, none with BIO seated; the DC levels took ~2 s to settle after
+# BIO went back on). So REF shows no verdict for this long after GND reads off.
+REF_SETTLE_AFTER_GND_S = 3.0
 
 # ── dashboard (Geist) palette, adapted for the Tk scope ──────────────────────
 # Mirrors the dashboard's design tokens (dashboard/src/index.css): near-black
@@ -300,10 +307,13 @@ class ContactTracker:
     N-side flags are ignored — on this board they read off regardless of REF.
     """
 
-    def __init__(self, num_channels, window=CONTACT_WINDOW):
+    def __init__(self, num_channels, window=CONTACT_WINDOW,
+                 clock=time.monotonic):
         self._hist = [deque(maxlen=window) for _ in range(num_channels)]
         self._ref = deque(maxlen=window)
         self._gnd = deque(maxlen=window)
+        self._clock = clock
+        self._gnd_off_at = None
 
     def update(self, status, recent=None, full_scale_uv=VREF_UV / 24, fs=250):
         """Feed one leadoff_status() readout and the recent signal block
@@ -322,7 +332,13 @@ class ContactTracker:
         if recent is None:
             return
         verdict = contact_from_signal(status, recent, full_scale_uv, fs)
-        self._ref.append(verdict["ref"])
+        now = self._clock()
+        if verdict["gnd"] == "red":
+            self._gnd_off_at = now
+            self._ref.clear()           # its last readings were the fall
+        settling = (self._gnd_off_at is not None
+                    and now - self._gnd_off_at < REF_SETTLE_AFTER_GND_S)
+        self._ref.append(None if settling else verdict["ref"])
         self._gnd.append(verdict["gnd"])
 
     @staticmethod
