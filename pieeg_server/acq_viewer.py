@@ -1068,8 +1068,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                         highlightcolor=C["border_hi"], highlightthickness=1)
 
     # ---- toolbar: ONE row, so the chart gets the height ------------------ #
-    # Each group is one compact dropdown whose face shows its setting:
-    #   [Montage* ⌄][1–70 Hz N60 ⌄][30 mm/s ⌄][7 µV/mm ⌄][● Rec] … [Ω AVG][IP] REF GND
+    # Each group is one compact dropdown:
+    #   [Montage* ⌄][Filters ⌄][30 mm/s ⌄][7 µV/mm ⌄][● Rec] … [Ω AVG][IP] REF GND
     # Montage Save/Reset live at the bottom of the montage menu; LFF/HFF/Notch
     # are submenus of the filter menu; the AVG box runs the impedance check.
     # Channels are edited in the box a right-click on a lead opens.
@@ -1121,21 +1121,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     lff_var = tk.StringVar(value=_lff0)
     hff_var = tk.StringVar(value=_hff0)
     notch_var = tk.StringVar(value=_notch0)
-    filt_mb, filt_menu = _dropdown(bar, 13)
+    filt_mb, filt_menu = _dropdown(bar, 7)
+    filt_mb.configure(text="Filters")
     _submenu(filt_menu, "LFF (low cut)", lff_var, [c[0] for c in LFF_CHOICES],
              lambda: _filters_changed())
     _submenu(filt_menu, "HFF (high cut)", hff_var,
              [c[0] for c in HFF_CHOICES], lambda: _filters_changed())
     _submenu(filt_menu, "Notch", notch_var, [c[0] for c in NOTCH_CHOICES],
              lambda: _filters_changed())
-
-    def _filters_face():
-        # "1–70 Hz N60": LFF–HFF, then the notch when it is on
-        lf = lff_var.get().replace(" Hz", "")
-        hf = hff_var.get().replace(" Hz", "")
-        notch = notch_var.get().replace(" Hz", "")
-        filt_mb.configure(text=f"{lf}–{hf} Hz"
-                          + ("" if notch == "Off" else f" N{notch}"))
 
     # Timebase (real mm of glass per second) and sensitivity: value + unit.
     speed_var = tk.StringVar(value=str(DEFAULT_TIMEBASE))
@@ -1781,7 +1774,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _filters_changed():
         model.set_montage_filters(lff_var.get(), hff_var.get(),
                                   notch_var.get())
-        _filters_face()
         _apply_filters()
         _refresh_montage_label()
 
@@ -1791,10 +1783,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         lff_var.set(lff)
         hff_var.set(hff)
         notch_var.set(notch)
-        _filters_face()
         _apply_filters()
 
-    _filters_face()
     _apply_filters()
 
     # ---- draw loop -------------------------------------------------------- #
