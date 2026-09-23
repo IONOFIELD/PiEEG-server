@@ -271,7 +271,9 @@ NOTCH_CHOICES_DEFAULT_HZ = dict(NOTCH_CHOICES)[DEFAULT_NOTCH]
 class MontageStore:
     """Tiny JSON persistence for saved montage edits.
 
-    Maps montage name -> serialized rows. A corrupt/missing file just means
+    Maps montage name -> serialized rows, and (separately, so rows saved by
+    older versions still load) montage name -> its display filters as menu
+    labels {"lff", "hff", "notch"}. A corrupt/missing file just means
     "nothing saved" (the scope must never fail to launch over its montage
     file). Writes go through a temp file + os.replace so a power cut on the
     Pi can't leave a half-written store.
@@ -280,24 +282,31 @@ class MontageStore:
     def __init__(self, path=STORE_PATH):
         self.path = Path(path)
         self.data: dict[str, list] = {}
+        self.filters: dict[str, dict] = {}
         try:
             raw = json.loads(self.path.read_text())
-            montages = raw.get("montages", {}) if isinstance(raw, dict) else {}
+            raw = raw if isinstance(raw, dict) else {}
+            montages = raw.get("montages", {})
             self.data = {k: v for k, v in montages.items()
                          if isinstance(k, str) and isinstance(v, list)}
-        except (OSError, ValueError):
+            filters = raw.get("filters", {})
+            self.filters = {k: v for k, v in filters.items()
+                            if isinstance(k, str) and isinstance(v, dict)}
+        except (OSError, ValueError, AttributeError):
             pass
 
-    def put(self, name, rows):
-        """Save serialized rows under name; rows=None deletes the entry."""
-        if rows is None:
-            self.data.pop(name, None)
-        else:
-            self.data[name] = rows
+    def put(self, name, rows, filters=None):
+        """Save serialized rows and filters under name; None deletes each."""
+        for table, value in ((self.data, rows), (self.filters, filters)):
+            if value is None:
+                table.pop(name, None)
+            else:
+                table[name] = value
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps({"montages": self.data}, indent=2))
+            tmp.write_text(json.dumps({"montages": self.data,
+                                       "filters": self.filters}, indent=2))
             os.replace(tmp, self.path)
             return True
         except OSError:
@@ -411,6 +420,9 @@ class ViewerModel:
         # Per-montage working copies (session edits live here; presets never
         # change). Each row: {"pair": (a,b), "name": "Fp1-C3", "on": True}.
         self.sessions: dict[str, list[dict]] = {}
+        # Per-montage display filters, as menu labels (lff, hff, notch):
+        # each montage keeps its own, saved with its rows.
+        self.session_filters: dict[str, tuple] = {}
         self.store = store          # MontageStore or None (in-memory only)
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
@@ -463,6 +475,32 @@ class ViewerModel:
             out.append(item)
         return out
 
+    @staticmethod
+    def default_filters():
+        """Factory display filters (menu labels), read at call time."""
+        return (DEFAULT_LFF, DEFAULT_HFF, DEFAULT_NOTCH)
+
+    def _saved_filters(self, name):
+        """A montage's saved filters (lff, hff, notch labels), or None. A
+        label that is no longer a menu choice falls back to the default."""
+        if self.store is None or name not in self.store.filters:
+            return None
+        saved = self.store.filters[name]
+        return tuple(saved.get(key) if saved.get(key) in dict(choices)
+                     else default
+                     for key, choices, default in zip(
+                         ("lff", "hff", "notch"),
+                         (LFF_CHOICES, HFF_CHOICES, NOTCH_CHOICES),
+                         self.default_filters()))
+
+    def montage_filters(self, name=None):
+        """The (lff, hff, notch) labels the montage is shown with."""
+        return self.session_filters[name or self.current]
+
+    def set_montage_filters(self, lff, hff, notch):
+        """Filter change on the current montage (Save keeps it)."""
+        self.session_filters[self.current] = (lff, hff, notch)
+
     def load_montage(self, name):
         if name not in self.sessions:
             # First touch this session: a saved copy wins; otherwise "Custom"
@@ -471,6 +509,8 @@ class ViewerModel:
             saved = self._saved_rows(name)
             self.sessions[name] = (saved if saved is not None
                                    else self._factory_rows(name))
+            filters = self._saved_filters(name)
+            self.session_filters[name] = filters or self.default_filters()
         self.current = name
 
     def reset_current_to_preset(self):
@@ -479,17 +519,21 @@ class ViewerModel:
         # saved copy (if any) is untouched — the montage just goes dirty
         # against it, and Save persists the factory state (dropping the entry).
         self.sessions[self.current] = self._factory_rows(self.current)
+        self.session_filters[self.current] = self.default_filters()
 
     def dirty(self, name=None):
-        """True when a montage's rows differ from its saved copy (or, with
-        nothing saved, from its factory default) — i.e. Save would matter."""
+        """True when a montage's rows or filters differ from its saved copy
+        (or, with nothing saved, from the factory default) — i.e. Save would
+        matter."""
         name = name or self.current
         if name not in self.sessions:
             return False
         baseline = self._saved_rows(name)
         if baseline is None:
             baseline = self._factory_rows(name)
-        return self.sessions[name] != baseline
+        filters = self._saved_filters(name) or self.default_filters()
+        return (self.sessions[name] != baseline
+                or self.session_filters[name] != filters)
 
     def save_current(self):
         """Persist the current montage's rows so they survive a reboot.
@@ -502,7 +546,10 @@ class ViewerModel:
         rows = self.sessions[self.current]
         ser = (None if rows == self._factory_rows(self.current)
                else self._serialize(rows))
-        return self.store.put(self.current, ser)
+        filters = self.session_filters[self.current]
+        filt = (None if filters == self.default_filters()
+                else dict(zip(("lff", "hff", "notch"), filters)))
+        return self.store.put(self.current, ser, filt)
 
     # ---- chip-input (E-number) labelling ---------------------------------- #
     def elabel(self, site):
@@ -1086,12 +1133,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Filters chip: [LFF ⌄ HFF ⌄ NOTCH ⌄]
     fchip = _chip(bar)
     fchip.pack(side="left", padx=(0, 6), pady=1)
-    lff_var = _menu(fchip, "LFF", [c[0] for c in LFF_CHOICES], DEFAULT_LFF,
-                    lambda v: _apply_filters(), width=6)
-    hff_var = _menu(fchip, "HFF", [c[0] for c in HFF_CHOICES], DEFAULT_HFF,
-                    lambda v: _apply_filters(), width=5)
-    notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], DEFAULT_NOTCH,
-                      lambda v: _apply_filters(), width=5)
+    # Filters belong to the montage: they start as the montage's saved ones,
+    # a change marks it edited ("*"), and Save keeps them with its rows.
+    _lff0, _hff0, _notch0 = model.montage_filters()
+    lff_var = _menu(fchip, "LFF", [c[0] for c in LFF_CHOICES], _lff0,
+                    lambda v: _filters_changed(), width=6)
+    hff_var = _menu(fchip, "HFF", [c[0] for c in HFF_CHOICES], _hff0,
+                    lambda v: _filters_changed(), width=5)
+    notch_var = _menu(fchip, "Notch", [c[0] for c in NOTCH_CHOICES], _notch0,
+                      lambda v: _filters_changed(), width=5)
     # Sensitivity chip (display gain, kept separate from the frequency filters;
     # labelled by its unit alone to fit the 800 px panel)
     schip = _chip(bar)
@@ -1241,6 +1291,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _switch_montage(name):
         model.load_montage(name)
         _toast["until"] = 0.0
+        _show_montage_filters()
         _refresh_montage_label()
 
     def _save_montage():
@@ -1248,13 +1299,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _hint("no changes to save")
             return
         if model.save_current():
-            _hint(f"{model.current} saved · loads on startup")
+            _hint(f"{model.current} saved (leads + filters) · loads on startup")
         else:
             _hint("save failed (disk?)", fg=C["red"])
         _refresh_montage_label()
 
     def _reset_montage():
         model.reset_current_to_preset()
+        _show_montage_filters()
         _hint("Custom cleared" if model.current == CUSTOM_MONTAGE
               else "factory montage · Save to keep it")
         _refresh_montage_label()
@@ -1628,8 +1680,21 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         notch = dict(NOTCH_CHOICES)[notch_var.get()]
         model.set_filters(lff, hff, notch)
 
-    model.set_filters(dict(LFF_CHOICES)[DEFAULT_LFF], dict(HFF_CHOICES)[DEFAULT_HFF],
-                      dict(NOTCH_CHOICES)[DEFAULT_NOTCH])
+    def _filters_changed():
+        model.set_montage_filters(lff_var.get(), hff_var.get(),
+                                  notch_var.get())
+        _apply_filters()
+        _refresh_montage_label()
+
+    def _show_montage_filters():
+        # after a montage switch/reset: show and run that montage's filters
+        lff, hff, notch = model.montage_filters()
+        lff_var.set(lff)
+        hff_var.set(hff)
+        notch_var.set(notch)
+        _apply_filters()
+
+    _apply_filters()
 
     # ---- draw loop -------------------------------------------------------- #
     def _drain_queue():
