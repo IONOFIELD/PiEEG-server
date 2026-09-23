@@ -121,6 +121,21 @@ def read_annotations(journal_path):
     return [a for a in annos if isinstance(a, dict) and "frame" in a]
 
 
+def save_annotations(journal_path, annotations):
+    """Replace the session's annotation file with `annotations` (list of
+    dicts), crash-safe: written to a temp file, fsync'd, then renamed over
+    it, so a power cut leaves either the old notes or the new ones. Returns
+    the file's Path."""
+    path = annotations_path(journal_path)
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as fh:
+        json.dump({"annotations": list(annotations)}, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
 def _write_annotations(writer, annotations, fs, n_samples):
     # EDF+/BDF+ time is sample index / fs, so place each mark by its sample.
     for a in sorted(annotations, key=lambda a: a["frame"]):

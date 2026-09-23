@@ -690,15 +690,9 @@ class PiEEGServer:
                 "type": str(kind or "note"),
                 "timestamp": datetime.fromtimestamp(unix_t, timezone.utc)
                 .isoformat()}
-        path = edf_export.annotations_path(journal.journal_path)
         annos = edf_export.read_annotations(journal.journal_path)
         annos.append(anno)
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w") as fh:
-            json.dump({"annotations": annos}, fh, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        edf_export.save_annotations(journal.journal_path, annos)
         logger.info("Annotation %r at sample %d (%.2f s)", anno["text"],
                     frame, anno["time"])
         return anno
