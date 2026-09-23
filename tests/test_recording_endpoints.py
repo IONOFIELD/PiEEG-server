@@ -55,35 +55,39 @@ async def _record_briefly(tmp_path, seconds=1.2):
     return srv, captured.get("stop_info")
 
 
-async def test_stop_writes_edf_and_summary_into_the_session_folder(tmp_path):
+async def test_stop_writes_bdf_and_summary_into_the_session_folder(tmp_path):
     srv, stop_info = await _record_briefly(tmp_path)
     session = srv._last_session
     folder, raw = tmp_path / session, tmp_path / session / "raw"
 
-    # The folder holds the recording: EDF+ and its summary JSON ...
+    # The folder holds the recording: BDF+ and its summary JSON ...
     assert sorted(p.name for p in folder.iterdir()) == sorted(
-        [f"{session}.edf", f"{session}.json", "raw"])
+        [f"{session}.bdf", f"{session}.json", "raw"])
     # ... and raw/ the crash-safe journal, its sidecar and the CSV.
     for ext in ("eegj", "json", "csv"):
         assert (raw / f"{session}.{ext}").exists()
     assert not list(tmp_path.glob("*.eegj"))        # nothing left flat
-    assert stop_info["primary_format"] == "edf"
-    assert stop_info["edf"].endswith(f"{session}/{session}.edf")
-    assert not (raw / f"{session}.bdf").exists()    # BDF+ only on request
+    assert stop_info["primary_format"] == "bdf"
+    assert stop_info["bdf"].endswith(f"{session}/{session}.bdf")
+    assert not (raw / f"{session}.edf").exists()    # EDF+ only on request
 
     import json
     summary = json.loads((folder / f"{session}.json").read_text())
-    counts, _ = read_journal(raw / f"{session}.eegj")
-    assert summary["edf_file"] == f"{session}.edf"
+    counts, meta = read_journal(raw / f"{session}.eegj")
+    assert summary["bdf_file"] == f"{session}.bdf"
+    assert summary["file_format"] == "BDF+"
     assert summary["samples"] == counts.shape[0]
     assert summary["raw"]["journal"] == f"raw/{session}.eegj"
     assert len(summary["channels"]) == 8
-    with pyedflib.EdfReader(str(folder / f"{session}.edf")) as r:
+    with pyedflib.EdfReader(str(folder / f"{session}.bdf")) as r:
         assert r.signals_in_file == 8
         for ci, ch in enumerate(summary["channels"]):
-            assert ch["edf_physical_min_uv"] == r.getPhysicalMinimum(ci)
-            assert ch["edf_physical_max_uv"] == r.getPhysicalMaximum(ci)
-            assert ch["edf_step_uv"] > 0
+            # one fixed step on every channel: a single ADC count
+            assert ch["bdf_step_uv"] == round(meta["lsb_uv"], 6)
+            assert ch["data_min_uv"] <= ch["data_max_uv"]
+            dig = r.readSignal(ci, digital=True).astype(np.int64)
+            assert np.array_equal(dig[:counts.shape[0]],
+                                  counts[:, ci].astype(np.int64))
 
 
 async def test_download_bdf_is_valid_and_bit_exact(tmp_path):
@@ -94,7 +98,8 @@ async def test_download_bdf_is_valid_and_bit_exact(tmp_path):
     assert resp.status_code == 200
     assert resp.headers.get("Content-Disposition") == \
         f'attachment; filename="{session}.bdf"'
-    assert (tmp_path / session / "raw" / f"{session}.bdf").exists()
+    # the recording's own BDF+ (written on Stop, in its folder) is served
+    assert resp.body == (tmp_path / session / f"{session}.bdf").read_bytes()
 
     # Write the served bytes out and read them back with pyedflib.
     served = tmp_path / "served.bdf"
@@ -114,17 +119,21 @@ async def test_download_bdf_is_valid_and_bit_exact(tmp_path):
 
 
 async def test_on_demand_reexport_is_identical(tmp_path):
-    """Deleting the EDF and re-fetching rebuilds a byte-identical file."""
+    """Deleting the BDF and re-fetching rebuilds a byte-identical file; an
+    EDF+ is only made on request, into raw/."""
     srv, _ = await _record_briefly(tmp_path)
     session = srv._last_session
-    edf_path = tmp_path / session / f"{session}.edf"
+    bdf_path = tmp_path / session / f"{session}.bdf"
 
-    original = edf_path.read_bytes()      # the on-stop export
-    edf_path.unlink()                     # simulate a missing export
-    resp = await srv._serve_edf(_FakeReq(), {})   # forces on-demand re-export
+    original = bdf_path.read_bytes()      # the on-stop export
+    bdf_path.unlink()                     # simulate a missing export
+    resp = await srv._serve_bdf(_FakeReq(), {})   # forces on-demand re-export
     assert resp.status_code == 200
-    assert edf_path.exists()
+    assert bdf_path.exists()
     assert resp.body == original
+    resp = await srv._serve_edf(_FakeReq(), {})
+    assert resp.status_code == 200
+    assert (tmp_path / session / "raw" / f"{session}.edf").exists()
 
 
 async def test_old_flat_sessions_still_download(tmp_path):
@@ -150,10 +159,10 @@ async def test_api_recordings_lists_both_formats(tmp_path):
     payload = srv._list_recordings()
     rec = next(r for r in payload["recordings"] if r["session"] == session)
     assert rec["folder"] == str(tmp_path / session)
-    assert rec["has_edf"] is True and rec["has_sidecar"] is True
-    assert rec["has_bdf"] is False
-    assert rec["primary_format"] == "edf"
-    assert rec["formats"]["edf"]["primary"] is True
+    assert rec["has_bdf"] is True and rec["has_sidecar"] is True
+    assert rec["has_edf"] is False
+    assert rec["primary_format"] == "bdf"
+    assert rec["formats"]["bdf"]["primary"] is True
     assert rec["formats"]["bdf"]["lossless"] is True
     assert rec["formats"]["journal"]["source_of_truth"] is True
     assert rec["bdf_url"] == f"/download/bdf?session={session}"
@@ -175,7 +184,7 @@ async def test_unified_download_route_and_traversal_guard(tmp_path):
     assert guard.status_code == 404
 
 
-async def test_annotations_saved_during_recording_and_in_edf(tmp_path):
+async def test_annotations_saved_during_recording_and_in_bdf(tmp_path):
     loop = asyncio.get_running_loop()
     hw = MockHardware(num_channels=8, sample_rate=250)
     hw.open()
@@ -203,17 +212,20 @@ async def test_annotations_saved_during_recording_and_in_edf(tmp_path):
     eo = await srv._add_annotation("Eyes open", kind="EO")
     assert eo["frame"] > ec["frame"]
     session = srv._last_session
-    # notes live in the recording's folder, beside the EDF+
+    # notes live in the recording's folder, beside the BDF+
     saved = json.loads((tmp_path / session / f"{session}.annotations.json")
                        .read_text())["annotations"]
     assert [a["text"] for a in saved] == ["Eyes closed", "Eyes open"]
     assert [a["type"] for a in saved] == ["note", "EO"]
     await srv._stop_recording()
     acq.stop()
-    with pyedflib.EdfReader(str(tmp_path / session / f"{session}.edf")) as r:
+    with pyedflib.EdfReader(str(tmp_path / session / f"{session}.bdf")) as r:
         onsets, _, texts = r.readAnnotations()
     assert list(texts) == ["Eyes closed", "Eyes open"]
-    assert np.allclose(onsets, [ec["frame"] / 250, eo["frame"] / 250])
+    # on their samples; the header's sub-second start time is stored to a
+    # limited precision, so read-back onsets can differ by tens of µs
+    assert np.allclose(onsets, [ec["frame"] / 250, eo["frame"] / 250],
+                       rtol=0, atol=0.5 / 250)
     summary = json.loads((tmp_path / session / f"{session}.json").read_text())
     assert [(a["frame"], a["text"]) for a in summary["annotations"]] == [
         (ec["frame"], "Eyes closed"), (eo["frame"], "Eyes open")]

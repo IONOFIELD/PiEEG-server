@@ -300,13 +300,15 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
 
 
 def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
-    """Write the recording's summary JSON beside its EDF+.
+    """Write the recording's summary JSON beside its BDF+ (or EDF+).
 
     One readable file per recording: when and how it was recorded, each
-    channel's label, input and EDF+ resolution (the 16-bit step follows the
-    channel's own min..max, so a drifting or railed lead gets a coarse step —
-    the lossless journal in raw/ keeps full resolution), and the annotations
-    at their sample and second. Returns the output Path.
+    channel's label, input and resolution, and the annotations at their
+    sample and second. For a BDF+ (`edf_path` ending .bdf) the step is the
+    same on every channel (one ADC count, lsb_uv), with the channel's data
+    min..max beside it. For an EDF+ the 16-bit step follows the channel's
+    own min..max, so a drifting or railed lead gets a coarse step. Returns
+    the output Path.
     """
     journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
                                         Path(out_path))
@@ -315,14 +317,21 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
     labels = _channel_labels(meta, nch)
     inputs = meta.get("channel_inputs") or [f"E{i}" for i in range(1, nch + 1)]
     uv = counts.astype(np.float64) * float(meta["lsb_uv"])
+    bdf = edf_path.suffix.lower() == ".bdf"
     channels = []
     for ci in range(nch):
         pmin, pmax = _physical_range(uv[:, ci]) if len(uv) else (-1.0, 1.0)
-        channels.append({
-            "label": str(labels[ci]), "input": inputs[ci],
-            "edf_physical_min_uv": pmin, "edf_physical_max_uv": pmax,
-            "edf_step_uv": round((pmax - pmin) / (_EDF_DIG_MAX - _EDF_DIG_MIN),
-                                 6)})
+        if bdf:
+            channels.append({
+                "label": str(labels[ci]), "input": inputs[ci],
+                "data_min_uv": pmin, "data_max_uv": pmax,
+                "bdf_step_uv": round(float(meta["lsb_uv"]), 6)})
+        else:
+            channels.append({
+                "label": str(labels[ci]), "input": inputs[ci],
+                "edf_physical_min_uv": pmin, "edf_physical_max_uv": pmax,
+                "edf_step_uv": round((pmax - pmin)
+                                     / (_EDF_DIG_MAX - _EDF_DIG_MIN), 6)})
     rel = lambda p: os.path.relpath(p, out_path.parent)   # noqa: E731
     # the operator's name for the recording (set in the Scope's Files list)
     # outlives a rebuild of this file
@@ -334,7 +343,8 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         "format": "pieeg-recording-v1",
         "session": journal_path.stem,
         **({"nickname": nickname} if nickname else {}),
-        "edf_file": rel(edf_path),
+        "file_format": "BDF+" if bdf else "EDF+",
+        ("bdf_file" if bdf else "edf_file"): rel(edf_path),
         "start_iso": meta.get("start_iso"),
         "duration_sec": round(counts.shape[0] / fs, 3),
         "samples": int(counts.shape[0]),

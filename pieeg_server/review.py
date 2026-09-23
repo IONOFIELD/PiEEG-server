@@ -217,33 +217,33 @@ def remove_note(journal, note_id):
 
 
 def rebuild_exports(journal):
-    """Re-export the session's EDF+ and summary JSON from the journal so
-    they carry the current notes. The EDF+ is written beside, then renamed
-    over the old one (never a half-written file). A lossless BDF+ built
-    earlier on request is removed so the next download rebuilds it with the
-    notes. Returns the EDF+ Path, or None when the session has none to
-    update (an old flat session that never had one)."""
+    """Re-export the session's BDF+ and summary JSON from the journal so
+    they carry the current notes. The BDF+ is written beside, then renamed
+    over the old one (never a half-written file). Any EDF+ (the recording
+    file before v4.7, or one built on request) is removed: it would carry
+    the old notes, and the server rebuilds one on request. Returns the BDF+
+    Path, or None for an old flat session with no BDF+ to update."""
     session, folder, raw, flat = _session_of(journal)
-    edf = folder / f"{session}.edf"
-    if flat and not edf.exists():
+    bdf = folder / f"{session}.bdf"
+    if flat and not bdf.exists():
         return None
     with _export_lock:
-        tmp = folder / f"{session}.rebuild.edf"
+        tmp = folder / f"{session}.rebuild.bdf"
         try:
             edf_export.export_journal(journal, raw / f"{session}.json", tmp,
-                                      "edf")
-            os.replace(tmp, edf)
+                                      "bdf")
+            os.replace(tmp, bdf)
         finally:
             if tmp.exists():
                 tmp.unlink()
         if not flat:
-            edf_export.write_summary(journal, edf, folder / f"{session}.json",
+            edf_export.write_summary(journal, bdf, folder / f"{session}.json",
                                      raw / f"{session}.json")
-        for bdf in (raw / f"{session}.bdf", folder / f"{session}.bdf"):
-            if bdf.exists():
-                bdf.unlink()
-    logger.info("Rebuilt %s with its notes", edf)
-    return edf
+        for edf in (raw / f"{session}.edf", folder / f"{session}.edf"):
+            if edf.exists():
+                edf.unlink()
+    logger.info("Rebuilt %s with its notes", bdf)
+    return bdf
 
 
 def delete_session(journal, recordings_dir):
