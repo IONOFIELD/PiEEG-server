@@ -76,3 +76,26 @@ def test_rows_and_filters_saved_together(tmp_path):
     m2 = _model(path)
     assert m2.sessions[m2.current][0]["on"] is False
     assert m2.montage_filters() == ("1 Hz", "70 Hz", "Off")
+
+
+def test_set_row_pair_and_insert_row_edit_the_current_montage(tmp_path):
+    m = _model(tmp_path / "s.json")
+    name = m.current
+    rows = m.rows()
+    n = len(rows)
+    a, b, c = m.electrodes[0], m.electrodes[1], m.electrodes[6]
+    assert not m.set_row_pair(rows[0], a, a)            # self-pair refused
+    assert m.set_row_pair(rows[0], a, c)
+    assert rows[0]["pair"] == (a, c) and rows[0]["name"] == f"{a}-{c}"
+    new = m.insert_row(1, b, c, label="EMG 1")
+    assert m.current == name                            # stays on this montage
+    assert m.rows()[1] is new and new["label"] == "EMG 1"
+    assert len(m.rows()) == n + 1
+    assert m.insert_row(None, a, "nope") is None
+    assert m.insert_row(99, b, a)["pair"] == (b, a)     # clamped to the end
+    assert m.rows()[-1]["pair"] == (b, a)
+    assert m.dirty()
+    m.save_current()
+    m2 = _model(tmp_path / "s.json")
+    assert [r["pair"] for r in m2.rows()] == [r["pair"] for r in m.rows()]
+    assert m2.rows()[1]["label"] == "EMG 1"

@@ -91,7 +91,7 @@ CUSTOM_MONTAGE = "Custom"
 # dropped from it so it only ever holds real customisations.
 STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
-# session-built "Custom" montage you fill from the bipolar picker. Selecting a
+# "Custom" montage you fill channel by channel (right-click → Add). Selecting a
 # preset always snaps straight back to it.
 MONTAGE_NAMES = list(MONTAGE_PRESETS) + [CUSTOM_MONTAGE]
 
@@ -504,7 +504,7 @@ class ViewerModel:
     def load_montage(self, name):
         if name not in self.sessions:
             # First touch this session: a saved copy wins; otherwise "Custom"
-            # starts empty (filled from the bipolar picker) and the presets
+            # starts empty (filled from the channel box) and the presets
             # seed from their read-only definition.
             saved = self._saved_rows(name)
             self.sessions[name] = (saved if saved is not None
@@ -599,6 +599,30 @@ class ViewerModel:
         rows.append({"pair": (upper, lower), "name": f"{upper}-{lower}",
                      "on": True})
         return True
+
+    def set_row_pair(self, row, upper, lower):
+        """Point a row at a different electrode pair (upper - lower).
+        Returns False, changing nothing, for a self-pair or unknown site."""
+        if (upper == lower or upper not in self.site_index
+                or lower not in self.site_index):
+            return False
+        row["pair"] = (upper, lower)
+        row["name"] = f"{upper}-{lower}"
+        return True
+
+    def insert_row(self, index, upper, lower, label=None):
+        """Add an (upper - lower) channel to the CURRENT montage at `index`
+        (clamped; None = the end). Returns the new row, or None for a
+        self-pair or unknown site."""
+        if (upper == lower or upper not in self.site_index
+                or lower not in self.site_index):
+            return None
+        rows = self.rows()
+        row = {"pair": (upper, lower), "name": f"{upper}-{lower}", "on": True}
+        self.set_row_label(row, label)
+        index = len(rows) if index is None else max(0, min(index, len(rows)))
+        rows.insert(index, row)
+        return row
 
     def rows(self):
         return self.sessions[self.current]
@@ -1058,10 +1082,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                         highlightcolor=C["border_hi"], highlightthickness=1)
 
     # ---- row 1 (top): montage controls ----------------------------------- #
-    # The montage picker + Reset, then the bipolar channel builder: pick any two
-    # electrodes and Add them as a bipolar channel, which builds the "Custom"
-    # montage and selects it; switch the Montage dropdown back to any preset at
-    # any time to snap to it. Each cluster lives in its own bordered chip.
+    # The montage picker + Save/Reset and the timebase. Channels themselves
+    # are edited in the box a right-click on a lead opens. Each cluster lives
+    # in its own bordered chip.
     bar2 = tk.Frame(root, bg=C["surface"])
     bar2.pack(side="top", fill="x", padx=8, pady=(6, 2))
 
@@ -1098,31 +1121,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     elec_choices = [(f"{model.elabel(s)}  {s}", s) for s in model.electrodes]
     elec_display = [d for d, _ in elec_choices]
     _disp_to_site = dict(elec_choices)
-    _b_default = elec_display[2] if len(elec_display) > 2 else elec_display[-1]
-
-    # Bipolar chip: [BIPOLAR A – B  +] — "+" adds the selected pair to the
-    # Custom montage and reads as part of the channel it builds. Kept compact
-    # so the whole row fits the 800 px panel beside the IP button.
-    grp = _chip(bar2)
-    grp.pack(side="left", padx=(0, 0), pady=1)
-    tk.Label(grp, text="BIPOLAR", bg=C["raised"], fg=C["text_dim"],
-             font=("TkDefaultFont", _fs(9))).pack(side="left", padx=(8, 4))
-    a_var = tk.StringVar(value=elec_display[0])
-    ttk.OptionMenu(grp, a_var, elec_display[0], *elec_display).pack(side="left")
-    grp.winfo_children()[-1].configure(width=7)
-    tk.Label(grp, text="–", bg=C["raised"], fg=C["text_sec"]).pack(side="left",
-                                                                   padx=4)
-    b_var = tk.StringVar(value=_b_default)
-    ttk.OptionMenu(grp, b_var, _b_default, *elec_display).pack(side="left")
-    grp.winfo_children()[-1].configure(width=7)
-    ttk.Button(grp, text="+", width=2,
-               command=lambda: _add_bipolar()).pack(side="left", padx=(6, 4),
-                                                     pady=2)
+    _site_to_disp = {site: d for d, site in elec_choices}
+    # Channels (which electrodes, name, order, add/remove) are edited in the
+    # box a right-click on a lead opens, not on the toolbar, to keep the
+    # bars small.
 
     # Timebase chip: [MM/S ⌄] — real millimetres of screen per second, from
     # the panel's physical size, so 30 mm/s is 30 mm/s on the glass.
     tchip = _chip(bar2)
-    tchip.pack(side="left", padx=(6, 0), pady=1)
+    tchip.pack(side="left", padx=(0, 0), pady=1)
     speed_var = _menu(tchip, "mm/s", [str(v) for v in TIMEBASE_CHOICES],
                       str(DEFAULT_TIMEBASE), lambda v: None, width=2)
 
@@ -1267,8 +1274,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _hint(f"{m['text']} marked at {secs // 60:02d}:{secs % 60:02d}",
                       fg=C["yellow"])
 
-    canvas.bind("<Button-3>", lambda e: _lead_menu(e))
-    canvas.bind("<Button-2>", lambda e: _lead_menu(e))
+    canvas.bind("<Button-3>", lambda e: _channel_box(e))
+    canvas.bind("<Button-2>", lambda e: _channel_box(e))
 
     # ---- control callbacks ------------------------------------------------ #
     def _refresh_montage_label():
@@ -1309,20 +1316,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _show_montage_filters()
         _hint("Custom cleared" if model.current == CUSTOM_MONTAGE
               else "factory montage · Save to keep it")
-        _refresh_montage_label()
-
-    def _add_bipolar():
-        a = _disp_to_site.get(a_var.get())
-        b = _disp_to_site.get(b_var.get())
-        if not a or not b or a == b:
-            _hint("pick two different electrodes")
-            return
-        added = model.add_bipolar(a, b)        # switches current -> Custom
-        if added:
-            _hint(f"added {model.epair_name((a, b))} to Custom  ·  "
-                  "right-click a lead to edit")
-        else:
-            _hint("already in Custom")
         _refresh_montage_label()
 
     _rec = {"future": None}
@@ -1616,63 +1609,159 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         k = int(y // (H / len(rows)))
         return rows[k] if 0 <= k < len(rows) else None
 
-    def _rename_channel(r):
-        from tkinter import simpledialog
-        new = simpledialog.askstring(
-            "Rename channel",
-            f"Name for {model.epair_name(r['pair'])}  ({r['name']}):\n"
-            "(blank restores the electrode-pair name)",
-            initialvalue=model.row_label(r), parent=root)
-        if new is not None:
-            model.set_row_label(r, new)
-            _edited()
+    _box = {"win": None}
 
-    def _lead_menu(evt):
-        # One context menu edits YOUR copy of the current montage: rename,
-        # hide (prune), reorder, un-hide — and remove, for rows of the Custom
-        # montage you built yourself. Every action marks the montage dirty
-        # (the "*" on the picker) until Save persists it.
+    def _close_channel_box():
+        win = _box["win"]
+        _box["win"] = None
+        if win is not None and win.winfo_exists():
+            win.grab_release()
+            win.destroy()
+
+    def _channel_box(evt):
+        # One small box edits the channel under the pointer — its name, the
+        # two electrodes it is made of, its place in the list, hide/remove —
+        # or adds a new one. It edits YOUR copy of the current montage: every
+        # change marks it dirty (the "*" on the picker) until Save keeps it,
+        # and Reset brings back the factory montage.
+        _close_channel_box()
         rows = model.rows()
         r = _row_at_y(evt.y)
-        menu = tk.Menu(root, tearoff=0, bg=C["raised"], fg=C["text"],
-                       activebackground=C["accent"], activeforeground="#ffffff",
-                       bd=0)
-
-        def _act(fn):
-            return lambda: (fn(), _edited())
-
-        if r is not None:
-            i = next(k for k, row in enumerate(rows) if row is r)
-            vis = [k for k, row in enumerate(rows) if row["on"]]
-            vpos = vis.index(i)
-            menu.add_command(label=f"Rename {model.row_label(r)}…",
-                             command=lambda: _rename_channel(r))
-            menu.add_command(label="Hide channel",
-                             command=_act(lambda: model.toggle_row(i)))
-            menu.add_command(
-                label="Move up",
-                state="normal" if vpos > 0 else "disabled",
-                command=_act(lambda: model.move_row(i, vis[vpos - 1])))
-            menu.add_command(
-                label="Move down",
-                state="normal" if vpos < len(vis) - 1 else "disabled",
-                command=_act(lambda: model.move_row(i, vis[vpos + 1])))
-            if model.current == CUSTOM_MONTAGE:
-                menu.add_command(label="Remove channel",
-                                 command=_act(lambda: model.remove_row(i)))
+        i = next((k for k, row in enumerate(rows) if row is r), None)
+        vis = [k for k, row in enumerate(rows) if row["on"]]
         hidden = [k for k, row in enumerate(rows) if not row["on"]]
+
+        win = tk.Toplevel(root, bg=C["raised"], highlightthickness=1,
+                          highlightbackground=C["border_hi"])
+        _box["win"] = win
+        win.title(f"Channel {model.row_label(r)}" if r else "Add channel")
+        win.transient(root)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", _close_channel_box)
+        win.bind("<Escape>", lambda e: _close_channel_box())
+        pad = dict(padx=6, pady=3)
+
+        def label(text, row_):
+            tk.Label(win, text=text.upper(), bg=C["raised"], fg=C["text_dim"],
+                     font=("TkDefaultFont", _fs(9))).grid(
+                         row=row_, column=0, sticky="w", **pad)
+
+        label("Name", 0)
+        name_var = tk.StringVar(value=model.row_label(r) if r else "")
+        name_ent = tk.Entry(win, textvariable=name_var, width=18,
+                            bg=C["surface"], fg=C["text"],
+                            insertbackground=C["text"], relief="flat",
+                            font=(_MONO, _fs(10)))
+        name_ent.grid(row=0, column=1, columnspan=3, sticky="we", **pad)
+
+        label("Electrodes", 1)
+        a0, b0 = (r["pair"] if r else
+                  (model.electrodes[0], model.electrodes[min(
+                      2, len(model.electrodes) - 1)]))
+        a_var = tk.StringVar(value=_site_to_disp[a0])
+        b_var = tk.StringVar(value=_site_to_disp[b0])
+        ttk.OptionMenu(win, a_var, a_var.get(), *elec_display).grid(
+            row=1, column=1, sticky="w", **pad)
+        tk.Label(win, text="–", bg=C["raised"], fg=C["text_sec"]).grid(
+            row=1, column=2)
+        ttk.OptionMenu(win, b_var, b_var.get(), *elec_display).grid(
+            row=1, column=3, sticky="w", **pad)
+
+        def pair():
+            a, b = _disp_to_site[a_var.get()], _disp_to_site[b_var.get()]
+            if a == b:
+                _hint("pick two different electrodes", fg=C["yellow"])
+                return None
+            return a, b
+
+        def done(fn):
+            fn()
+            _edited()
+            _close_channel_box()
+
+        def ok():
+            p = pair()
+            if p is None:
+                return
+            if r is None:
+                model.insert_row(None, *p, label=name_var.get())
+                _hint(f"added {model.epair_name(p)}")
+            else:
+                # An unrenamed channel is named after its pair, so its name
+                # follows the new pair; a custom name ("EMG 1") is kept.
+                name = name_var.get().strip()
+                if not r.get("label") and name == r["name"]:
+                    name = ""
+                model.set_row_pair(r, *p)
+                model.set_row_label(r, name)
+            _edited()
+            _close_channel_box()
+
+        def add_new():
+            p = pair()
+            if p is None:
+                return
+            model.insert_row(None if i is None else i + 1, *p)
+            _hint(f"added {model.epair_name(p)} below")
+            _edited()
+            _close_channel_box()
+
+        btns = tk.Frame(win, bg=C["raised"])
+        btns.grid(row=2, column=0, columnspan=4, sticky="we", **pad)
+        if r is not None:
+            vpos = vis.index(i)
+            ttk.Button(btns, text="▲", width=2,
+                       state="normal" if vpos > 0 else "disabled",
+                       command=lambda: done(lambda: model.move_row(
+                           i, vis[vpos - 1]))).pack(side="left")
+            ttk.Button(btns, text="▼", width=2,
+                       state="normal" if vpos < len(vis) - 1 else "disabled",
+                       command=lambda: done(lambda: model.move_row(
+                           i, vis[vpos + 1]))).pack(side="left", padx=(2, 8))
+            ttk.Button(btns, text="Hide", width=5,
+                       command=lambda: done(lambda: model.toggle_row(i))
+                       ).pack(side="left")
+            ttk.Button(btns, text="Remove", width=7,
+                       command=lambda: done(lambda: model.remove_row(i))
+                       ).pack(side="left", padx=(2, 0))
+
+        next_row = 3
         if hidden:
-            if r is not None:
-                menu.add_separator()
-            sub = tk.Menu(menu, tearoff=0, bg=C["raised"], fg=C["text"],
-                          activebackground=C["accent"],
-                          activeforeground="#ffffff", bd=0)
-            for k in hidden:
-                sub.add_command(label=model.row_label(rows[k]),
-                                command=_act(lambda k=k: model.toggle_row(k)))
-            menu.add_cascade(label="Show hidden channel", menu=sub)
-        if menu.index("end") is not None:
-            menu.tk_popup(evt.x_root, evt.y_root)
+            label("Show hidden", next_row)
+            names = [model.row_label(rows[k]) for k in hidden]
+            show_var = tk.StringVar(value="—")
+
+            def show(name):
+                k = hidden[names.index(name)]
+                done(lambda: model.toggle_row(k))
+            ttk.OptionMenu(win, show_var, "—", *names,
+                           command=show).grid(row=next_row, column=1,
+                                              columnspan=3, sticky="w", **pad)
+            next_row += 1
+
+        foot = tk.Frame(win, bg=C["raised"])
+        foot.grid(row=next_row, column=0, columnspan=4, sticky="we", **pad)
+        if r is not None:
+            ttk.Button(foot, text="+ Add as new", command=add_new
+                       ).pack(side="left")
+        ttk.Button(foot, text="OK" if r else "Add", width=5,
+                   command=ok).pack(side="right")
+        ttk.Button(foot, text="Cancel", width=6,
+                   command=_close_channel_box).pack(side="right", padx=(0, 4))
+        win.bind("<Return>", lambda e: ok())
+
+        # beside the pointer, kept on screen
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = min(max(0, evt.x_root + 8), root.winfo_screenwidth() - w)
+        y = min(max(0, evt.y_root - h // 2), root.winfo_screenheight() - h)
+        win.geometry(f"+{x}+{y}")
+        win.attributes("-topmost", True)
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass                            # not viewable yet: no grab
 
     def _apply_filters():
         lff = dict(LFF_CHOICES)[lff_var.get()]

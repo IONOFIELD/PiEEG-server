@@ -235,6 +235,11 @@ SCOPE_CHANGELOG = [
             "<session>.json (channels, times, sample rate, each channel's EDF "
             "step, annotations); raw/ inside it keeps the lossless crash-safe "
             "journal and CSV. A lossless BDF+ is still available on request."),
+    ("3.9", "Channels are edited in one small box: right-click a lead to set "
+            "its name and the two electrodes it is made of, move it up or "
+            "down, hide or remove it, show a hidden one, or add a new channel "
+            "below it (right-click an empty chart adds one). The Bipolar "
+            "builder is gone from the top bar."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
