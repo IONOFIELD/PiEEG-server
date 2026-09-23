@@ -112,6 +112,8 @@ DEFAULT_NOTCH = "60 Hz"   # local mains (US grid)
 # HFF roll-off: 4th-order Butterworth (-24 dB/octave). 2nd order left the
 # 70 Hz setting only -1.3 dB at 60 Hz and -5.9 dB at 80 Hz.
 HFF_ORDER = 4
+# LFF roll-off: first order, like an analog RC coupling (time constant).
+LFF_ORDER = 1
 DEFAULT_SENS = 7          # microvolts per millimetre
 
 WINDOW_SECONDS = 10.0     # initial strip-chart length; the timebase sets it
@@ -193,7 +195,9 @@ class StreamingFilter:
         nyq = self._fs / 2.0
         self._hp = None
         if lff is not None and 0 < lff < nyq:
-            self._hp = signal.butter(2, lff / nyq, btype="highpass")
+            # single pole, the RC time-constant filter: TC = 1 / (2π·LFF),
+            # -6 dB/octave (0.3 Hz ≈ TC 0.53 s, 1 Hz ≈ TC 0.16 s)
+            self._hp = signal.butter(LFF_ORDER, lff / nyq, btype="highpass")
         self._lp = None
         if hff is not None and 0 < hff < nyq:
             self._lp = signal.butter(HFF_ORDER, hff / nyq, btype="lowpass")
@@ -719,6 +723,13 @@ def screen_px_per_mm(root=None):
         except Exception:                   # noqa: BLE001 - Tk error, fall back
             pass
     return PX_PER_MM, PX_PER_MM
+
+
+def trace_y(vals, base, sens, px_per_mm, half):
+    """Canvas y for trace values in µV: NEGATIVE UP (EEG convention), `sens`
+    µV per real millimetre, clipped to ±half pixels around the row centre
+    `base` (canvas y grows downward, so +µV maps below the centre)."""
+    return base + np.clip(np.asarray(vals) / sens * px_per_mm, -half, half)
 
 
 def sweep_chunks(first, last, ncol, size):
@@ -1657,7 +1668,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
                                        head, ncol)
             base = k * row_h + row_h / 2.0
-            ys.append(base - np.clip(vals / sens * _px_mm["y"], -half, half))
+            ys.append(trace_y(vals, base, sens, _px_mm["y"], half))
         gap = max(2, ncol // 100)                 # erase gap, ~0.1 s
 
         def draw(a, b):

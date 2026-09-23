@@ -215,7 +215,8 @@ SCOPE_CHANGELOG = [
             "ring at start-up or after a filter change when an electrode has "
             "a DC offset. The sweep head always shows the same small gap. The "
             "sps readout averages over 10 s, so it no longer jumps between "
-            "248 and 263."),
+            "248 and 263. Negative is drawn up. LFF is a single-pole "
+            "(time-constant) filter: TC = 1/(2π·LFF)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
