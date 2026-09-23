@@ -246,6 +246,7 @@ SCOPE_CHANGELOG = [
             "then the AVG box (tap it to check impedance), IP, REF and GND. "
             "The channel box is smaller and opens right at the pointer; Esc, "
             "✕ or a tap outside closes it."),
+    ("4.1", "The filter menu is simply labelled \"Filters\"."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
