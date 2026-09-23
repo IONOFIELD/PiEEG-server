@@ -1995,10 +1995,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _close_popup()
         _note_form("Note" if ago < 0.5 else f"Note  −{ago:.1f} s", put, evt)
 
-    def _note_form(title, put, evt):
+    def _note_form(title, put, evt, above=None):
         """The note popup: EC / EO / MVMT, or typed text. put(short, text,
-        kind) saves the choice."""
+        kind) saves the choice. above(body), if given, fills the top of the
+        box first (the notes already at that spot)."""
         win, body = _popup(title)
+        if above is not None:
+            above(body)
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(2, 4))
         for short, text in NOTE_KINDS:
@@ -2050,6 +2053,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         sec = max(0, int(sec))
         return (f"{sec // 3600}:{sec // 60 % 60:02d}:{sec % 60:02d}"
                 if sec >= 3600 else f"{sec // 60:02d}:{sec % 60:02d}")
+
+    def _mmss_t(sec):
+        """mm:ss.t — to the tenth, for notes that sit close together."""
+        tenths = int(round(max(0.0, sec) * 10))
+        return f"{_mmss(tenths // 10)}.{tenths % 10}"
 
     def _active_session():
         if record_control is None:
@@ -2406,31 +2414,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _rev_note_box(evt):
         W = max(1, canvas.winfo_width())
         px = W / model.win
-        near = [a for a in _rev["notes"]
-                if abs((a["frame"] - _rev["start"] + 0.5) * px - evt.x) <= 8]
+        # notes at this spot: the line within 8 px, or a tap on its flag
+        hit = {k for k, (x0, y0, x1, y1) in _flag_boxes.items()
+               if x0 <= evt.x <= x1 and y0 <= evt.y <= y1}
+        near = sorted((a for a in _rev["notes"]
+                       if a.get("id") in hit
+                       or abs((a["frame"] - _rev["start"] + 0.5) * px
+                              - evt.x) <= 8),
+                      key=lambda a: a["frame"])
         journal = _rev["info"]["journal"]
-        if near:
-            a = min(near, key=lambda a: abs(
-                (a["frame"] - _rev["start"] + 0.5) * px - evt.x))
-            win, body = _popup(f"Note  {_mmss(a['frame'] / model.fs)}")
-            tk.Label(body, text=a.get("text", ""), bg=C["raised"],
-                     fg=C["text"], wraplength=220, justify="left",
-                     font=(_MONO, _fs(10))).pack(anchor="w", pady=(2, 6))
-
-            def remove():
-                _close_popup()
-                try:
-                    review_store.remove_note(journal, a.get("id"))
-                except Exception as e:      # noqa: BLE001
-                    _hint(f"note not removed: {e}", seconds=8, fg=C["red"])
-                    return
-                _rev_notes_changed(journal)
-                _hint(f"removed {a.get('text', '')} · updating BDF+…",
-                      fg=C["yellow"])
-            ttk.Button(body, text="Remove note", command=remove).pack(
-                anchor="e")
-            _show_popup(win, evt)
-            return
         frame = _rev_frame_at_x(evt.x)
         if frame is None:
             return
@@ -2444,9 +2436,40 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _hint(f"{text} not saved: {e}", seconds=8, fg=C["red"])
                 return
             _rev_notes_changed(journal)
-            _hint(f"{text} at {_mmss(frame / model.fs)} · updating BDF+…",
+            _hint(f"{text} at {_mmss_t(frame / model.fs)} · updating BDF+…",
                   fg=C["yellow"])
-        _note_form(f"Note  {_mmss(frame / model.fs)}", put, evt)
+
+        def remove(a):
+            _close_popup()
+            try:
+                review_store.remove_note(journal, a.get("id"))
+            except Exception as e:          # noqa: BLE001
+                _hint(f"note not removed: {e}", seconds=8, fg=C["red"])
+                return
+            _rev_notes_changed(journal)
+            _hint(f"removed {a.get('text', '')} · updating BDF+…",
+                  fg=C["yellow"])
+
+        def existing(body):
+            # one row per note here, each with its own Remove
+            for a in near:
+                row = tk.Frame(body, bg=C["raised"])
+                row.pack(fill="x", pady=(2, 0))
+                text = str(a.get("text", ""))
+                tk.Label(row, text=f"{_mmss_t(a['frame'] / model.fs)}  "
+                                   f"{text[:24] + ('…' if len(text) > 24 else '')}",
+                         bg=C["raised"], fg=C["yellow"], anchor="w",
+                         font=(_MONO, _fs(9))).pack(side="left")
+                ttk.Button(row, text="Remove", width=7,
+                           command=lambda a=a: remove(a)).pack(
+                               side="right", padx=(6, 0))
+            tk.Frame(body, bg=C["border_hi"], height=1).pack(fill="x",
+                                                            pady=(6, 2))
+            tk.Label(body, text="add another here", bg=C["raised"],
+                     fg=C["text_sec"], anchor="w",
+                     font=(_MONO, _fs(8))).pack(fill="x")
+        _note_form(f"Note  {_mmss_t(frame / model.fs)}", put, evt,
+                   above=existing if near else None)
 
     def _rev_notes_changed(journal):
         if _rev["on"] and _rev["info"]["journal"] == journal:
@@ -2670,37 +2693,51 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if sig == _overlay["marks"]:
             return
         _overlay["marks"] = sig
-        _draw_flags([(((m["total"] - 1) % win + 0.5) * W / win, m["text"])
-                     for m in shown], W, H)
+        _draw_flags([(((m["total"] - 1) % win + 0.5) * W / win, m["text"],
+                      None) for m in shown], W, H)
+
+    _flag_boxes = {}                        # note key -> its flag's box
+    _flag_font = tkfont.Font(family=_MONO, size=_fs(9), weight="bold")
+    FLAG_ROW = 18
 
     def _draw_flags(flags, W, H):
         """Notes on the EEG: a yellow line at each note's sample with its
-        text in a box at the top. A box that would run into the one before
-        drops a level (three levels, then back to the top)."""
+        text in a box at the top. A box that would run into one already
+        drawn goes to the first row down where it fits — its own row when
+        notes share a spot — as many rows as the chart has room for.
+        flags: (x, text, key)."""
         canvas.delete("marks")
-        font = (_MONO, _fs(9), "bold")
-        ends = []                           # right edge of the last box per level
-        for x, text in sorted(flags):
+        _flag_boxes.clear()
+        rows = max(1, int((H - 6) // FLAG_ROW))
+        ends = []                           # right edge of the last box per row
+        for x, text, key in sorted(flags, key=lambda f: f[0]):
             text = str(text)
             if len(text) > 28:
                 text = text[:27] + "…"
             canvas.create_line(x, 0, x, H, fill=C["yellow"], tags="marks")
-            level = next((k for k, e in enumerate(ends) if x > e + 4),
-                         len(ends) if len(ends) < 3 else 0)
-            y = 3 + level * 18
-            right = x + 4 < W - 60          # label right of the line if room
+            w = _flag_font.measure(text) + 6
+            right = x + 5 + w < W           # label right of the line if room
+            left = x + 2 if right else x - 5 - w
+            row = next((k for k, e in enumerate(ends) if left > e + 4), None)
+            if row is None:
+                if len(ends) < rows:
+                    row = len(ends)
+                    ends.append(-1e9)
+                else:                       # no room: the row freest here
+                    row = min(range(rows), key=lambda k: ends[k])
+            y = 3 + row * FLAG_ROW
             tid = canvas.create_text(x + 5 if right else x - 5, y + 2,
                                      text=text, anchor="nw" if right else "ne",
-                                     fill=C["yellow"], font=font, tags="marks")
+                                     fill=C["yellow"], font=_flag_font,
+                                     tags="marks")
             bx0, by0, bx1, by1 = canvas.bbox(tid)
-            bg = canvas.create_rectangle(bx0 - 3, by0 - 2, bx1 + 3, by1 + 2,
-                                         fill=C["canvas_bg"],
+            box = (bx0 - 3, by0 - 2, bx1 + 3, by1 + 2)
+            bg = canvas.create_rectangle(*box, fill=C["canvas_bg"],
                                          outline=C["yellow"], tags="marks")
             canvas.tag_lower(bg, tid)
-            if level < len(ends):
-                ends[level] = max(ends[level], bx1 + 3)
-            else:
-                ends.append(bx1 + 3)
+            ends[row] = max(ends[row], box[2])
+            if key is not None:
+                _flag_boxes[key] = box
         canvas.tag_raise("marks")
         canvas.tag_raise("toast")
 
@@ -2713,8 +2750,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if sig == _overlay["marks"]:
             return
         _overlay["marks"] = sig
-        _draw_flags([((a["frame"] - s + 0.5) * W / win, a.get("text", ""))
-                     for a in shown], W, H)
+        _draw_flags([((a["frame"] - s + 0.5) * W / win, a.get("text", ""),
+                      a.get("id")) for a in shown], W, H)
 
     def _draw_static(rows, W, H, row_h, half, sens, box_w, box_x):
         sig = (W, H, sens, model.win, tuple((r["pair"], model.epair_name(r["pair"]),

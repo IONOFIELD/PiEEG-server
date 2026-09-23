@@ -284,6 +284,11 @@ SCOPE_CHANGELOG = [
             "0.022 µV step on every channel, calibration included) instead of "
             "the EDF+, and notes edited in review rebuild it. No EDF+ is kept; "
             "the server still builds one on request (/download/edf) into raw/."),
+    ("4.8", "Notes close together: flags that would overlap each get their own "
+            "row (notes on the same spot stack), as many rows as the chart "
+            "has. In review, double-clicking a note (its line or its flag) "
+            "lists every note there with its own Remove, and still adds a new "
+            "note at that spot; times show to the tenth of a second."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
