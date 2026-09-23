@@ -151,3 +151,27 @@ def test_prefilter_from_sidecar_reaches_the_bdf_header(tmp_path):
         assert r.getPrefilter(1) == meta["prefilter"]
     finally:
         r.close()
+
+
+def test_annotations_file_reaches_bdf_and_edf_on_their_samples(tmp_path):
+    counts = np.zeros((2500, 2), dtype=np.int64)          # 10 s @ 250
+    jrnl = _make_journal(tmp_path, counts)
+    edf_export.annotations_path(jrnl).write_text(json.dumps({"annotations": [
+        {"id": 2, "frame": 1500, "time": 6.0, "text": "Eyes open"},
+        {"id": 1, "frame": 500, "time": 2.0, "text": "Eyes closed"},
+    ]}))
+    assert edf_export.annotations_path(jrnl).name == "sess.csv.annotations.json"
+    for fmt in ("bdf", "edf"):
+        out = edf_export.export_journal(jrnl, fmt=fmt)
+        with pyedflib.EdfReader(str(out)) as r:
+            onsets, _, texts = r.readAnnotations()
+        assert list(texts) == ["Eyes closed", "Eyes open"]
+        assert np.allclose(onsets, [2.0, 6.0])
+
+
+def test_no_annotations_file_exports_without_marks(tmp_path):
+    jrnl = _make_journal(tmp_path, np.zeros((500, 2), dtype=np.int64))
+    assert edf_export.read_annotations(jrnl) == []
+    out = edf_export.export_journal(jrnl)
+    with pyedflib.EdfReader(str(out)) as r:
+        assert len(r.readAnnotations()[0]) == 0

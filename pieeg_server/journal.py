@@ -168,6 +168,20 @@ class JournalWriter:
         self._start_time = None
         self._first_t = self._last_t = None     # first/last frame times
 
+    def sample_at(self, unix_t):
+        """Journal index of the sample taken at wall-clock time ``unix_t``.
+
+        Frame times are the physical sample times, so counting back from the
+        newest written sample places an event on the sample it happened at
+        (the decimation delay and queueing don't shift it). Clamped to the
+        samples written so far. Call from the event loop that runs ``run()``.
+        """
+        if self._last_t is None:
+            return 0
+        newest = self.samples_written - 1       # index of the newest sample
+        back = round((self._last_t - unix_t) * self._fs)
+        return max(0, min(newest, newest - back))
+
     # ---- sidecar -------------------------------------------------------- #
     def _write_sidecar(self, extra=None):
         """Write (or rewrite) the JSON header and fsync it to disk.

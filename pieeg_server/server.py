@@ -19,8 +19,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -642,6 +643,38 @@ class PiEEGServer:
         }
         stop_info.update(edf_info)
         await self._broadcast_record_status(stop_info=stop_info)
+
+    async def _add_annotation(self, text, unix_t=None):
+        """Mark an event (e.g. "Eyes closed") in the running recording.
+
+        Placed on the journal sample taken at ``unix_t`` (the press time; now
+        if None) and saved at once to ``<session>.csv.annotations.json``, the
+        file the dashboard's session viewer reads and writes, so a crash keeps
+        every mark. The BDF+/EDF+ export carries them as annotations.
+        Raises RuntimeError when nothing is recording.
+        """
+        journal = self._journal
+        if journal is None or not self._recorder_task or self._recorder_task.done():
+            raise RuntimeError("not recording")
+        unix_t = time.time() if unix_t is None else float(unix_t)
+        frame = journal.sample_at(unix_t)
+        fs = self._sample_rate()
+        anno = {"id": int(unix_t * 1000), "frame": frame,
+                "time": round(frame / fs, 3), "text": str(text),
+                "timestamp": datetime.fromtimestamp(unix_t, timezone.utc)
+                .isoformat()}
+        path = edf_export.annotations_path(journal.journal_path)
+        annos = edf_export.read_annotations(journal.journal_path)
+        annos.append(anno)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w") as fh:
+            json.dump({"annotations": annos}, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        logger.info("Annotation %r at sample %d (%.2f s)", anno["text"],
+                    frame, anno["time"])
+        return anno
 
     async def _export_primary_on_stop(self) -> dict:
         """Best-effort BDF+ (primary, lossless) export of the finished journal.

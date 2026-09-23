@@ -873,7 +873,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                auto_shot=None, auto_close_ms=None,
                connect_popup=None, contact_source=None,
                record_control=None, full_scale_uv=VREF_UV / 24,
-               impedance_control=None, stop_event=None):
+               impedance_control=None, stop_event=None,
+               annotate_control=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -1175,6 +1176,47 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Right-click a lead to edit the montage (rename / hide / reorder …).
     # Button-3 is the right button on X11; Button-2 covers the middle/right
     # button on some trackpads.
+    # ---- annotations: EC / EO ------------------------------------------- #
+    # While recording, EC and EO buttons sit over the chart's bottom-right.
+    # A press marks the recording at the press time (the server puts it on
+    # the journal sample taken then) and draws a dashed marker on the trace
+    # at the newest sample, which goes when the sweep comes round again.
+    ANNOTATIONS = (("EC", "Eyes closed"), ("EO", "Eyes open"))
+    _marks = []     # {"total": model.total at the press, "label", "future"}
+    ann_bar = None
+    if annotate_control is not None:
+        ann_bar = tk.Frame(canvas, bg=C["canvas_bg"])
+        for short, text in ANNOTATIONS:
+            ttk.Button(ann_bar, text=short, width=3,
+                       command=lambda s=short, t=text: _annotate(s, t)
+                       ).pack(side="left", padx=(0, 4))
+
+    def _annotate(short, text):
+        mark = {"total": model.total, "label": short, "text": text,
+                "future": None}
+        try:
+            mark["future"] = annotate_control["add"](text, time.time())
+        except Exception as e:              # noqa: BLE001 - report, don't crash
+            _hint(f"mark failed: {e}", seconds=8, fg=C["red"])
+            return
+        _marks.append(mark)
+
+    def _poll_marks():
+        for m in list(_marks):
+            fut = m["future"]
+            if fut is None or not fut.done():
+                continue
+            m["future"] = None
+            try:
+                res = fut.result()
+            except Exception as e:          # noqa: BLE001
+                _marks.remove(m)
+                _hint(f"{m['text']} not saved: {e}", seconds=8, fg=C["red"])
+            else:
+                secs = int(res.get("time", 0))
+                _hint(f"{m['text']} marked at {secs // 60:02d}:{secs % 60:02d}",
+                      fg=C["yellow"])
+
     canvas.bind("<Button-3>", lambda e: _lead_menu(e))
     canvas.bind("<Button-2>", lambda e: _lead_menu(e))
 
@@ -1265,6 +1307,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             st = record_control["status"]()
         except Exception:                   # noqa: BLE001 - display only
             return
+        if ann_bar is not None:
+            shown = bool(ann_bar.winfo_manager())
+            if st.get("recording") and not shown:
+                # left of the stream readout in the chart's bottom-right
+                ann_bar.place(relx=1.0, rely=1.0, x=-96, y=-3, anchor="se")
+            elif not st.get("recording") and shown:
+                ann_bar.place_forget()
         if _rec["future"] is not None:
             rec_btn.configure(text="saving…" if st.get("recording")
                               else "starting…", style="TButton")
@@ -1746,6 +1795,30 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # only when their signature changes. Rebuilding them every frame made Tk
     # repaint the whole chart 15 times a second.
     _deco = {"sig": None, "dots": [], "dot_sig": None}
+    _overlay = {"toast": None, "stream": None, "marks": None}
+
+    def _draw_marks(W, H):
+        # Sample c (1 = first) sits at sweep position (c - 1) % win; drop a
+        # mark once the sweep's erase gap reaches it a lap later.
+        win = model.win
+        total = model.total if model.frozen is None else model.frozen["total"]
+        ncol = max(1, min(W, win))
+        gap = (max(2, ncol // 100) + 1) * win / ncol
+        _marks[:] = [m for m in _marks
+                     if total - m["total"] < win - gap or m["future"]]
+        shown = [m for m in _marks if total - m["total"] < win - gap]
+        sig = (W, H, win, tuple((m["total"], m["label"]) for m in shown))
+        if sig == _overlay["marks"]:
+            return
+        _overlay["marks"] = sig
+        canvas.delete("marks")
+        for m in shown:
+            x = ((m["total"] - 1) % win + 0.5) * W / win
+            canvas.create_line(x, 0, x, H, fill=C["yellow"], dash=(4, 3),
+                               tags="marks")
+            canvas.create_text(x + 3, 3, text=m["label"], anchor="nw",
+                               fill=C["yellow"], font=(_MONO, _fs(9), "bold"),
+                               tags="marks")
 
     def _draw_static(rows, W, H, row_h, half, sens, box_w, box_x):
         sig = (W, H, sens, model.win, tuple((r["pair"], model.epair_name(r["pair"]),
@@ -1830,6 +1903,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         got = _drain_queue()
         _poll_contact()
         _poll_record()
+        _poll_marks()
         if impedance_control is not None:
             _poll_impedance()
         _rate["n"] += got
@@ -1864,17 +1938,29 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             box_w = 2.0 * half
             box_x = 2.0
             _sweep_draw(rows, W, row_h, half, sens)
+            _draw_marks(W, H)
             _draw_static(rows, W, H, row_h, half, sens, box_w, box_x)
             _draw_dots()
-        if _toast["text"] and time.monotonic() < _toast["until"] and W > 2:
-            tid = canvas.create_text(W - 12, 12, text=_toast["text"],
-                                     anchor="ne", fill=_toast["fg"],
-                                     font=(_MONO, _fs(9)), tags="trace")
-            x0, y0, x1, y1 = canvas.bbox(tid)
-            bg = canvas.create_rectangle(x0 - 8, y0 - 4, x1 + 8, y1 + 4,
-                                         fill=C["surface"],
-                                         outline=C["border_hi"], tags="trace")
-            canvas.tag_lower(bg, tid)
+        # Toast and stream readout are persistent items (tags "toast",
+        # "stream"), rebuilt only when their content changes. Tk repaints ONE
+        # rectangle per frame, the union of everything that changed, so a
+        # corner label recreated every frame stretched the repaint from the
+        # sweep head to the far edge — most of the chart, 15 times a second.
+        show = bool(_toast["text"]) and time.monotonic() < _toast["until"]
+        sig = (_toast["text"], _toast["fg"], W) if show and W > 2 else None
+        if sig != _overlay["toast"]:
+            _overlay["toast"] = sig
+            canvas.delete("toast")
+            if sig is not None:
+                tid = canvas.create_text(W - 12, 12, text=_toast["text"],
+                                         anchor="ne", fill=_toast["fg"],
+                                         font=(_MONO, _fs(9)), tags="toast")
+                x0, y0, x1, y1 = canvas.bbox(tid)
+                bg = canvas.create_rectangle(x0 - 8, y0 - 4, x1 + 8, y1 + 4,
+                                             fill=C["surface"],
+                                             outline=C["border_hi"],
+                                             tags="toast")
+                canvas.tag_lower(bg, tid)
         if W > 2 and H > 2:
             _draw_measure(W, H)
         if impedance_control is not None and W > 2 and H > 2:
@@ -1888,14 +1974,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _stream["text"] = f"{_rate['sps']:.0f} sps"
         _stream["fg"] = (C["green"] if got > 0
                          else C["yellow"] if model.filled > 0 else C["red"])
-        if W > 2 and H > 2:
-            sid = canvas.create_text(W - 10, H - 10, anchor="se",
-                                     text=_stream["text"], fill=C["axis"],
-                                     font=(_MONO, _fs(9)), tags="trace")
-            x0, y0, _, y1 = canvas.bbox(sid)
-            canvas.create_text(x0 - 4, (y0 + y1) / 2, anchor="e", text="●",
-                               fill=_stream["fg"], font=(_MONO, _fs(9)),
-                               tags="trace")
+        sig = ((_stream["text"], _stream["fg"], W, H) if W > 2 and H > 2
+               else None)
+        if sig != _overlay["stream"]:
+            _overlay["stream"] = sig
+            canvas.delete("stream")
+            if sig is not None:
+                sid = canvas.create_text(W - 10, H - 10, anchor="se",
+                                         text=_stream["text"], fill=C["axis"],
+                                         font=(_MONO, _fs(9)), tags="stream")
+                x0, y0, _, y1 = canvas.bbox(sid)
+                canvas.create_text(x0 - 4, (y0 + y1) / 2, anchor="e",
+                                   text="●", fill=_stream["fg"],
+                                   font=(_MONO, _fs(9)), tags="stream")
         root.after(REDRAW_MS, _redraw)
 
     def _on_close():
@@ -2088,7 +2179,7 @@ class _RemoteFuture:
 
 
 def run_viewer_process(conn, contact=False, record=False, impedance=False,
-                       **viewer_kwargs):
+                       annotate=False, **viewer_kwargs):
     """Entry point of the Scope's viewer process (multiprocessing, spawn).
 
     The Tk viewer runs in its own process so its drawing never holds the GIL
@@ -2130,7 +2221,8 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
                     frames.put(msg["frames"])
                 state["leadoff"] = msg.get("leadoff")
                 state["record"] = msg.get("record") or state["record"]
-            elif kind in ("record_result", "impedance_result"):
+            elif kind in ("record_result", "impedance_result",
+                          "annotate_result"):
                 fut = pending.pop(rest[0], None)
                 if fut is not None:
                     fut.set(rest[1])
@@ -2141,11 +2233,11 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
 
     ids = itertools.count()
 
-    def request(kind):
+    def request(kind, *args):
         req = next(ids)
         fut = _RemoteFuture()
         pending[req] = fut
-        send((kind, req))
+        send((kind, req, *args))
         return fut
 
     def status():
@@ -2164,6 +2256,9 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
     if impedance:
         viewer_kwargs["impedance_control"] = {
             "run": lambda: request("impedance")}
+    if annotate:
+        viewer_kwargs["annotate_control"] = {
+            "add": lambda text, unix_t: request("annotate", text, unix_t)}
     try:
         run_viewer(frames, **viewer_kwargs)
     except Exception:

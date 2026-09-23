@@ -157,3 +157,44 @@ async def test_unified_download_route_and_traversal_guard(tmp_path):
     # Path-traversal guard on the BDF route.
     guard = await srv._serve_bdf(_FakeReq(), {"session": ["../../etc/passwd"]})
     assert guard.status_code == 404
+
+
+async def test_annotations_saved_during_recording_and_in_bdf(tmp_path):
+    loop = asyncio.get_running_loop()
+    hw = MockHardware(num_channels=8, sample_rate=250)
+    hw.open()
+    acq = AcquisitionLoop(hw, loop, mock=True)
+    srv = PiEEGServer(acq, num_channels=8)
+    srv._recordings_dir = tmp_path
+
+    async def _cap(stop_info=None):
+        pass
+    srv._broadcast_record_status = _cap
+
+    import json
+    from pieeg_server import edf_export
+    acq.start()
+    with pytest.raises(RuntimeError):
+        await srv._add_annotation("Eyes closed")        # not recording yet
+    await srv._start_recording()
+    await asyncio.sleep(1.0)
+    journal = srv._journal
+    # a press 0.4 s ago lands 0.4 s (100 samples) before the newest sample
+    newest = journal.samples_written - 1                # 0-based index
+    ec = await srv._add_annotation("Eyes closed", journal._last_t - 0.4)
+    assert abs(ec["frame"] - (newest - 100)) <= 1
+    await asyncio.sleep(0.4)
+    eo = await srv._add_annotation("Eyes open")
+    assert eo["frame"] > ec["frame"]
+    session = srv._last_session
+    saved = json.loads((tmp_path / f"{session}.csv.annotations.json")
+                       .read_text())["annotations"]
+    assert [a["text"] for a in saved] == ["Eyes closed", "Eyes open"]
+    await srv._stop_recording()
+    acq.stop()
+    with pyedflib.EdfReader(str(tmp_path / f"{session}.bdf")) as r:
+        onsets, _, texts = r.readAnnotations()
+    assert list(texts) == ["Eyes closed", "Eyes open"]
+    assert np.allclose(onsets, [ec["frame"] / 250, eo["frame"] / 250])
+    with pytest.raises(RuntimeError):
+        await srv._add_annotation("Eyes open")          # stopped

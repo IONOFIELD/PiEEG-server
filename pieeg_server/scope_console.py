@@ -221,6 +221,11 @@ SCOPE_CHANGELOG = [
             "filtered down to 250: flat to 100 Hz (the chip's roll-off "
             "corrected), and mains harmonics no longer fold below 125 Hz. "
             "Traces run ~68 ms later than before."),
+    ("3.6", "EC / EO buttons while recording: each press marks Eyes closed / "
+            "Eyes open on the sample taken at the press, saved at once beside "
+            "the recording and carried into the BDF+/EDF+ as annotations; a "
+            "dashed marker shows on the trace. The sps readout is no longer "
+            "repainted every frame."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -382,14 +387,15 @@ class _ViewerLink:
     CHUNK = 100                             # rows converted per GIL hold
 
     def __init__(self, viewer_kwargs, leadoff=None, record_status=None,
-                 toggle_record=None, impedance=None):
+                 toggle_record=None, impedance=None, annotate=None):
         ctx = multiprocessing.get_context("spawn")
         self._conn, self._child_conn = ctx.Pipe(duplex=True)
         self._proc = ctx.Process(
             target=_viewer_main, args=(self._child_conn,),
             kwargs=dict(viewer_kwargs, contact=leadoff is not None,
                         record=toggle_record is not None,
-                        impedance=impedance is not None),
+                        impedance=impedance is not None,
+                        annotate=annotate is not None),
             name="pieeg-scope-viewer", daemon=True)
         self._leadoff = leadoff
         self._record_status = record_status
@@ -399,6 +405,8 @@ class _ViewerLink:
             self._requests["toggle_record"] = ("record_result", toggle_record)
         if impedance is not None:
             self._requests["impedance"] = ("impedance_result", impedance)
+        if annotate is not None:
+            self._requests["annotate"] = ("annotate_result", annotate)
         self._frames = collections.deque(maxlen=self.MAX_BACKLOG)
         self._outbox: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
@@ -466,9 +474,9 @@ class _ViewerLink:
                 return
             if kind in self._requests:
                 reply, start = self._requests[kind]
-                req = rest[0]
+                req, args = rest[0], rest[1:]
                 try:
-                    fut = start()
+                    fut = start(*args)
                 except Exception as e:      # noqa: BLE001
                     self._outbox.put((reply, req, {"error": str(e)}))
                     continue
@@ -796,7 +804,11 @@ def main(argv=None):
         # which simulates it).
         impedance=None if unsupported_reason(acq) else (
             lambda: asyncio.run_coroutine_threadsafe(
-                server.run_impedance_check(), loop)))
+                server.run_impedance_check(), loop)),
+        # EC / EO marks in the running recording (same no-mock rule as Rec)
+        annotate=None if args.mock else (
+            lambda text, unix_t: asyncio.run_coroutine_threadsafe(
+                server._add_annotation(text, unix_t), loop)))
     try:
         link_ref["link"] = link
         link.start()
