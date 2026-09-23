@@ -57,8 +57,10 @@ class PiEEGServer:
     def __init__(self, acquisition: AcquisitionLoop,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  auth: AuthManager | None = None,
-                 num_channels: int = 16):
+                 num_channels: int = 16, channel_labels=None):
         self._acq = acquisition
+        # recording labels (None: the journal's ch1..chN)
+        self._channel_labels = channel_labels
         self._host = host
         self._port = port
         self._auth = auth
@@ -580,6 +582,7 @@ class PiEEGServer:
             num_channels=self._acq.num_channels,
             sample_rate=self._sample_rate(),
             prefilter=getattr(self._acq, "prefilter", None),
+            channel_labels=self._channel_labels,
             **journal_kwargs,
         )
         self._last_session = session

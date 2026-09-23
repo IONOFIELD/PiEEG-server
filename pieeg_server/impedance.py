@@ -955,6 +955,10 @@ def _archive_bench(path=BENCH_PATH):
 # Statuses whose carrier is a real reading of the wiring (the calibration
 # isn't involved in recording it).
 _RECORDABLE = (OK, ABOVE, UNCALIBRATED)
+# A bench reading's neighbouring-bin noise is 0.03-0.3 µV on a still rig; the
+# bad ones (a wire just moved, a loose joint) read 21-208 µV and pulled the
+# carrier by ~5%. The fit weights every reading equally, so refuse them.
+BENCH_MAX_NOISE_UV = 2.0
 
 
 def _record_bench(args, results):
@@ -978,7 +982,11 @@ def _record_bench(args, results):
             continue
         for ch in _parse_channels(args.channels):
             lead = r.leads[ch - 1]
-            if lead.status in _RECORDABLE:
+            if lead.status in _RECORDABLE and lead.noise_uv > BENCH_MAX_NOISE_UV:
+                print(f"{lead.name} not recorded: noise {lead.noise_uv:.1f} µV "
+                      f"(> {BENCH_MAX_NOISE_UV:g}); let the rig settle and "
+                      f"take it again")
+            elif lead.status in _RECORDABLE:
                 point = {"pass": "lead", "name": lead.name, "ohms": args.ohms,
                          "carrier_uv": lead.carrier_uv,
                          "noise_uv": lead.noise_uv, "fs": r.fs,

@@ -135,3 +135,43 @@ def test_journal_sidecar_records_the_prefilter(loop, tmp_path):
     j._write_sidecar()
     assert json.loads((tmp_path / "s.json").read_text())["prefilter"] == \
         acq.prefilter
+
+
+def test_recording_labels_are_referential_sites(loop, tmp_path):
+    import json
+    from pieeg_server.journal import JournalWriter, referential_labels
+    labels = referential_labels(["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1",
+                                 "O2"])
+    assert labels[0] == "EEG Fp1-REF" and all(len(x) <= 16 for x in labels)
+    j = JournalWriter(_acq(loop), tmp_path, session_name="s", num_channels=8,
+                      channel_labels=labels)
+    j._write_sidecar()
+    meta = json.loads((tmp_path / "s.json").read_text())
+    assert meta["channel_labels"] == labels
+    assert meta["channel_inputs"][:2] == ["E1", "E2"]
+
+
+def test_measured_rate():
+    from pieeg_server.journal import measured_rate
+    assert measured_rate(2501, 100.0, 100.0 + 2500 / 249.75) == \
+        pytest.approx(249.75, abs=1e-3)
+    assert measured_rate(100, 0.0, 0.4) is None       # too short to say
+    assert measured_rate(0, None, None) is None
+
+
+def test_bench_refuses_noisy_readings(monkeypatch, tmp_path, capsys):
+    import json
+    from types import SimpleNamespace as NS
+    from pieeg_server import impedance as imp
+    monkeypatch.setattr(imp, "BENCH_PATH", tmp_path / "bench.json")
+
+    def lead(name, noise):
+        return NS(name=name, status=imp.OK, carrier_uv=61.7, noise_uv=noise,
+                  phase_deg=None)
+    result = NS(leads=[lead("E1", 0.1), lead("E2", 21.0)], problem=None,
+                ref_carrier_uv=None, fs=250.0)
+    args = NS(fresh=False, ref=False, channels="1,2", ohms=10000.0)
+    imp._record_bench(args, [result])
+    points = json.loads((tmp_path / "bench.json").read_text())
+    assert [p["name"] for p in points] == ["E1"]
+    assert "E2 not recorded: noise 21.0" in capsys.readouterr().out
