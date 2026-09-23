@@ -1181,7 +1181,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     # REC: its own red-bordered black box; solid red while recording. Tap to
     # start the server's crash-safe recording, tap again to stop and export
-    # the EDF+ into the recording's folder.
+    # the BDF+ into the recording's folder.
     rec_btn = None
     if record_control is not None:
         rec_box = tk.Frame(ewrap, bg=C["bg"], highlightthickness=1,
@@ -1958,7 +1958,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # for anything else. The note goes on the sample under the pointer (at
     # the sweep head that is "now"; further back, the moment already drawn
     # there), a marker shows at that spot, and the server saves it at once to
-    # <session>/<session>.annotations.json (and into the EDF+ on Stop).
+    # <session>/<session>.annotations.json (and into the BDF+ on Stop).
     NOTE_KINDS = (("EC", "Eyes closed"), ("EO", "Eyes open"),
                   ("MVMT", "Movement"))
 
@@ -2059,7 +2059,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         except Exception:                   # noqa: BLE001 - display only
             return None
 
-    # EDF+ rebuilds after a note is added or removed run on one worker
+    # BDF+ rebuilds after a note is added or removed run on one worker
     # thread, so the window never waits on them; each rebuild reads the
     # notes file as it is then, so quick edits coalesce into one.
     _exp = {"pending": [], "current": None, "lock": threading.Lock(),
@@ -2075,10 +2075,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             try:
                 edf = review_store.rebuild_exports(journal)
                 _exp["msgs"].append(
-                    (True, f"EDF+ updated · {edf.name}" if edf
+                    (True, f"BDF+ updated · {edf.name}" if edf
                      else "notes saved"))
             except Exception as e:          # noqa: BLE001 - report, don't crash
-                _exp["msgs"].append((False, f"EDF+ not updated: {e}"))
+                _exp["msgs"].append((False, f"BDF+ not updated: {e}"))
 
     def _schedule_export(journal):
         with _exp["lock"]:
@@ -2252,7 +2252,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                fg=C["yellow"])
                 return
             if _export_busy(sx["journal"]):
-                info.configure(text="its EDF+ is still updating: try again "
+                info.configure(text="its BDF+ is still updating: try again "
                                     "in a moment", fg=C["yellow"])
                 return
             if armed["session"] != sx["session"]:
@@ -2262,7 +2262,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 armed["after"] = root.after(5000, disarm)
                 del_btn.configure(text="Tap again to delete")
                 info.configure(
-                    text=f"Delete {sx['session']}?\nEDF+, notes and raw "
+                    text=f"Delete {sx['session']}?\nBDF+, notes and raw "
                          f"files, {sx['bytes'] / 1e6:.1f} MB — permanent",
                     fg=C["red"])
                 return
@@ -2425,7 +2425,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     _hint(f"note not removed: {e}", seconds=8, fg=C["red"])
                     return
                 _rev_notes_changed(journal)
-                _hint(f"removed {a.get('text', '')} · updating EDF+…",
+                _hint(f"removed {a.get('text', '')} · updating BDF+…",
                       fg=C["yellow"])
             ttk.Button(body, text="Remove note", command=remove).pack(
                 anchor="e")
@@ -2444,7 +2444,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _hint(f"{text} not saved: {e}", seconds=8, fg=C["red"])
                 return
             _rev_notes_changed(journal)
-            _hint(f"{text} at {_mmss(frame / model.fs)} · updating EDF+…",
+            _hint(f"{text} at {_mmss(frame / model.fs)} · updating BDF+…",
                   fg=C["yellow"])
         _note_form(f"Note  {_mmss(frame / model.fs)}", put, evt)
 

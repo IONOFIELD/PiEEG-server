@@ -68,22 +68,26 @@ def test_add_and_remove_note_in_the_master_file(tmp_path):
     assert [x["text"] for x in review.notes(j)] == ["blink"]
 
 
-def test_rebuild_puts_notes_in_edf_and_summary_and_drops_stale_bdf(tmp_path):
+def test_rebuild_puts_notes_in_bdf_and_summary_and_drops_stale_edf(tmp_path):
     j = _session(tmp_path, "s1")
     folder = tmp_path / "s1"
-    stale = folder / "raw" / "s1.bdf"
-    stale.write_bytes(b"old")
+    stale = [folder / "s1.edf", folder / "raw" / "s1.edf"]   # pre-4.7 / on request
+    for p in stale:
+        p.write_bytes(b"old")
     _, meta = review.load(j)
     review.add_note(j, 1500, "Eyes open", "EO", meta)
-    edf = review.rebuild_exports(j)
-    assert edf == folder / "s1.edf"
-    with pyedflib.EdfReader(str(edf)) as r:
+    bdf = review.rebuild_exports(j)
+    assert bdf == folder / "s1.bdf"
+    with pyedflib.EdfReader(str(bdf)) as r:
         onsets, _, texts = r.readAnnotations()
+        assert np.array_equal(r.readSignal(1, digital=True)[:2500],
+                              np.arange(2500) * 2)          # lossless counts
     assert list(texts) == ["Eyes open"] and np.allclose(onsets, [6.0])
     summary = json.loads((folder / "s1.json").read_text())
+    assert summary["bdf_file"] == "s1.bdf"
     assert "Eyes open" in json.dumps(summary)
-    assert not stale.exists()
-    assert not list(folder.glob("*.rebuild.edf"))
+    assert not any(p.exists() for p in stale)
+    assert not list(folder.glob("*.rebuild.*"))
 
 
 def test_rebuild_skips_flat_session_without_edf(tmp_path):

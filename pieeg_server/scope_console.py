@@ -280,6 +280,10 @@ SCOPE_CHANGELOG = [
             "reviewing, and is kept in the recording's summary JSON (files and "
             "folder keep their session names). Find filters the list by name, "
             "date or session as you type."),
+    ("4.7", "BDF+ only: Stop saves <session>.bdf (24-bit, lossless, the same "
+            "0.022 µV step on every channel, calibration included) instead of "
+            "the EDF+, and notes edited in review rebuild it. No EDF+ is kept; "
+            "the server still builds one on request (/download/edf) into raw/."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -779,7 +783,7 @@ def main(argv=None):
             await server._stop_recording()
             folder = args.recordings_dir / session
             saved = sorted(p.suffix for p in folder.glob(f"{session}.*")
-                           if p.suffix in (".edf", ".json"))
+                           if p.suffix in (".bdf", ".json"))
             return {"stopped": session, "saved": saved,
                     "seconds": status["elapsed"] or 0.0,
                     "dir": str(folder)}
