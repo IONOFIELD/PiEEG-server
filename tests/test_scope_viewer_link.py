@@ -54,7 +54,7 @@ def _as_thread(link):
 
 
 def _run_link(fake_viewer, leadoff=None, record_status=None, toggle=None,
-              frames=(), impedance=None):
+              frames=(), impedance=None, annotate=None):
     seen = {}
 
     def run_viewer(frame_queue, **kwargs):
@@ -63,7 +63,7 @@ def _run_link(fake_viewer, leadoff=None, record_status=None, toggle=None,
     link = scope_console._ViewerLink(
         {"num_channels": 8, "fs": 250, "title": "t"},
         leadoff=leadoff, record_status=record_status, toggle_record=toggle,
-        impedance=impedance)
+        impedance=impedance, annotate=annotate)
     original = acq_viewer.run_viewer
     acq_viewer.run_viewer = run_viewer
     try:
@@ -148,6 +148,32 @@ def test_record_error_is_raised_in_the_viewer():
     seen = _run_link(viewer, record_status=lambda: {"recording": False},
                      toggle=toggle)
     assert seen["ok"]
+
+
+def test_annotation_round_trip_carries_text_and_time():
+    calls = []
+
+    def annotate(text, unix_t):
+        calls.append((text, unix_t))
+        fut = concurrent.futures.Future()
+        fut.set_result({"frame": 500, "time": 2.0, "text": text})
+        return fut
+
+    def viewer(q, kwargs, seen):
+        fut = kwargs["annotate_control"]["add"]("Eyes closed", 1234.5)
+        _wait_for(fut.done)
+        seen["result"] = fut.result()
+
+    seen = _run_link(viewer, annotate=annotate)
+    assert calls == [("Eyes closed", 1234.5)]
+    assert seen["result"]["frame"] == 500
+
+
+def test_no_annotate_control_without_a_handler():
+    def viewer(q, kwargs, seen):
+        seen["has"] = "annotate_control" in kwargs
+
+    assert _run_link(viewer)["has"] is False
 
 
 def test_impedance_round_trip():

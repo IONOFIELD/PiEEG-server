@@ -97,7 +97,32 @@ def _channel_labels(meta, nch):
 # --------------------------------------------------------------------------- #
 # BDF+ 24-bit  (primary, lossless)
 # --------------------------------------------------------------------------- #
-def _write_bdfplus(counts, meta, out_path):
+def annotations_path(journal_path):
+    """The session's annotation file: ``<session>.csv.annotations.json``,
+    the name the dashboard's session viewer uses for the same recording."""
+    journal_path = Path(journal_path)
+    return journal_path.with_name(journal_path.stem + ".csv.annotations.json")
+
+
+def read_annotations(journal_path):
+    """The session's annotations (list of dicts with "frame" = journal sample
+    index and "text"), or [] when there are none or the file is unreadable."""
+    try:
+        data = json.loads(annotations_path(journal_path).read_text())
+    except (OSError, ValueError):
+        return []
+    annos = data.get("annotations", []) if isinstance(data, dict) else []
+    return [a for a in annos if isinstance(a, dict) and "frame" in a]
+
+
+def _write_annotations(writer, annotations, fs, n_samples):
+    # EDF+/BDF+ time is sample index / fs, so place each mark by its sample.
+    for a in sorted(annotations, key=lambda a: a["frame"]):
+        frame = min(max(int(a["frame"]), 0), n_samples - 1)
+        writer.writeAnnotation(frame / fs, -1, str(a.get("text", ""))[:40])
+
+
+def _write_bdfplus(counts, meta, out_path, annotations=()):
     """Write a lossless BDF+ file: journal counts ARE the digital samples.
 
     The mapping is 1:1 -- we never scale the sample values. The header carries
@@ -148,6 +173,7 @@ def _write_bdfplus(counts, meta, out_path):
             digital = [np.ascontiguousarray(counts[:, ci].astype(np.int32))
                        for ci in range(nch)]
             writer.writeSamples(digital, digital=True)
+        _write_annotations(writer, annotations, fs, counts.shape[0])
     finally:
         writer.close()
     return out_path
@@ -170,7 +196,7 @@ def _physical_range(uv_channel):
     return pmin, pmax
 
 
-def _write_edfplus(counts, meta, out_path):
+def _write_edfplus(counts, meta, out_path, annotations=()):
     """Write EDF+ 16-bit. Per-channel adaptive range (some resolution lost)."""
     pyedflib = _require_pyedflib()
     nch = int(meta["channel_count"])
@@ -202,6 +228,7 @@ def _write_edfplus(counts, meta, out_path):
         writer.setSignalHeaders(channel_info)
         # writeSamples wants one array per channel (physical uV values).
         writer.writeSamples([np.ascontiguousarray(uv[:, ci]) for ci in range(nch)])
+        _write_annotations(writer, annotations, fs, counts.shape[0])
     finally:
         writer.close()
     return out_path
@@ -238,14 +265,16 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    annotations = read_annotations(journal_path)
     if fmt == "bdf":
-        _write_bdfplus(counts, meta, out_path)
+        _write_bdfplus(counts, meta, out_path, annotations)
     else:
-        _write_edfplus(counts, meta, out_path)
+        _write_edfplus(counts, meta, out_path, annotations)
 
-    logger.info("Wrote %s %s (%d ch, %d samples, %.1f s)",
+    logger.info("Wrote %s %s (%d ch, %d samples, %.1f s, %d annotations)",
                 fmt.upper() + "+", out_path, int(meta["channel_count"]),
-                counts.shape[0], counts.shape[0] / int(meta["sample_rate"]))
+                counts.shape[0], counts.shape[0] / int(meta["sample_rate"]),
+                len(annotations))
     return out_path
 
 
