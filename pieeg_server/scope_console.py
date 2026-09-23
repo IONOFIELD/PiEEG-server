@@ -230,6 +230,11 @@ SCOPE_CHANGELOG = [
             "the montage (Save keeps leads + filters) and come back whenever "
             "you pick it. Changing a filter marks the montage edited (*); "
             "Reset returns it to the default filters."),
+    ("3.8", "One folder per recording on the USB drive: eeg-recordings/<session>/ "
+            "holds <session>.edf (EDF+, with the EC/EO annotations) and "
+            "<session>.json (channels, times, sample rate, each channel's EDF "
+            "step, annotations); raw/ inside it keeps the lossless crash-safe "
+            "journal and CSV. A lossless BDF+ is still available on request."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -720,12 +725,12 @@ def main(argv=None):
         if status["recording"]:
             session = server._last_session
             await server._stop_recording()
-            saved = sorted(p.suffix for p in
-                           args.recordings_dir.glob(f"{session}.*")
-                           if p.suffix in (".bdf", ".edf", ".csv"))
+            folder = args.recordings_dir / session
+            saved = sorted(p.suffix for p in folder.glob(f"{session}.*")
+                           if p.suffix in (".edf", ".json"))
             return {"stopped": session, "saved": saved,
                     "seconds": status["elapsed"] or 0.0,
-                    "dir": str(args.recordings_dir)}
+                    "dir": str(folder)}
         problem = _off_usb_problem(args.recordings_dir)
         if problem:
             logger.error("recording refused: %s", problem)

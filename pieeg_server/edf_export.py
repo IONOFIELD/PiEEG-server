@@ -32,6 +32,7 @@ CALIBRATION IS NEVER HARD-CODED
 import argparse
 import json
 import logging
+import os
 import sys
 import tempfile
 import warnings
@@ -275,6 +276,60 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
                 fmt.upper() + "+", out_path, int(meta["channel_count"]),
                 counts.shape[0], counts.shape[0] / int(meta["sample_rate"]),
                 len(annotations))
+    return out_path
+
+
+def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
+    """Write the recording's summary JSON beside its EDF+.
+
+    One readable file per recording: when and how it was recorded, each
+    channel's label, input and EDF+ resolution (the 16-bit step follows the
+    channel's own min..max, so a drifting or railed lead gets a coarse step —
+    the lossless journal in raw/ keeps full resolution), and the annotations
+    at their sample and second. Returns the output Path.
+    """
+    journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
+                                        Path(out_path))
+    counts, meta = read_journal(journal_path, sidecar_path)
+    nch, fs = int(meta["channel_count"]), int(meta["sample_rate"])
+    labels = _channel_labels(meta, nch)
+    inputs = meta.get("channel_inputs") or [f"E{i}" for i in range(1, nch + 1)]
+    uv = counts.astype(np.float64) * float(meta["lsb_uv"])
+    channels = []
+    for ci in range(nch):
+        pmin, pmax = _physical_range(uv[:, ci]) if len(uv) else (-1.0, 1.0)
+        channels.append({
+            "label": str(labels[ci]), "input": inputs[ci],
+            "edf_physical_min_uv": pmin, "edf_physical_max_uv": pmax,
+            "edf_step_uv": round((pmax - pmin) / (_EDF_DIG_MAX - _EDF_DIG_MIN),
+                                 6)})
+    rel = lambda p: os.path.relpath(p, out_path.parent)   # noqa: E731
+    summary = {
+        "format": "pieeg-recording-v1",
+        "session": journal_path.stem,
+        "edf_file": rel(edf_path),
+        "start_iso": meta.get("start_iso"),
+        "duration_sec": round(counts.shape[0] / fs, 3),
+        "samples": int(counts.shape[0]),
+        "sample_rate": fs,
+        "measured_rate_hz": meta.get("measured_rate_hz"),
+        "gain": meta.get("gain"),
+        "prefilter": meta.get("prefilter") or "raw, no filter",
+        "reference": "all inputs against one shared REF electrode (SRB1)",
+        "channels": channels,
+        "annotations": [{"time": round(int(a["frame"]) / fs, 3),
+                         "frame": int(a["frame"]), "text": a.get("text", "")}
+                        for a in sorted(read_annotations(journal_path),
+                                        key=lambda a: a["frame"])],
+        "raw": {"journal": rel(journal_path),
+                "sidecar": rel(Path(sidecar_path) if sidecar_path
+                               else journal_path.with_suffix(".json")),
+                "note": "lossless 24-bit source; rebuild with "
+                        "python -m pieeg_server.edf_export"},
+    }
+    tmp = out_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(summary, indent=2))
+    os.replace(tmp, out_path)
     return out_path
 
 

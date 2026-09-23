@@ -255,6 +255,18 @@ class PiEEGServer:
             return HTTPResponse(400, "Bad Request", hdrs, b"WebSocket upgrade required\n")
 
     # ---- recording download helpers ------------------------------------ #
+    def _session_dirs(self, session):
+        """(folder, raw_dir) of a session. A recording lives in its own
+        folder, <recordings>/<session>/ (EDF+ and summary JSON), with the
+        journal, sidecar, CSV and annotations in its raw/ subfolder. Sessions
+        from before that layout are flat in <recordings>/ and stay readable."""
+        folder = self._recordings_dir / session
+        raw = folder / "raw"
+        flat = self._recordings_dir / f"{session}.eegj"
+        if not (raw / f"{session}.eegj").exists() and flat.exists():
+            return self._recordings_dir, self._recordings_dir
+        return folder, raw
+
     def _list_recordings(self) -> dict:
         """List recorded sessions (one per journal) with what's available.
 
@@ -264,27 +276,32 @@ class PiEEGServer:
         """
         sessions = []
         if self._recordings_dir.exists():
-            for jrnl in sorted(self._recordings_dir.glob("*.eegj")):
+            journals = (list(self._recordings_dir.glob("*.eegj"))
+                        + list(self._recordings_dir.glob("*/raw/*.eegj")))
+            for jrnl in sorted(journals, key=lambda p: p.stem):
                 base = jrnl.stem
-                has_bdf = (self._recordings_dir / f"{base}.bdf").exists()
-                has_edf = (self._recordings_dir / f"{base}.edf").exists()
+                folder, raw = self._session_dirs(base)
+                has_bdf = ((raw / f"{base}.bdf").exists()
+                           or (folder / f"{base}.bdf").exists())
+                has_edf = (folder / f"{base}.edf").exists()
                 sessions.append({
                     "session": base,
+                    "folder": str(folder),
                     "journal_bytes": jrnl.stat().st_size,
-                    "has_sidecar": (self._recordings_dir / f"{base}.json").exists(),
+                    "has_sidecar": (raw / f"{base}.json").exists(),
                     # --- legacy keys (unchanged) ---
                     "has_edf": has_edf,
                     "edf_url": f"/download/edf?session={base}",
                     "journal_url": f"/download/journal?session={base}",
-                    # --- new: BDF+ is the primary clinical export ---
+                    # EDF+ is the recording's file; BDF+ (lossless) on request
                     "has_bdf": has_bdf,
                     "bdf_url": f"/download/bdf?session={base}",
-                    "primary_format": "bdf",
+                    "primary_format": "edf",
                     "formats": {
-                        "bdf": {"primary": True, "lossless": True,
+                        "bdf": {"primary": False, "lossless": True,
                                 "present": has_bdf,
                                 "url": f"/download/bdf?session={base}"},
-                        "edf": {"primary": False, "lossless": False,
+                        "edf": {"primary": True, "lossless": False,
                                 "present": has_edf,
                                 "url": f"/download/edf?session={base}"},
                         "journal": {"source_of_truth": True, "present": True,
@@ -327,9 +344,13 @@ class PiEEGServer:
         if not session:
             return HTTPResponse(404, "Not Found", hdrs, b"no recording available\n")
 
-        out_path = self._recordings_dir / f"{session}.{fmt}"
-        journal_path = self._recordings_dir / f"{session}.eegj"
-        sidecar_path = self._recordings_dir / f"{session}.json"
+        folder, raw = self._session_dirs(session)
+        # EDF+ is the recording's file (in its folder); BDF+ is built on
+        # request into raw/, beside the journal it comes from.
+        home = folder if fmt == "edf" else raw
+        out_path = home / f"{session}.{fmt}"
+        journal_path = raw / f"{session}.eegj"
+        sidecar_path = raw / f"{session}.json"
 
         # Build on demand if it isn't already on disk.
         if not out_path.exists():
@@ -357,7 +378,7 @@ class PiEEGServer:
         hdrs["Access-Control-Allow-Origin"] = "*"
         if not session:
             return HTTPResponse(404, "Not Found", hdrs, b"no recording available\n")
-        journal_path = self._recordings_dir / f"{session}.eegj"
+        journal_path = self._session_dirs(session)[1] / f"{session}.eegj"
         if not journal_path.exists():
             return HTTPResponse(404, "Not Found", hdrs, b"unknown session\n")
         return self._file_response(journal_path, "application/octet-stream", hdrs)
@@ -569,7 +590,11 @@ class PiEEGServer:
         # One timestamp -> one base name shared by the CSV, the journal, its
         # sidecar, and the eventual EDF, so a session's files stay together.
         session = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
-        output = self._recordings_dir / f"{session}.csv"
+        # Its own folder: <session>/ gets the EDF+ and summary JSON on stop;
+        # everything written while recording goes in <session>/raw/.
+        raw_dir = self._recordings_dir / session / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        output = raw_dir / f"{session}.csv"
         self._recorder = Recorder(self._acq, output=output)
 
         # Authoritative journal. Channel count/labels come from the hardware.
@@ -579,7 +604,7 @@ class PiEEGServer:
         gain = self._acq.pga_gain
         journal_kwargs = {} if gain is None else {"gain": gain}
         self._journal = JournalWriter(
-            self._acq, out_dir=self._recordings_dir, session_name=session,
+            self._acq, out_dir=raw_dir, session_name=session,
             num_channels=self._acq.num_channels,
             sample_rate=self._sample_rate(),
             prefilter=getattr(self._acq, "prefilter", None),
@@ -677,45 +702,42 @@ class PiEEGServer:
         return anno
 
     async def _export_primary_on_stop(self) -> dict:
-        """Best-effort BDF+ (primary, lossless) export of the finished journal.
+        """Best-effort EDF+ export of the finished journal, into its folder.
 
-        Returns fields to merge into the stop status. Never raises: if pyedflib
-        is missing or export fails, the journal + sidecar remain on disk and can
-        be converted later with ``python -m pieeg_server.edf_export``.
-
-        Only BDF+ is built here (the primary clinical file). The EDF+ fallback
-        is generated on demand when ``/download/edf`` is requested, so we don't
-        spend CPU on a format the client may never ask for. We still advertise
-        its URL below — the file is created the first time it's fetched.
+        Writes <session>/<session>.edf (with the annotations) and the summary
+        <session>/<session>.json beside it. Returns fields to merge into the
+        stop status. Never raises: if pyedflib is missing or export fails, the
+        journal + sidecar stay in raw/ and can be converted later with
+        ``python -m pieeg_server.edf_export``. A lossless BDF+ is built on
+        request (/download/bdf) into raw/.
         """
         if self._journal is None:
             return {}
         journal_path = self._journal.journal_path
         sidecar_path = self._journal.sidecar_path
         session = self._last_session
+        folder = self._session_dirs(session)[0]
         loop = asyncio.get_running_loop()
-        try:
-            bdf_path = await loop.run_in_executor(
-                None, edf_export.export_journal,
-                journal_path, sidecar_path, None, "bdf")
-            logger.info("BDF+ exported (primary): %s", bdf_path)
-            return {
-                "journal": str(journal_path.resolve()),
-                "primary_format": "bdf",
-                "bdf": str(bdf_path.resolve()),
-                "bdf_url": f"/download/bdf?session={session}",
-                # Fallback EDF+ is built lazily on first download.
+        info = {"journal": str(journal_path.resolve()),
+                "folder": str(folder.resolve()),
+                "primary_format": "edf",
                 "edf_url": f"/download/edf?session={session}",
-            }
+                "bdf_url": f"/download/bdf?session={session}"}
+        try:
+            edf_path = await loop.run_in_executor(
+                None, edf_export.export_journal,
+                journal_path, sidecar_path, folder / f"{session}.edf", "edf")
+            summary = await loop.run_in_executor(
+                None, edf_export.write_summary, journal_path, edf_path,
+                folder / f"{session}.json", sidecar_path)
+            logger.info("EDF+ exported: %s (+ %s)", edf_path, summary.name)
+            info.update(edf=str(edf_path.resolve()),
+                        summary=str(summary.resolve()))
         except Exception as exc:  # noqa: BLE001 - export must not block stop
-            logger.warning("BDF export deferred (%s); journal is safe at %s",
+            logger.warning("EDF export deferred (%s); journal is safe at %s",
                            exc, journal_path)
-            return {
-                "journal": str(journal_path.resolve()),
-                "primary_format": "bdf",
-                "bdf": None,
-                "bdf_error": str(exc),
-            }
+            info.update(edf=None, edf_error=str(exc))
+        return info
 
     @staticmethod
     def _csv_integrity(path: Path) -> tuple[int, str | None]:
