@@ -253,6 +253,12 @@ REF_FLOAT_DRIFT_UV_S = 1500.0
 # ... and sits far from zero with every lead at the same level.
 REF_FLOAT_DC_UV = 30_000.0
 REF_FLOAT_DC_SPREAD = 0.2
+# GND (BIO) out on WALL power (saline bath, 2026-09-23): nothing holds the
+# body near the amplifier's reference, so every lead carries 0.3-33 mV of
+# mains (median 3.5-4.5 mV; 2-10 µV with BIO in), and the all-off lead-off
+# signature only flashes every 10-15 s. mains_uv at or above this, after such
+# a flash, keeps GND off (see acq_viewer.ContactTracker).
+GND_OFF_MAINS_UV = 500.0
 
 
 def classify_contact(status, railed, common_uv=0.0, drift_uv_s=0.0,
@@ -315,9 +321,18 @@ def contact_from_signal(status, block, full_scale_uv, fs=250):
     on = [i for i, c in enumerate(status)
           if not c.get("p_off") and i < x.shape[1]]
     common = drift = shared_dc = 0.0
+    mains = 0.0
+    live = on if len(on) >= 2 else [i for i in range(x.shape[1])
+                                     if not railed[i]]
+    k = int(round(MAINS_AVERAGE_S * fs))
+    if live and 1 < k < x.shape[0]:
+        # fast part: the signal minus its MAINS_AVERAGE_S running mean
+        w = x[:, live]
+        c = np.vstack([np.zeros((1, w.shape[1])), np.cumsum(w, axis=0)])
+        fast = w[k - 1:] - (c[k:] - c[:-k]) / k
+        mains = float(np.median(fast.std(axis=0)))
     if len(on) >= 2:
         z = x[:, on]
-        k = int(round(MAINS_AVERAGE_S * fs))
         if 1 < k < z.shape[0]:
             c = np.vstack([np.zeros((1, z.shape[1])), np.cumsum(z, axis=0)])
             z = (c[k:] - c[:-k]) / k
@@ -333,7 +348,9 @@ def contact_from_signal(status, block, full_scale_uv, fs=250):
         level = float(np.median(dc))
         if np.all(np.abs(dc - level) <= REF_FLOAT_DC_SPREAD * abs(level)):
             shared_dc = level
-    return classify_contact(status, railed, common, drift, shared_dc)
+    verdict = classify_contact(status, railed, common, drift, shared_dc)
+    verdict["mains_uv"] = mains     # median rms of the leads' fast part
+    return verdict
 
 
 def parse_leadoff_status(status_bytes, channel_offset: int = 0) -> list[dict]:

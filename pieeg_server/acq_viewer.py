@@ -56,7 +56,7 @@ from pathlib import Path
 import numpy as np
 from scipy import signal
 
-from .hardware import VREF_UV, contact_from_signal
+from .hardware import GND_OFF_MAINS_UV, VREF_UV, contact_from_signal
 from .impedance import band as impedance_band, format_ohms
 
 # ── electrode map: chip input (E1..) -> scalp label ──────────────────────────
@@ -323,6 +323,7 @@ class ContactTracker:
         self._gnd = deque(maxlen=window)
         self._clock = clock
         self._gnd_off_at = None
+        self._gnd_latched = False
 
     def update(self, status, recent=None, full_scale_uv=VREF_UV / 24, fs=250):
         """Feed one leadoff_status() readout and the recent signal block
@@ -342,6 +343,16 @@ class ContactTracker:
             return
         verdict = contact_from_signal(status, recent, full_scale_uv, fs)
         now = self._clock()
+        # On wall power a GND that is out only flashes the all-off
+        # signature; in between, every lead carries mV of mains. Hold GND
+        # off from a flash for as long as that mains stays.
+        mains_high = verdict.get("mains_uv", 0.0) >= GND_OFF_MAINS_UV
+        if verdict["gnd"] == "red":
+            self._gnd_latched = True
+        elif not mains_high:
+            self._gnd_latched = False
+        if self._gnd_latched and mains_high:
+            verdict["gnd"] = "red"
         if verdict["gnd"] == "red":
             self._gnd_off_at = now
             self._ref.clear()           # its last readings were the fall
