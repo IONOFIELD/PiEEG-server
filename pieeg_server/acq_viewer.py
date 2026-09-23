@@ -112,6 +112,7 @@ DEFAULT_SENS = 7          # microvolts per millimetre
 WINDOW_SECONDS = 10.0     # width of the strip-chart
 PX_PER_MM = 4.0           # screen pixels per "millimetre" for sensitivity
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
+SWEEP_CHUNK = 8           # trace columns per persistent canvas line
 # Preferred window size. Smaller screens (the Pi's 7" 800x480 DSI panel) get
 # the window maximised to fit instead.
 WINDOW_W, WINDOW_H = 1000, 640
@@ -547,7 +548,8 @@ class ViewerModel:
     def freeze(self):
         """Hold the display on the current window (see self.frozen)."""
         self.frozen = {"raw": self.raw.copy(), "filt": self.filt.copy(),
-                       "head": self.sweep_head(), "filled": self.filled}
+                       "head": self.sweep_head(), "filled": self.filled,
+                       "total": self.total}
 
     def unfreeze(self):
         self.frozen = None
@@ -637,6 +639,21 @@ def dominant_hz(x, fs, lff=None, hff=None):
         if d != 0:
             return float(f[k] + 0.5 * (a - c) / d * (f[1] - f[0]))
     return float(f[k])
+
+
+def sweep_chunks(first, last, ncol, size):
+    """Column ranges (a, b), inclusive, walking forward from `first` to
+    `last` on a sweep of `ncol` columns (wrapping past the right edge), cut
+    into pieces of at most `size` columns and never across the wrap."""
+    out = []
+    c = first
+    while True:
+        end = last if last >= c else ncol - 1
+        b = min(end, c + size - 1)
+        out.append((c, b))
+        if b == last:
+            return out
+        c = (b + 1) % ncol
 
 
 def sweep_envelope(trace, head, ncol):
@@ -754,7 +771,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                auto_shot=None, auto_close_ms=None,
                connect_popup=None, contact_source=None,
                record_control=None, full_scale_uv=VREF_UV / 24,
-               impedance_control=None):
+               impedance_control=None, stop_event=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -1501,7 +1518,161 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             word.config(text=_CONTACT_WORD.get(verdict, "—"),
                         fg=_CONTACT_FG.get(verdict, C["text_dim"]))
 
+    # ---- sweep trace layer ------------------------------------------------ #
+    # Behind the sweep nothing changes, so trace lines are persistent canvas
+    # items (tag "sweep") drawn SWEEP_CHUNK columns at a time: each frame
+    # redraws only the chunk being written and deletes the chunks the erase
+    # gap reaches. Anything that changes the whole picture (size, rows,
+    # sensitivity, filters, hold/resume) triggers one full redraw.
+    _sw = {"sig": None, "chunks": deque(), "open": None}
+
+    def _sweep_reset():
+        canvas.delete("sweep")
+        _sw["sig"], _sw["open"] = None, None
+        _sw["chunks"].clear()
+
+    def _sweep_draw(rows, W, row_h, half, sens):
+        ncol = max(1, min(W, model.win))
+        vfilt, head, _ = model.view()
+        sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
+               id(model.frozen))
+        if sig != _sw["sig"]:
+            _sweep_reset()
+            _sw["sig"] = sig
+        xs = np.repeat((np.arange(ncol) + 0.5) * W / ncol, 2)
+        ys = []
+        cur = 0
+        total = model.total if model.frozen is None else model.frozen["total"]
+        cur_abs = total * ncol // model.win     # sweep column, counting laps
+        for k, r in enumerate(rows):
+            vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
+                                       head, ncol)
+            base = k * row_h + row_h / 2.0
+            ys.append(base - np.clip(vals / sens * PX_PER_MM, -half, half))
+        gap = max(2, ncol // 100)                 # erase gap, ~0.1 s
+
+        def draw(a, b):
+            # columns a..b inclusive, joined to column a-1 when it exists
+            a0 = a - 1 if a > 0 else a
+            ids = []
+            if b > a0:
+                for y in ys:
+                    co = np.empty(2 * (b - a0 + 1) * 2)
+                    co[0::2] = xs[2 * a0:2 * (b + 1)]
+                    co[1::2] = y[2 * a0:2 * (b + 1)]
+                    lid = canvas.create_line(*co.tolist(), fill=C["curve"],
+                                             width=1, tags="sweep")
+                    canvas.tag_lower(lid)
+                    ids.append(lid)
+            # lap-aware column of the chunk's right end, for erasing
+            return (a, b, ids, cur_abs - (cur - b) % ncol)
+
+        chunks = _sw["chunks"]
+        if _sw["open"] is None:                    # full redraw
+            first = (cur + gap + 1) % ncol
+            for a, b in sweep_chunks(first, cur, ncol, SWEEP_CHUNK):
+                chunks.append(draw(a, b))
+        else:                                      # extend the open chunk
+            a = _sw["open"]
+            old = chunks.pop()
+            canvas.delete(*old[2]) if old[2] else None
+            for a, b in sweep_chunks(a, cur, ncol, SWEEP_CHUNK):
+                chunks.append(draw(a, b))
+        _sw["open"] = chunks[-1][0] if chunks else None
+        # erase ahead of the sweep: drop every chunk drawn a lap ago that the
+        # gap has reached — however far the sweep jumped since the last frame
+        while len(chunks) > 1 and chunks[0][3] <= cur_abs + gap - ncol:
+            ids = chunks.popleft()[2]
+            if ids:
+                canvas.delete(*ids)
+
+    # ---- static chart layer ------------------------------------------------ #
+    # Row lines, label boxes, labels and the calibration marker only change
+    # with the layout, so they stay on the canvas (tag "deco") and are rebuilt
+    # only when their signature changes. Rebuilding them every frame made Tk
+    # repaint the whole chart 15 times a second.
+    _deco = {"sig": None, "dots": [], "dot_sig": None}
+
+    def _draw_static(rows, W, H, row_h, half, sens, box_w, box_x):
+        sig = (W, H, sens, tuple((r["pair"], model.epair_name(r["pair"]),
+                                  model.row_label(r)) for r in rows))
+        if sig == _deco["sig"]:
+            return
+        canvas.delete("deco")
+        _deco["sig"], _deco["dots"], _deco["dot_sig"] = sig, [], None
+        for k, r in enumerate(rows):
+            base = k * row_h + row_h / 2.0
+            top, bot = base - half, base + half
+            # 1) row separator (hairline grid)
+            canvas.create_line(0, k * row_h, W, k * row_h,
+                               fill=C["grid"], tags="deco")
+            # 2) accent tick at the far left of the row — the Geist
+            #    channel-label "border-left: 2px solid accent" motif.
+            canvas.create_line(0, top, 0, bot, fill=C["accent"], width=2,
+                               tags="deco")
+            # 3) the framed lead-name box (as wide as it is tall)
+            canvas.create_rectangle(box_x, top, box_x + box_w, bot,
+                                    outline=C["border_hi"], width=1,
+                                    tags="deco")
+            # 5) lead labels centred where the trace crosses, on a small
+            #    chip so they stay readable: the CHIP-INPUT pair (E1-E3) on
+            #    top — which physical electrode to reseat — and the scalp
+            #    SITE pair (Fp1-C3) dimmed under it. Mono, per the Geist
+            #    "numeric data is monospace" convention.
+            cx = box_x + box_w / 2.0
+            e_name = model.epair_name(r["pair"])
+            s_name = model.row_label(r)
+            chip = max(28.0, max(len(e_name), len(s_name)) * 6.0)
+            canvas.create_rectangle(cx - chip / 2, base - 13, cx + chip / 2,
+                                    base + 13, fill=C["canvas_bg"],
+                                    outline="", tags="deco")
+            e_text = canvas.create_text(cx, base - 5, text=e_name,
+                                        fill=C["text"],
+                                        font=(_MONO, _fs(8), "bold"),
+                                        tags="deco")
+            canvas.create_text(cx, base + 6, text=s_name, fill=C["text_sec"],
+                               font=(_MONO, _fs(8)), tags="deco")
+            tx0, _, tx1, _ = canvas.bbox(e_text)
+            _deco["dots"].append(((r["pair"][0], tx0 - 7, base),
+                                  (r["pair"][1], tx1 + 7, base)))
+        # calibration marker: 100 uV vertical, 1 s horizontal
+        cal_uv = 100.0 / sens * PX_PER_MM
+        cal_s = W / WINDOW_SECONDS
+        x0, y0 = 40, H - 16
+        canvas.create_line(x0, y0, x0, y0 - cal_uv, fill=C["text_dim"],
+                           tags="deco")
+        canvas.create_line(x0, y0, x0 + cal_s, y0, fill=C["text_dim"],
+                           tags="deco")
+        canvas.create_text(x0 + 6, y0 - cal_uv, text="100 µV", anchor="w",
+                           fill=C["axis"], font=(_MONO, _fs(8)), tags="deco")
+        canvas.create_text(x0 + cal_s + 4, y0, text="1 s", anchor="w",
+                           fill=C["axis"], font=(_MONO, _fs(8)), tags="deco")
+
+    def _draw_dots():
+        # contact dots flanking the electrode pair: left = upper electrode,
+        # right = lower (green on / amber intermittent / red off). None until
+        # the first lead-off readout. Redrawn only when a colour changes.
+        if contact_source is None:
+            return
+        cols = tuple(_CONTACT_FG.get(model.site_contact(site))
+                     for pair in _deco["dots"] for site, _, _ in pair)
+        sig = (_deco["sig"], cols)
+        if sig == _deco["dot_sig"]:
+            return
+        _deco["dot_sig"] = sig
+        canvas.delete("dots")
+        for pair in _deco["dots"]:
+            for site, dot_x, base in pair:
+                fg = _CONTACT_FG.get(model.site_contact(site))
+                if fg:
+                    canvas.create_oval(dot_x - 3, base - 8, dot_x + 3,
+                                       base - 2, fill=fg, outline="",
+                                       tags="dots")
+
     def _redraw():
+        if stop_event is not None and stop_event.is_set():
+            root.destroy()                  # the Scope process is gone
+            return
         got = _drain_queue()
         _poll_contact()
         _poll_record()
@@ -1517,6 +1688,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         H = canvas.winfo_height()
         rows = [r for r in model.rows() if r["on"]]
         n = len(rows)
+        if not (W > 2 and H > 2 and n > 0):
+            _sweep_reset()
+            canvas.delete("deco", "dots")
+            _deco["sig"], _deco["dot_sig"], _deco["dots"] = None, None, []
         if W > 2 and H > 2 and n > 0:
             sens = float(sens_var.get())            # uV per mm
             row_h = H / n
@@ -1526,85 +1701,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             # parallel to the trace at the left, with the EEG passing through it.
             box_w = 2.0 * half
             box_x = 2.0
-            # Sweep display: one fixed pixel column per slice of the 10 s
-            # window (min + max of its samples); the sweep overwrites the
-            # oldest data just ahead of a small erase gap.
-            ncol = max(1, min(W, model.win))
-            vfilt, head, _ = model.view()
-            xs = np.repeat((np.arange(ncol) + 0.5) * W / ncol, 2)
-            gap = max(2, ncol // 100)           # erase gap, ~0.1 s
-            for k, r in enumerate(rows):
-                base = k * row_h + row_h / 2.0
-                top, bot = base - half, base + half
-                vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
-                                           head, ncol)
-                dy = np.clip(vals / sens * PX_PER_MM, -half, half)
-                ys = base - dy
-                # the written part left of the sweep, and the older part
-                # right of the erase gap
-                segments = [(0, 2 * (cur + 1)),
-                            (2 * min(ncol, cur + 1 + gap), 2 * ncol)]
-                # 1) row separator (hairline grid)
-                canvas.create_line(0, k * row_h, W, k * row_h,
-                                   fill=C["grid"], tags="trace")
-                # 2) accent tick at the far left of the row — the Geist
-                #    channel-label "border-left: 2px solid accent" motif.
-                canvas.create_line(0, top, 0, bot, fill=C["accent"], width=2,
-                                   tags="trace")
-                # 3) the framed lead-name box (as wide as it is tall)
-                canvas.create_rectangle(box_x, top, box_x + box_w, bot,
-                                        outline=C["border_hi"], width=1,
-                                        tags="trace")
-                # 4) the EEG trace, drawn on top so it runs THROUGH the box
-                for a, b in segments:
-                    if b - a >= 4:
-                        coords = np.empty((b - a) * 2)
-                        coords[0::2] = xs[a:b]
-                        coords[1::2] = ys[a:b]
-                        canvas.create_line(*coords.tolist(), fill=C["curve"],
-                                           width=1, tags="trace")
-                # 5) lead labels centred where the trace crosses, on a small
-                #    chip so they stay readable: the CHIP-INPUT pair (E1-E3) on
-                #    top — which physical electrode to reseat — and the scalp
-                #    SITE pair (Fp1-C3) dimmed under it. Mono, per the Geist
-                #    "numeric data is monospace" convention.
-                cx = box_x + box_w / 2.0
-                e_name = model.epair_name(r["pair"])
-                s_name = model.row_label(r)
-                chip = max(28.0, max(len(e_name), len(s_name)) * 6.0)
-                canvas.create_rectangle(cx - chip / 2, base - 13, cx + chip / 2,
-                                        base + 13, fill=C["canvas_bg"],
-                                        outline="", tags="trace")
-                e_text = canvas.create_text(cx, base - 5, text=e_name,
-                                            fill=C["text"],
-                                            font=(_MONO, _fs(8), "bold"),
-                                            tags="trace")
-                canvas.create_text(cx, base + 6, text=s_name, fill=C["text_sec"],
-                                   font=(_MONO, _fs(8)), tags="trace")
-                # 6) contact dots flanking the electrode pair: left = upper
-                #    electrode, right = lower (green on / amber intermittent /
-                #    red off). None until the first lead-off readout.
-                if contact_source is not None:
-                    tx0, _, tx1, _ = canvas.bbox(e_text)
-                    for site, dot_x in ((r["pair"][0], tx0 - 7),
-                                        (r["pair"][1], tx1 + 7)):
-                        fg = _CONTACT_FG.get(model.site_contact(site))
-                        if fg:
-                            canvas.create_oval(dot_x - 3, base - 8, dot_x + 3,
-                                               base - 2, fill=fg, outline="",
-                                               tags="trace")
-            # calibration marker: 100 uV vertical, 1 s horizontal
-            cal_uv = 100.0 / sens * PX_PER_MM
-            cal_s = W / WINDOW_SECONDS
-            x0, y0 = 40, H - 16
-            canvas.create_line(x0, y0, x0, y0 - cal_uv, fill=C["text_dim"],
-                               tags="trace")
-            canvas.create_line(x0, y0, x0 + cal_s, y0, fill=C["text_dim"],
-                               tags="trace")
-            canvas.create_text(x0 + 6, y0 - cal_uv, text="100 µV", anchor="w",
-                               fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
-            canvas.create_text(x0 + cal_s + 4, y0, text="1 s", anchor="w",
-                               fill=C["axis"], font=(_MONO, _fs(8)), tags="trace")
+            _sweep_draw(rows, W, row_h, half, sens)
+            _draw_static(rows, W, H, row_h, half, sens, box_w, box_x)
+            _draw_dots()
         if _toast["text"] and time.monotonic() < _toast["until"] and W > 2:
             tid = canvas.create_text(W - 12, 12, text=_toast["text"],
                                      anchor="ne", fill=_toast["fg"],
@@ -1861,6 +1960,7 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
             try:
                 kind, *rest = conn.recv()
             except (EOFError, OSError):
+                parent_gone.set()           # Scope killed: close the window
                 return
             if kind == "tick":
                 msg = rest[0]
@@ -1873,6 +1973,8 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
                 if fut is not None:
                     fut.set(rest[1])
 
+    parent_gone = threading.Event()
+    viewer_kwargs["stop_event"] = parent_gone
     threading.Thread(target=receive, name="viewer-rx", daemon=True).start()
 
     ids = itertools.count()
