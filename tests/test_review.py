@@ -111,3 +111,15 @@ def test_delete_refuses_outside_recordings_dir(tmp_path):
     with pytest.raises(ValueError):
         review.delete_session(j, tmp_path / "recs")
     assert j.exists()
+
+
+def test_cal_breaks_find_the_jump_before_each_cal_note():
+    fs = 250
+    uv = np.full((3000, 2), -57000.0)
+    uv[:400] = 1875.0                        # calibration until sample 400
+    uv[2000:] = -1875.0                      # and again from 2000
+    notes = [{"frame": 430, "type": "CAL", "text": "Calibration off"},
+             {"frame": 2010, "type": "CAL", "text": "Calibration on"},
+             {"frame": 1000, "type": "EC", "text": "Eyes closed"}]
+    assert review.cal_breaks(uv, notes, fs) == [400, 2000]
+    assert review.cal_breaks(uv, notes[2:], fs) == []
