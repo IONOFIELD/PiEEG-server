@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 from pieeg_server import impedance as imp
-from pieeg_server.hardware import LOFF, LOFF_SENSN, LOFF_SENSP
+from pieeg_server.hardware import (BIAS_DRIVE_OFF, BIAS_DRIVE_ON, BIAS_SENSP,
+                                   CONFIG3, LOFF, LOFF_SENSN, LOFF_SENSP)
 
 FS = 250
 FULL_SCALE = 4.5e6 / 24
@@ -40,10 +41,12 @@ class TestRegisters:
         assert imp.EXCITATION_HZ == 31.25
 
     def test_lead_pass_senses_all_p_inputs_only(self):
-        assert imp.LEAD_PASS == {LOFF: 0x02, LOFF_SENSP: 0xFF, LOFF_SENSN: 0x00}
+        assert imp.LEAD_PASS == {LOFF: 0x02, LOFF_SENSP: 0xFF, LOFF_SENSN: 0x00,
+                                 **BIAS_DRIVE_OFF}
 
     def test_ref_pass_uses_one_n_source(self):
-        assert imp.REF_PASS == {LOFF: 0x02, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01}
+        assert imp.REF_PASS == {LOFF: 0x02, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01,
+                                **BIAS_DRIVE_OFF}
 
     def test_lead_pass_mask_excites_only_given_leads(self):
         assert imp.lead_pass(0x7E)[LOFF_SENSP] == 0x7E
@@ -56,6 +59,19 @@ class TestRegisters:
 
     def test_restore_matches_dc_lead_off_boot_config(self):
         assert imp.DC_RESTORE == {LOFF: 0x00, LOFF_SENSP: 0xFF, LOFF_SENSN: 0xFF}
+
+    def test_restore_puts_back_the_boards_bias_drive(self):
+        class Hw:
+            bias_registers = dict(BIAS_DRIVE_ON)
+        regs = imp.restore_registers(Hw())
+        assert regs[CONFIG3] == 0xEC and regs[BIAS_SENSP] == 0xFF
+        assert regs[LOFF] == 0x00
+        # hardware that doesn't report bias registers (mock) gets DC only
+        assert imp.restore_registers(object()) == imp.DC_RESTORE
+
+    def test_passes_run_with_bias_drive_off(self):
+        for regs in (imp.lead_pass(0x3F), imp.REF_PASS):
+            assert {k: regs[k] for k in BIAS_DRIVE_OFF} == BIAS_DRIVE_OFF
 
 
 class TestBlockLength:
@@ -580,3 +596,13 @@ class TestShieldOwnerDetection:
     ])
     def test_mentions_are_not_owners(self, argv):
         assert not imp._holds_shield(argv)
+
+
+def test_bias_drive_default_and_override(monkeypatch):
+    from pieeg_server.hardware import bias_drive_wanted
+    monkeypatch.delenv("PIEEG_BIAS_DRIVE", raising=False)
+    assert bias_drive_wanted(8) and not bias_drive_wanted(16)
+    monkeypatch.setenv("PIEEG_BIAS_DRIVE", "0")
+    assert not bias_drive_wanted(8)
+    monkeypatch.setenv("PIEEG_BIAS_DRIVE", "1")
+    assert bias_drive_wanted(16)

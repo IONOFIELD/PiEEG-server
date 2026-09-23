@@ -77,6 +77,33 @@ LOFF_DC_95_5 = 0x00
 LOFF_SENSE_ALL = 0xFF          # enable lead-off sensing on all 8 channels
 CONFIG4_PD_LOFF_COMP = 0x02    # bit 1: power up the lead-off comparators
 
+# --- Bias drive (driven right leg) ---
+# BIAS_SENSP/N choose which inputs the bias amplifier averages into the
+# common-mode estimate it inverts and drives back onto the body through the
+# BIAS pin (the "BIO" electrode). With none selected the BIAS pin only sits at
+# mid-supply, so common-mode pickup is not cancelled. TI SBAS499C 9.3.2.4.5.
+BIAS_SENSP = 0x0D
+BIAS_SENSN = 0x0E
+# CONFIG3: PD_REFBUF=1, reserved 11, BIAS_MEAS=0, BIASREF_INT=1, PD_BIAS=1,
+# BIAS_LOFF_SENS=0 -> 0xEC (TI's sample sequence and OpenBCI). The old 0xFF
+# also set BIAS_MEAS and BIAS_LOFF_SENS, which are for bias diagnostics only.
+CONFIG3_BIAS_DRIVE = 0xEC
+CONFIG3_LEGACY = 0xFF
+# Register values with the bias drive on / off (off = the original PiEEG
+# block, which is also what impedance_cal.json was fitted with).
+BIAS_DRIVE_ON = {CONFIG3: CONFIG3_BIAS_DRIVE, BIAS_SENSP: 0xFF, BIAS_SENSN: 0xFF}
+BIAS_DRIVE_OFF = {CONFIG3: CONFIG3_LEGACY, BIAS_SENSP: 0x00, BIAS_SENSN: 0x00}
+
+
+def bias_drive_wanted(num_channels: int) -> bool:
+    """Bias drive on? PIEEG_BIAS_DRIVE=1/0 forces it; unset, it is on for
+    the 8-channel board (bench-tested) and off for the daisy-chained boards,
+    whose BIAS wiring between chips has not been checked."""
+    env = os.environ.get("PIEEG_BIAS_DRIVE", "").strip()
+    if env:
+        return env not in ("0", "off", "no", "false")
+    return num_channels == 8
+
 # STATUS word sync marker: every ADS1299 data frame begins with a 24-bit STATUS
 # word whose top 4 bits are fixed 1100. The remaining bits carry LOFF_STATP[7:0]
 # + LOFF_STATN[7:0] + GPIO[3:0], which now VARY once lead-off sensing is on — so
@@ -893,10 +920,21 @@ class PiEEGHardware:
         self._write_register(chip_num, CONFIG1, config1)
         self._config1 = config1
         self._write_register(chip_num, CONFIG2, 0xD4)
-        self._write_register(chip_num, CONFIG3, 0xFF)
+        # Bias drive: all 8 P inputs and the shared reference (every N input
+        # is tied to SRB1) feed the common-mode loop. An unconnected input
+        # rails and would skew that average, so a partial montage wants
+        # PIEEG_BIAS_DRIVE=0 until the sense mask follows lead-off status.
+        self.bias_registers = dict(BIAS_DRIVE_ON if bias_drive_wanted(
+            self._num_channels) else BIAS_DRIVE_OFF)
+        logger.info("bias drive %s: %s",
+                    "ON" if self.bias_registers[BIAS_SENSP] else "OFF",
+                    {hex(k): hex(v) for k, v in self.bias_registers.items()})
+        self._write_register(chip_num, CONFIG3, self.bias_registers[CONFIG3])
         self._write_register(chip_num, LOFF, LOFF_DC_95_5)  # DC lead-off, 95%/5%
-        self._write_register(chip_num, 0x0D, 0x00)          # BIAS_SENSP
-        self._write_register(chip_num, 0x0E, 0x00)          # BIAS_SENSN
+        self._write_register(chip_num, BIAS_SENSP,
+                             self.bias_registers[BIAS_SENSP])
+        self._write_register(chip_num, BIAS_SENSN,
+                             self.bias_registers[BIAS_SENSN])
         # Enable lead-off sensing on all 8 P and N inputs so the STATUS word
         # reports per-channel electrode contact. Additive: does not touch the
         # sample rate, gain, filtering, or channel data path.

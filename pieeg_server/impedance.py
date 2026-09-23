@@ -52,8 +52,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .hardware import (LOFF, LOFF_DC_95_5, LOFF_SENSE_ALL, LOFF_SENSN,
-                       LOFF_SENSP, VREF_UV, contact_from_signal)
+from .hardware import (BIAS_DRIVE_OFF, LOFF, LOFF_DC_95_5, LOFF_SENSE_ALL,
+                       LOFF_SENSN, LOFF_SENSP, VREF_UV, contact_from_signal)
 
 logger = logging.getLogger("pieeg.impedance")
 
@@ -73,13 +73,25 @@ def lead_pass(mask=LOFF_SENSE_ALL):
     ~33 µV down to ~4.5 µV. Leads without current read ~0.2 µV (no crosstalk
     worth counting), and a lead reads the same alone or with all the others.
     """
-    return {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: mask & 0xFF, LOFF_SENSN: 0x00}
+    return {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: mask & 0xFF, LOFF_SENSN: 0x00,
+            **BIAS_DRIVE_OFF}
 
 
+# Every pass runs with the bias drive OFF: the calibration (impedance_cal.json)
+# was fitted with it off, and the driven BIAS pin would change the path the
+# test current returns through. DC_RESTORE then puts back whatever the board
+# runs with (restore_registers adds the hardware's own bias registers).
 LEAD_PASS = lead_pass()
-REF_PASS = {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01}
+REF_PASS = {LOFF: LOFF_AC_6NA_31HZ, LOFF_SENSP: 0x00, LOFF_SENSN: 0x01,
+            **BIAS_DRIVE_OFF}
 DC_RESTORE = {LOFF: LOFF_DC_95_5, LOFF_SENSP: LOFF_SENSE_ALL,
               LOFF_SENSN: LOFF_SENSE_ALL}
+
+
+def restore_registers(hw):
+    """DC_RESTORE plus the bias registers `hw` normally runs with (none for
+    hardware that doesn't report them, e.g. the mock)."""
+    return {**DC_RESTORE, **(getattr(hw, "bias_registers", None) or {})}
 
 # ── display bands (wet gel) ──────────────────────────────────────────────────
 GREEN_MAX_OHMS = 10_000
@@ -725,7 +737,7 @@ class ImpedanceCheck:
                        ref_block=ref, k0=k0)
 
     def _restore_and_restart(self):
-        self._acq._hw.configure_registers(dict(DC_RESTORE))
+        self._acq._hw.configure_registers(restore_registers(self._acq._hw))
         logger.info("impedance check: DC lead-off restored")
         self._acq.start()
 
@@ -748,7 +760,7 @@ class ImpedanceCheck:
         finally:
             try:
                 if self._switched:
-                    await self._restart(DC_RESTORE)
+                    await self._restart(restore_registers(self._acq._hw))
                     logger.info("impedance check: DC lead-off restored")
             finally:
                 hampel.enabled = hampel_was
