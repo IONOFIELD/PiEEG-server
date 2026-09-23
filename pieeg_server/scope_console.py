@@ -262,6 +262,12 @@ SCOPE_CHANGELOG = [
             "and its EDF+ and summary rebuilt with the notes. Delete removes "
             "a recording for good after a second tap; the one recording now "
             "is locked."),
+    ("4.4", "Calibration: the square button with the square-wave icon, left of "
+            "the montage, switches every channel to the chip's internal "
+            "square wave (yellow while on) and back — for the start and end "
+            "of a recording, where it adds \"Calibration on/off\" notes. Each "
+            "switch drops ~40 ms of samples. Live traces are grey-blue, and "
+            "strong blue while recording."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -423,7 +429,8 @@ class _ViewerLink:
     CHUNK = 100                             # rows converted per GIL hold
 
     def __init__(self, viewer_kwargs, leadoff=None, record_status=None,
-                 toggle_record=None, impedance=None, annotate=None):
+                 toggle_record=None, impedance=None, annotate=None,
+                 calibrate=None):
         ctx = multiprocessing.get_context("spawn")
         self._conn, self._child_conn = ctx.Pipe(duplex=True)
         self._proc = ctx.Process(
@@ -431,7 +438,8 @@ class _ViewerLink:
             kwargs=dict(viewer_kwargs, contact=leadoff is not None,
                         record=toggle_record is not None,
                         impedance=impedance is not None,
-                        annotate=annotate is not None),
+                        annotate=annotate is not None,
+                        calibrate=calibrate is not None),
             name="pieeg-scope-viewer", daemon=True)
         self._leadoff = leadoff
         self._record_status = record_status
@@ -443,6 +451,8 @@ class _ViewerLink:
             self._requests["impedance"] = ("impedance_result", impedance)
         if annotate is not None:
             self._requests["annotate"] = ("annotate_result", annotate)
+        if calibrate is not None:
+            self._requests["calibrate"] = ("calibrate_result", calibrate)
         self._frames = collections.deque(maxlen=self.MAX_BACKLOG)
         self._outbox: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
@@ -768,6 +778,46 @@ def main(argv=None):
         await server._start_recording()
         return {"started": server._last_session}
 
+    # ---- calibration (the viewer's square-wave button) ---------------------- #
+    # Every channel's input is switched to the ADS1299's internal test signal
+    # (CHnSET MUX=101, gain unchanged: a square wave from CONFIG2) and back
+    # to the saved CHnSET values. Each switch restarts acquisition, which drops
+    # ~40 ms of samples. While recording, "Calibration on/off" notes mark it.
+    # The mock only knows 0x05 (test) / 0x00 (normal).
+    _chn = range(0x05, 0x0D)
+    _cal_test, _cal_normal = (0x05, 0x00) if args.mock else (0x65, 0x60)
+    _cal = {"on": False, "saved": None}
+
+    async def _calibrate(on):
+        on = bool(on)
+        if on == _cal["on"]:
+            return {"on": on}
+        if server._impedance_active:
+            raise RuntimeError("wait for the impedance check to finish")
+        if on:
+            state = getattr(acq._hw, "register_state", None) or {}
+            _cal["saved"] = {r: state.get(r, _cal_normal) for r in _chn}
+            regs = {r: _cal_test for r in _chn}
+        else:
+            regs = _cal["saved"] or {r: _cal_normal for r in _chn}
+        await loop.run_in_executor(None, acq.restart_with_config, regs)
+        _cal["on"] = on
+        logger.info("calibration %s", "on" if on else "off")
+        note = None
+        if _record_status()["recording"]:
+            try:
+                note = await server._add_annotation(
+                    "Calibration on" if on else "Calibration off", None, "CAL")
+            except Exception as e:          # noqa: BLE001 - the switch happened
+                logger.warning("calibration note not saved: %s", e)
+        return {"on": on, "note": note}
+
+    def _impedance_unless_cal():
+        if _cal["on"]:
+            raise RuntimeError("turn calibration off first")
+        return asyncio.run_coroutine_threadsafe(
+            server.run_impedance_check(), loop)
+
 
     async def _shutdown():
         # Runs ON the loop: cancel the server (its `async with serve()` closes
@@ -842,13 +892,13 @@ def main(argv=None):
             lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)),
         # Ω: the electrode impedance check (PiEEG-8 only; works on --mock too,
         # which simulates it).
-        impedance=None if unsupported_reason(acq) else (
-            lambda: asyncio.run_coroutine_threadsafe(
-                server.run_impedance_check(), loop)),
+        impedance=None if unsupported_reason(acq) else _impedance_unless_cal,
         # EC / EO marks in the running recording (same no-mock rule as Rec)
         annotate=None if args.mock else (
             lambda text, unix_t, kind=None: asyncio.run_coroutine_threadsafe(
-                server._add_annotation(text, unix_t, kind), loop)))
+                server._add_annotation(text, unix_t, kind), loop)),
+        calibrate=lambda on: asyncio.run_coroutine_threadsafe(
+            _calibrate(on), loop))
     try:
         link_ref["link"] = link
         link.start()
