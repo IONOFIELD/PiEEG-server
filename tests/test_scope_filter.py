@@ -27,3 +27,29 @@ def test_no_startup_transient_for_each_stage_combination():
                 # against what passes: offset + sine
                 ref = 0.0 if lff else 30000.0
                 assert np.abs(y - ref).max() < 25.0, (lff, hff, notch)
+
+
+def test_lff_is_single_pole_time_constant():
+    from scipy import signal
+    fs, lff = 250, 1.0
+    f = StreamingFilter(1, fs)
+    f.set_cutoffs(lff, None, None)
+    b, a = f._hp
+    assert len(a) == 2                              # one pole
+    w, h = signal.freqz(b, a, worN=[lff, lff / 16, lff / 32], fs=fs)
+    db = 20 * np.log10(np.abs(h))
+    assert abs(db[0] + 3.01) < 0.05                 # -3 dB at the cutoff
+    assert abs((db[1] - db[2]) - 6.0) < 0.1         # -6 dB/octave well below it
+    # step response decays with TC = 1/(2π·LFF)
+    y = f.process(np.r_[np.zeros(10), np.ones(1000)][:, None])[:, 0]
+    tc = 1 / (2 * np.pi * lff)
+    k = 10 + int(round(tc * fs))
+    assert abs(y[k] - np.exp(-1)) < 0.01
+
+
+def test_negative_is_drawn_up():
+    from pieeg_server.acq_viewer import trace_y
+    y = trace_y([-50.0, 0.0, 50.0], base=100.0, sens=10.0, px_per_mm=5.0,
+                half=40.0)
+    assert list(y) == [75.0, 100.0, 125.0]          # canvas y grows downward
+    assert list(trace_y([-1e6, 1e6], 100.0, 10.0, 5.0, 40.0)) == [60.0, 140.0]
