@@ -1587,12 +1587,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Measured sample rate: frames drained per second, re-estimated ~1 Hz.
     _rate = {"t": time.monotonic(), "n": 0, "sps": None}
 
-    _rail_n = max(1, int(fs / 4))           # ~0.25 s of signal per verdict
+    # 2 s of signal per REF/GND verdict: a floating REF shows as a shared
+    # drift of a few mV/s, and 0.25 s was too short to measure it steadily
+    # (on a person, REF out read "off" on 155/169 readings, flickering the
+    # word to LOOSE; 2 s read 169/169, with no false alarm while connected).
+    _rail_n = max(1, int(2 * fs))
 
     def _poll_contact():
         if contact_source is None or _imp["future"] is not None:
             return                          # no lead-off readout during a check
-        recent = model.raw[-_rail_n:] if model.filled >= _rail_n else None
+        n = min(_rail_n, model.win)
+        recent = model.raw[-n:] if model.filled >= n else None
         try:
             model.contact.update(contact_source(), recent, full_scale_uv, fs)
         except Exception:                   # noqa: BLE001 - display only
