@@ -163,6 +163,9 @@ GEIST = {
     "grid":      "#21262d",   # row separators / grid
     "axis":      "#8b949e",   # --canvas-axis-text
     "curve":     "#58a6ff",   # --canvas-curve
+    # live traces: grey-blue while not recording, strong blue while recording
+    "curve_idle": "#7f8ea6",
+    "curve_rec":  "#3d8bff",
 }
 
 
@@ -946,7 +949,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                connect_popup=None, contact_source=None,
                record_control=None, full_scale_uv=VREF_UV / 24,
                impedance_control=None, stop_event=None,
-               annotate_control=None, recordings_dir=None):
+               annotate_control=None, recordings_dir=None,
+               calibrate_control=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
@@ -968,6 +972,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     given, an Ω button beside AVG IMP runs the electrode impedance check; the
     Future's result is ImpedanceResult.to_dict(). Results show in a panel over
     the traces (tap it to close) and AVG IMP averages the visible montage.
+    calibrate_control: optional dict {"set": (on) -> concurrent Future}. When
+    given, a square-wave button left of the montage switches every channel to
+    the chip's internal calibration square wave and back; the Future's
+    result is {"on", "note"}.
     recordings_dir: optional folder of recordings. When given, a Files
     button lists them (open / delete); an opened recording is shown page by
     page in the chart, with the same montage, filters, speed and
@@ -1099,6 +1107,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                 command=cb)
         menu.add_cascade(label=label, menu=sub)
 
+    # Calibration: a square button with a square-wave icon, left of the
+    # montage. Tap: every channel shows (and records) the chip's internal
+    # square wave; tap again: back to the electrodes. Yellow while on.
+    cal_box = cal_icon = None
+    if calibrate_control is not None:
+        cal_box = _chip(bar)
+        cal_box.pack(side="left", padx=(0, 4), pady=1)
+        cal_icon = tk.Canvas(cal_box, width=20, height=20, bg=C["raised"],
+                             highlightthickness=0, cursor="hand2")
+        cal_icon.pack(padx=1, pady=1)
+        # -/+ square wave: baseline, down, up, back to baseline
+        cal_icon.create_line(1, 10, 4, 10, 4, 15, 10, 15, 10, 5, 16, 5,
+                             16, 10, 19, 10, fill=C["text_sec"], width=2,
+                             tags="wave")
+        cal_icon.bind("<Button-1>", lambda e: _toggle_cal())
+
     # Montage: the list, then Save / Reset. The face grows a "*"
     # ("Transverse*") while the montage has edits Save hasn't kept.
     montage_var = tk.StringVar(value=DEFAULT_MONTAGE)
@@ -1126,7 +1150,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     lff_var = tk.StringVar(value=_lff0)
     hff_var = tk.StringVar(value=_hff0)
     notch_var = tk.StringVar(value=_notch0)
-    filt_mb, filt_menu = _dropdown(bar, 7)
+    filt_mb, filt_menu = _dropdown(bar, 6)
     filt_mb.configure(text="Filters")
     _submenu(filt_menu, "LFF (low cut)", lff_var, [c[0] for c in LFF_CHOICES],
              lambda: _filters_changed())
@@ -1378,6 +1402,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _refresh_montage_label()
 
     _rec = {"future": None}
+    _live = {"recording": False}            # colours the live traces
 
     def _toggle_record():
         if _rec["future"] is not None:
@@ -1411,6 +1436,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             st = record_control["status"]()
         except Exception:                   # noqa: BLE001 - display only
             return
+        _live["recording"] = bool(st.get("recording"))
         if ann_bar is not None:
             shown = bool(ann_bar.winfo_manager())
             if st.get("recording") and not shown and not _rev["on"]:
@@ -1427,6 +1453,57 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         else:
             _rec_face("● REC", False)
 
+    # ---- calibration (square wave) ---------------------------------------- #
+    _cal = {"on": False, "future": None, "want": None, "quiet_until": 0.0}
+
+    def _cal_face():
+        if cal_icon is None:
+            return
+        busy = _cal["future"] is not None
+        fg = (C["text_dim"] if busy else C["yellow"] if _cal["on"]
+              else C["text_sec"])
+        cal_icon.itemconfigure("wave", fill=fg)
+        edge = C["yellow"] if _cal["on"] and not busy else C["border_hi"]
+        cal_box.configure(highlightbackground=edge, highlightcolor=edge)
+
+    def _toggle_cal():
+        if calibrate_control is None or _cal["future"] is not None:
+            return
+        if _imp["future"] is not None:
+            _hint("wait for the impedance check to finish", fg=C["yellow"])
+            return
+        _cal["want"] = not _cal["on"]
+        try:
+            _cal["future"] = calibrate_control["set"](_cal["want"])
+        except Exception as e:              # noqa: BLE001 - report, don't crash
+            _hint(f"calibration failed: {e}", seconds=8, fg=C["red"])
+            return
+        _cal_face()
+
+    def _poll_cal():
+        fut = _cal["future"]
+        if fut is None or not fut.done():
+            return
+        _cal["future"] = None
+        try:
+            res = fut.result()
+        except Exception as e:              # noqa: BLE001
+            _hint(f"calibration failed: {e}", seconds=8, fg=C["red"])
+            _cal_face()
+            return
+        _cal["on"] = bool(res.get("on"))
+        # The input just jumped (electrode offset <-> square wave): start the
+        # display filters afresh on the new level instead of ringing, and
+        # hold the contact readout until 2 s of window is clean again.
+        model.filter.set_cutoffs(*model.cutoffs)
+        _cal["quiet_until"] = time.monotonic() + 2.5
+        note = res.get("note")
+        _hint(("calibration ON · internal square wave on every channel"
+               if _cal["on"] else "calibration off · electrodes")
+              + (" · marked in the recording" if note else ""),
+              seconds=5, fg=C["yellow"] if _cal["on"] else C["text_sec"])
+        _cal_face()
+
     # ---- impedance check (Ω) --------------------------------------------- #
     # Results stay in a panel over the traces for IMP_PANEL_S (tap to close);
     # AVG IMP keeps the latest check, recomputed for the montage on screen,
@@ -1439,6 +1516,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _run_impedance():
         if impedance_control is None or _imp["future"] is not None:
+            return
+        if _cal["on"] or _cal["future"] is not None:
+            _hint("turn calibration off first", fg=C["yellow"])
             return
         if record_control is not None:
             try:
@@ -2212,7 +2292,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _rev_note_label(a):
         kind = a.get("type")
-        if kind in {k for k, _ in NOTE_KINDS}:
+        if kind in {k for k, _ in NOTE_KINDS} | {"CAL"}:
             return kind
         return str(a.get("text", ""))[:12]
 
@@ -2324,6 +2404,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _poll_contact():
         if contact_source is None or _imp["future"] is not None:
             return                          # no lead-off readout during a check
+        if (_cal["on"] or _cal["future"] is not None
+                or time.monotonic() < _cal["quiet_until"]):
+            return                          # nor on the calibration signal
         n = min(_rail_n, model.win)
         recent = model.raw[-n:] if model.filled >= n else None
         try:
@@ -2363,8 +2446,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _sweep_draw(rows, W, row_h, half, sens):
         ncol = max(1, min(W, model.win))
         vfilt, head, _ = model.view()
+        curve = C["curve_rec"] if _live["recording"] else C["curve_idle"]
         sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
-               id(model.frozen), model.win, _rev["on"] and _rev["gen"])
+               id(model.frozen), model.win, _rev["on"] and _rev["gen"], curve)
         if _rev["on"]:
             if sig != _sw["sig"]:
                 _sweep_reset()
@@ -2395,7 +2479,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     co = np.empty(2 * (b - a0 + 1) * 2)
                     co[0::2] = xs[2 * a0:2 * (b + 1)]
                     co[1::2] = y[2 * a0:2 * (b + 1)]
-                    lid = canvas.create_line(*co.tolist(), fill=C["curve"],
+                    lid = canvas.create_line(*co.tolist(), fill=curve,
                                              width=1, tags="sweep")
                     canvas.tag_lower(lid)
                     ids.append(lid)
@@ -2458,7 +2542,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                         _px_mm["y"], half)
             co = np.empty(2 * xs.size)
             co[0::2], co[1::2] = xs, y
-            canvas.tag_lower(canvas.create_line(*co.tolist(), fill=C["curve"],
+            canvas.tag_lower(canvas.create_line(*co.tolist(),
+                                                fill=C["curve_idle"],
                                                 width=1, tags="sweep"))
 
     # ---- static chart layer ------------------------------------------------ #
@@ -2599,6 +2684,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _poll_record()
         _poll_marks()
         _poll_exports()
+        _poll_cal()
         if impedance_control is not None:
             _poll_impedance()
         _rate["n"] += got
@@ -2878,7 +2964,7 @@ class _RemoteFuture:
 
 
 def run_viewer_process(conn, contact=False, record=False, impedance=False,
-                       annotate=False, **viewer_kwargs):
+                       annotate=False, calibrate=False, **viewer_kwargs):
     """Entry point of the Scope's viewer process (multiprocessing, spawn).
 
     The Tk viewer runs in its own process so its drawing never holds the GIL
@@ -2921,7 +3007,7 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
                 state["leadoff"] = msg.get("leadoff")
                 state["record"] = msg.get("record") or state["record"]
             elif kind in ("record_result", "impedance_result",
-                          "annotate_result"):
+                          "annotate_result", "calibrate_result"):
                 fut = pending.pop(rest[0], None)
                 if fut is not None:
                     fut.set(rest[1])
@@ -2956,6 +3042,9 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
     if impedance:
         viewer_kwargs["impedance_control"] = {
             "run": lambda: request("impedance")}
+    if calibrate:
+        viewer_kwargs["calibrate_control"] = {
+            "set": lambda on: request("calibrate", on)}
     if annotate:
         viewer_kwargs["annotate_control"] = {
             "add": lambda text, unix_t, kind=None: request(
