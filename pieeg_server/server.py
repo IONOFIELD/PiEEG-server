@@ -579,6 +579,7 @@ class PiEEGServer:
             self._acq, out_dir=self._recordings_dir, session_name=session,
             num_channels=self._acq.num_channels,
             sample_rate=self._sample_rate(),
+            prefilter=getattr(self._acq, "prefilter", None),
             **journal_kwargs,
         )
         self._last_session = session

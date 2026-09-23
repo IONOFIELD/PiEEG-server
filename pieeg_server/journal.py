@@ -118,7 +118,7 @@ class JournalWriter:
 
     def __init__(self, acquisition, out_dir, session_name=None,
                  num_channels=None, sample_rate=250, channel_labels=None,
-                 gain=GAIN, vref_uv=VREF_UV):
+                 gain=GAIN, vref_uv=VREF_UV, prefilter=None):
         self._acq = acquisition
         # Large buffer: tolerate an occasional fsync stall without dropping.
         self._queue = acquisition.subscribe(maxsize=8192)
@@ -132,6 +132,10 @@ class JournalWriter:
         self._gain = int(gain)
         self._vref_uv = float(vref_uv)
         self._lsb_uv = physical_lsb_uv(self._gain, self._vref_uv)
+        # None = the chip's own output. With oversampling the samples are
+        # the decimation FIR's output, rounded to the nearest count (the
+        # 0.022 µV count is far below the noise), and this says so.
+        self._prefilter = prefilter
 
         if session_name is None:
             session_name = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
@@ -166,6 +170,7 @@ class JournalWriter:
             # THE authoritative count -> microvolt scale for EDF export.
             "lsb_uv": self._lsb_uv,
             "physical_dimension": "uV",
+            "prefilter": self._prefilter,
             "start_unix": self._start_time,
             "start_iso": (datetime.fromtimestamp(self._start_time, timezone.utc)
                           .astimezone().isoformat()) if self._start_time else None,

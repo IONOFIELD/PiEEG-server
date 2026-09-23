@@ -104,6 +104,31 @@ def bias_drive_wanted(num_channels: int) -> bool:
         return env not in ("0", "off", "no", "false")
     return num_channels == 8
 
+# Oversampling (see decimate.py): the chip runs at OUTPUT_RATE x k and the
+# acquisition loop decimates back to OUTPUT_RATE. CONFIG1 codes by k.
+OUTPUT_RATE = 250
+OVERSAMPLE_CONFIG1 = {1: 0x96, 2: 0x95, 4: 0x94}
+
+
+def oversample_factor(num_channels: int) -> int:
+    """k from PIEEG_OVERSAMPLE (1, 2 or 4). Unset: 4 on the 8-channel board
+    (bench-tested 2026-09-23), 1 on the daisy-chained boards, which read
+    in-thread and haven't been tested faster — and 1 whenever PIEEG_CONFIG1
+    picks the rate by hand."""
+    env = os.environ.get("PIEEG_OVERSAMPLE", "").strip()
+    if env:
+        k = int(env)
+    elif os.environ.get("PIEEG_CONFIG1", "").strip() or num_channels != 8:
+        k = 1
+    else:
+        k = 4
+    if k not in OVERSAMPLE_CONFIG1:
+        raise ValueError(f"PIEEG_OVERSAMPLE={env!r}: use 1, 2 or 4")
+    if k > 1 and num_channels != 8:
+        raise ValueError("PIEEG_OVERSAMPLE is for the 8-channel board only")
+    return k
+
+
 # STATUS word sync marker: every ADS1299 data frame begins with a 24-bit STATUS
 # word whose top 4 bits are fixed 1100. The remaining bits carry LOFF_STATP[7:0]
 # + LOFF_STATN[7:0] + GPIO[3:0], which now VARY once lead-off sensing is on — so
@@ -403,14 +428,33 @@ class PiEEGHardware:
         return self._pga_gain
 
     @property
+    def chip_rate(self) -> int | None:
+        """Conversion rate (SPS) programmed into CONFIG1 (None until
+        configured): the DRDY edge rate the acquisition loop times against."""
+        config1 = getattr(self, "_config1", None)
+        return None if config1 is None else config1_sample_rate(config1)
+
+    @property
+    def oversample(self) -> int:
+        """Chip samples per output sample (1 = no decimation)."""
+        return getattr(self, "_oversample", 1)
+
+    @property
+    def config1(self) -> int | None:
+        """The CONFIG1 value streaming runs with (restored after the
+        impedance check, which needs 250 SPS)."""
+        return getattr(self, "_config1", None)
+
+    @property
     def sample_rate(self) -> int | None:
-        """Sample rate (SPS) programmed into CONFIG1 (None until configured).
+        """Rate (SPS) of the samples the server hands on (None until
+        configured): the chip rate, or with oversampling the decimated rate.
 
         Consumers (server welcome, filters, journal, the Scope viewer) read
         this instead of assuming 250, so PIEEG_CONFIG1 changes stay consistent.
         """
-        config1 = getattr(self, "_config1", None)
-        return None if config1 is None else config1_sample_rate(config1)
+        rate = self.chip_rate
+        return None if rate is None else rate // self.oversample
 
     @property
     def spike_threshold(self) -> int:
@@ -915,10 +959,21 @@ class PiEEGHardware:
         # the board behaves exactly as it always has. The register API refuses
         # CONFIG1 writes on purpose, because changing the rate under a running
         # filter chain is silent and destructive, so it has to happen here.
-        config1 = int(os.environ.get("PIEEG_CONFIG1", "0x96"), 0)
-        logger.info("WREG CONFIG1 <- 0x%02X (sample rate)", config1)
+        #
+        # PIEEG_OVERSAMPLE=k instead runs the chip k times faster and the
+        # acquisition loop decimates to 250 SPS (sample_rate stays 250,
+        # chip_rate is the real conversion rate).
+        k = oversample_factor(self._num_channels)
+        if k > 1 and os.environ.get("PIEEG_CONFIG1", "").strip():
+            raise ValueError("set PIEEG_OVERSAMPLE or PIEEG_CONFIG1, not both")
+        config1 = int(os.environ.get("PIEEG_CONFIG1", "")
+                      or hex(OVERSAMPLE_CONFIG1[k]), 0)
+        logger.info("WREG CONFIG1 <- 0x%02X (chip %s SPS%s)", config1,
+                    config1_sample_rate(config1),
+                    f", decimated x{k} to {OUTPUT_RATE}" if k > 1 else "")
         self._write_register(chip_num, CONFIG1, config1)
         self._config1 = config1
+        self._oversample = k
         self._write_register(chip_num, CONFIG2, 0xD4)
         # Bias drive: all 8 P inputs and the shared reference (every N input
         # is tied to SRB1) feed the common-mode loop. An unconnected input

@@ -132,8 +132,9 @@ def _write_bdfplus(counts, meta, out_path):
                 "digital_min": _BDF_DIG_MIN,
                 "digital_max": _BDF_DIG_MAX,
                 "transducer": "",
-                # Truthful: the journal is the raw, unfiltered archive.
-                "prefilter": "raw, no filter",
+                # Truthful: the journal is the chip's raw output, or says
+                # which decimation filter made it (oversampling).
+                "prefilter": (meta.get("prefilter") or "raw, no filter")[:80],
             })
         # pyedflib warns that phys_min/max (~ +/-2.25e6) don't fit the header's
         # 8-char field and get rounded to whole microvolts. That is EXPECTED and
@@ -196,7 +197,7 @@ def _write_edfplus(counts, meta, out_path):
                 "digital_min": _EDF_DIG_MIN,
                 "digital_max": _EDF_DIG_MAX,
                 "transducer": "",
-                "prefilter": "",
+                "prefilter": (meta.get("prefilter") or "")[:80],
             })
         writer.setSignalHeaders(channel_info)
         # writeSamples wants one array per channel (physical uV values).

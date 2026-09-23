@@ -127,3 +127,27 @@ def test_unknown_format_rejected(tmp_path):
 def test_builtin_selftest_passes():
     """The module's own bit-exact self-test returns True."""
     assert edf_export.roundtrip_check(verbose=False) is True
+
+
+def test_prefilter_from_sidecar_reaches_the_bdf_header(tmp_path):
+    """An oversampled recording says which decimation filter made it; a
+    plain one still says raw."""
+    counts = np.zeros((500, 2), dtype=JOURNAL_DTYPE)
+    jrnl = _make_journal(tmp_path, counts)
+    out = edf_export.export_journal(jrnl, fmt="bdf")
+    r = pyedflib.EdfReader(str(out))
+    try:
+        assert r.getPrefilter(0) == "raw, no filter"
+    finally:
+        r.close()
+    side = tmp_path / "sess.json"
+    meta = json.loads(side.read_text())
+    meta["prefilter"] = "AA FIR flat 0-100Hz, -100dB>=150Hz (1000->250 SPS)"
+    side.write_text(json.dumps(meta))
+    out.unlink()
+    out = edf_export.export_journal(jrnl, fmt="bdf")
+    r = pyedflib.EdfReader(str(out))
+    try:
+        assert r.getPrefilter(1) == meta["prefilter"]
+    finally:
+        r.close()
