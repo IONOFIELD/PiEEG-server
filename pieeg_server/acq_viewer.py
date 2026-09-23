@@ -355,6 +355,12 @@ class ViewerModel:
         self.raw = np.zeros((self.win, num_channels), dtype=np.float64)
         self.filt = np.zeros((self.win, num_channels), dtype=np.float64)
         self.filled = 0
+        self.total = 0              # samples pushed since start (sweep clock)
+        self.cutoffs = (None, None, None)   # (lff, hff, notch) Hz in use
+        # Display hold for the measure box: a copy of the window taken when
+        # the operator presses on the chart. Acquisition keeps going into
+        # raw/filt underneath; only the drawing and measuring use the copy.
+        self.frozen = None
         self.filter = StreamingFilter(num_channels, fs)
         self.contact = ContactTracker(num_channels)
         # Per-montage working copies (session edits live here; presets never
@@ -522,18 +528,43 @@ class ViewerModel:
 
     # ---- data handling ---------------------------------------------------- #
     def set_filters(self, lff, hff, notch=None):
+        self.cutoffs = (lff, hff, notch)
         self.filter.set_cutoffs(lff, hff, notch)
         # Re-run the whole visible raw window so the filtered view is coherent.
-        if self.filled:
-            self.filt[:] = 0.0
-            valid = self.raw[self.win - self.filled:]
-            self.filt[self.win - self.filled:] = self.filter.process(valid)
+        self.filt = self._refilter(self.raw, self.filled, self.filter)
+        if self.frozen is not None:
+            f = StreamingFilter(self.nch, self.fs)
+            f.set_cutoffs(lff, hff, notch)
+            self.frozen["filt"] = self._refilter(self.frozen["raw"],
+                                                 self.frozen["filled"], f)
+
+    def _refilter(self, raw, filled, filt):
+        out = np.zeros_like(raw)
+        if filled:
+            out[self.win - filled:] = filt.process(raw[self.win - filled:])
+        return out
+
+    def freeze(self):
+        """Hold the display on the current window (see self.frozen)."""
+        self.frozen = {"raw": self.raw.copy(), "filt": self.filt.copy(),
+                       "head": self.sweep_head(), "filled": self.filled}
+
+    def unfreeze(self):
+        self.frozen = None
+
+    def view(self):
+        """(filtered window, sweep head, filled) the display should draw."""
+        v = self.frozen
+        if v is not None:
+            return v["filt"], v["head"], v["filled"]
+        return self.filt, self.sweep_head(), self.filled
 
     def push(self, samples: np.ndarray):
         """Append new raw samples (M x nch) and filter them incrementally."""
         m = samples.shape[0]
         if m == 0:
             return
+        self.total += m
         if m >= self.win:
             samples = samples[-self.win:]
             m = self.win
@@ -544,16 +575,99 @@ class ViewerModel:
         self.filt[-m:] = f
         self.filled = min(self.win, self.filled + m)
 
+    def sweep_head(self):
+        """Sweep position (0..win-1) the next sample will be written to."""
+        return self.total % self.win
+
     def montage_inputs(self):
         """1-based chip inputs of the electrodes in the visible rows."""
         return sorted({self.site_index[site] + 1 for r in self.rows()
                        if r["on"] for site in r["pair"]
                        if site in self.site_index})
 
-    def derivation(self, pair):
+    def derivation(self, pair, filt=None):
         """Filtered (upper - lower) trace across the window, in microvolts."""
         a, b = pair
-        return self.filt[:, self.site_index[a]] - self.filt[:, self.site_index[b]]
+        f = self.filt if filt is None else filt
+        return f[:, self.site_index[a]] - f[:, self.site_index[b]]
+
+    def measure(self, pair, frac0, frac1):
+        """Measure the displayed trace between two sweep-screen fractions
+        (0 = left edge, 1 = right edge). Returns None when nothing measurable
+        is there, else {"max","min","pp" (µV), "hz", "seconds"}."""
+        filt, head, filled = self.view()
+        lo, hi = sorted((frac0, frac1))
+        p0 = int(np.floor(max(0.0, lo) * self.win))
+        p1 = int(np.ceil(min(1.0, hi) * self.win))
+        if p1 - p0 < 2:
+            return None
+        # sweep position p holds rolling index (p - head) % win; keep only
+        # filled samples, and if the box straddles the sweep gap (newest next
+        # to oldest) keep the longer side so the samples are contiguous.
+        idx = (np.arange(p0, p1) - head) % self.win
+        idx = idx[idx >= self.win - filled]
+        if idx.size < 2:
+            return None
+        breaks = np.flatnonzero(np.diff(idx) != 1) + 1
+        idx = max(np.split(idx, breaks), key=len)
+        x = self.derivation(pair, filt)[idx]
+        return {"max": float(x.max()), "min": float(x.min()),
+                "pp": float(x.max() - x.min()),
+                "hz": dominant_hz(x, self.fs, self.cutoffs[0], self.cutoffs[1]),
+                "seconds": idx.size / self.fs}
+
+
+def dominant_hz(x, fs, lff=None, hff=None):
+    """Frequency (Hz) of the largest spectral peak of `x` inside the display
+    passband, or None if the span is under 0.25 s. Hann window, zero-padded
+    FFT, parabolic interpolation around the peak bin."""
+    n = len(x)
+    if n < 0.25 * fs:
+        return None
+    nfft = max(8192, 1 << (n - 1).bit_length())
+    spec = np.abs(np.fft.rfft((x - x.mean()) * np.hanning(n), nfft))
+    f = np.fft.rfftfreq(nfft, 1.0 / fs)
+    band = (f >= max(lff or 0.0, 0.5)) & (f <= min(hff or fs / 2, fs / 2))
+    if not band.any():
+        return None
+    k = int(np.flatnonzero(band)[np.argmax(spec[band])])
+    if 0 < k < len(spec) - 1:
+        a, b, c = spec[k - 1], spec[k], spec[k + 1]
+        d = a - 2 * b + c
+        if d != 0:
+            return float(f[k] + 0.5 * (a - c) / d * (f[1] - f[0]))
+    return float(f[k])
+
+
+def sweep_envelope(trace, head, ncol):
+    """Sweep-display a rolling window as `ncol` fixed pixel columns.
+
+    `trace` is the rolling window (oldest first, newest last) and `head` the
+    sweep position the next sample goes to, so trace[i] sits at sweep
+    position (head + i) % len. Each column always covers the same sweep
+    positions, so once a sample is drawn it never moves or changes shape
+    (point-picking a scrolling window re-samples every column each frame).
+    Returns (vals, cursor_col): vals is (2*ncol,) — every column's min and
+    max, in the order they occurred in time — and cursor_col the column the
+    sweep is writing into."""
+    win = trace.shape[0]
+    sweep = np.roll(trace, head)
+    ncol = max(1, min(int(ncol), win))
+    starts = (np.arange(ncol) * win) // ncol
+    lo = np.minimum.reduceat(sweep, starts)
+    hi = np.maximum.reduceat(sweep, starts)
+    # first index of the min / max inside each column
+    col = np.repeat(np.arange(ncol), np.diff(np.append(starts, win)))
+    idx = np.arange(win)
+    big = win + 1
+    i_lo = np.minimum.reduceat(np.where(sweep == lo[col], idx, big), starts)
+    i_hi = np.minimum.reduceat(np.where(sweep == hi[col], idx, big), starts)
+    lo_first = i_lo <= i_hi
+    vals = np.empty(2 * ncol)
+    vals[0::2] = np.where(lo_first, lo, hi)
+    vals[1::2] = np.where(lo_first, hi, lo)
+    cursor_col = int(np.searchsorted(starts, head % win, side="right") - 1)
+    return vals, cursor_col
 
 
 def _compact_ohms(ohms):
@@ -1169,7 +1283,100 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if box and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]:
             _imp["panel_until"] = 0.0
 
-    canvas.bind("<Button-1>", _close_impedance_panel)
+    # ---- measure box: press and drag across a trace ----------------------- #
+    # Pressing on the chart holds the display (acquisition, the stream and
+    # recording carry on); the dragged box reports each overlapped row's
+    # peak µV and dominant Hz over its time span. A tap (no drag) clears the
+    # box and resumes the sweep.
+    _meas = {"start": None, "box": None, "rows": []}
+    _TAP_PX = 6
+
+    def _meas_rows(y0, y1):
+        rows = [r for r in model.rows() if r["on"]]
+        H = canvas.winfo_height()
+        if not rows or H <= 2:
+            return []
+        row_h = H / len(rows)
+        lo, hi = sorted((y0, y1))
+        # rows whose centre line the box covers; a box drawn inside one row
+        # (not reaching its centre) measures the row it sits in
+        hit = [r["pair"] for k, r in enumerate(rows)
+               if lo <= (k + 0.5) * row_h <= hi]
+        if not hit:
+            k = min(len(rows) - 1, max(0, int((lo + hi) / 2 // row_h)))
+            hit = [rows[k]["pair"]]
+        return hit
+
+    def _meas_press(evt):
+        box = _imp["panel_box"]
+        if (_imp["panel_until"] > time.monotonic() and box
+                and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]):
+            _close_impedance_panel(evt)
+            return
+        _meas["start"] = (evt.x, evt.y)
+        if model.frozen is None:
+            model.freeze()
+
+    def _meas_drag(evt):
+        if _meas["start"] is None:
+            return
+        x0, y0 = _meas["start"]
+        if abs(evt.x - x0) >= _TAP_PX or abs(evt.y - y0) >= _TAP_PX:
+            _meas["box"] = (x0, y0, evt.x, evt.y)
+            _meas["rows"] = _meas_rows(y0, evt.y)
+
+    def _meas_release(evt):
+        if _meas["start"] is None:
+            return
+        x0, y0 = _meas["start"]
+        _meas["start"] = None
+        if abs(evt.x - x0) < _TAP_PX and abs(evt.y - y0) < _TAP_PX:
+            _meas["box"], _meas["rows"] = None, []      # tap: resume
+            model.unfreeze()
+        else:
+            _meas_drag(evt)
+
+    canvas.bind("<ButtonPress-1>", _meas_press)
+    canvas.bind("<B1-Motion>", _meas_drag)
+    canvas.bind("<ButtonRelease-1>", _meas_release)
+
+    def _draw_measure(W, H):
+        if _meas["box"] is None:
+            if model.frozen is not None:        # pressed, not yet dragged
+                canvas.create_text(W / 2, H - 10, anchor="s",
+                                   text="HOLD · drag a box · tap to resume",
+                                   fill=C["yellow"], font=(_MONO, _fs(9)),
+                                   tags="trace")
+            return
+        x0, y0, x1, y1 = _meas["box"]
+        canvas.create_rectangle(x0, y0, x1, y1, outline=C["yellow"],
+                                dash=(4, 3), width=1, tags="trace")
+        lines = []
+        for pair in _meas["rows"]:
+            m = model.measure(pair, x0 / W, x1 / W)
+            if m is None:
+                continue
+            hz = "— Hz" if m["hz"] is None else f"{m['hz']:.1f} Hz"
+            lines.append(f"{model.epair_name(pair):<6} "
+                         f"{m['pp']:6.1f} µVpp  "
+                         f"{m['max']:+6.1f}/{m['min']:+6.1f}  "
+                         f"{hz:>8}  {m['seconds']:.2f} s")
+        lines.append("tap to resume")
+        # readout above the box, or below it if there is no room
+        top = min(y0, y1)
+        ytxt = top - 6 if top > 16 * len(lines) + 12 else max(y0, y1) + 6
+        anchor = "sw" if ytxt < top else "nw"
+        tid = canvas.create_text(max(4, min(x0, x1)), ytxt, anchor=anchor,
+                                 text="\n".join(lines), fill=C["text"],
+                                 font=(_MONO, _fs(9)), tags="trace")
+        bx0, by0, bx1, by1 = canvas.bbox(tid)
+        if bx1 > W - 4:                          # keep it on screen
+            canvas.move(tid, W - 4 - bx1, 0)
+            bx0, by0, bx1, by1 = canvas.bbox(tid)
+        bg = canvas.create_rectangle(bx0 - 6, by0 - 4, bx1 + 6, by1 + 4,
+                                     fill=C["surface"], outline=C["border_hi"],
+                                     tags="trace")
+        canvas.tag_lower(bg, tid)
 
     def _row_at_y(y):
         """The visible row under a canvas y-coordinate, or None."""
@@ -1319,19 +1526,24 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             # parallel to the trace at the left, with the EEG passing through it.
             box_w = 2.0 * half
             box_x = 2.0
-            # x for one screen column per pixel (decimate the 10 s window to W)
-            win = model.win
-            idx = np.linspace(0, win - 1, num=min(W, win)).astype(int)
-            xs = idx / (win - 1) * W
+            # Sweep display: one fixed pixel column per slice of the 10 s
+            # window (min + max of its samples); the sweep overwrites the
+            # oldest data just ahead of a small erase gap.
+            ncol = max(1, min(W, model.win))
+            vfilt, head, _ = model.view()
+            xs = np.repeat((np.arange(ncol) + 0.5) * W / ncol, 2)
+            gap = max(2, ncol // 100)           # erase gap, ~0.1 s
             for k, r in enumerate(rows):
                 base = k * row_h + row_h / 2.0
                 top, bot = base - half, base + half
-                trace = model.derivation(r["pair"])[idx]
-                dy = np.clip(trace / sens * PX_PER_MM, -half, half)
+                vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
+                                           head, ncol)
+                dy = np.clip(vals / sens * PX_PER_MM, -half, half)
                 ys = base - dy
-                coords = np.empty(xs.size * 2)
-                coords[0::2] = xs
-                coords[1::2] = ys
+                # the written part left of the sweep, and the older part
+                # right of the erase gap
+                segments = [(0, 2 * (cur + 1)),
+                            (2 * min(ncol, cur + 1 + gap), 2 * ncol)]
                 # 1) row separator (hairline grid)
                 canvas.create_line(0, k * row_h, W, k * row_h,
                                    fill=C["grid"], tags="trace")
@@ -1344,8 +1556,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                         outline=C["border_hi"], width=1,
                                         tags="trace")
                 # 4) the EEG trace, drawn on top so it runs THROUGH the box
-                canvas.create_line(*coords.tolist(), fill=C["curve"],
-                                   width=1, tags="trace")
+                for a, b in segments:
+                    if b - a >= 4:
+                        coords = np.empty((b - a) * 2)
+                        coords[0::2] = xs[a:b]
+                        coords[1::2] = ys[a:b]
+                        canvas.create_line(*coords.tolist(), fill=C["curve"],
+                                           width=1, tags="trace")
                 # 5) lead labels centred where the trace crosses, on a small
                 #    chip so they stay readable: the CHIP-INPUT pair (E1-E3) on
                 #    top — which physical electrode to reseat — and the scalp
@@ -1397,6 +1614,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                          fill=C["surface"],
                                          outline=C["border_hi"], tags="trace")
             canvas.tag_lower(bg, tid)
+        if W > 2 and H > 2:
+            _draw_measure(W, H)
         if impedance_control is not None and W > 2 and H > 2:
             _draw_impedance(W, H)
         pct = int(100 * model.filled / model.win)

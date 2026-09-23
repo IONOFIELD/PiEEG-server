@@ -198,6 +198,13 @@ SCOPE_CHANGELOG = [
             "input path is taken off an electrode correctly even though an "
             "electrode behaves partly like a capacitor; sizes alone read "
             "about 10% low on a 10 kΩ electrode."),
+    ("3.2", "Traces sweep instead of scrolling: data stays where it was drawn "
+            "and a small gap marks where the sweep is writing. Each pixel "
+            "column shows the full min–max of its samples, so a waveform no "
+            "longer shimmers or changes shape after it is drawn. Press and "
+            "drag a box on the chart to hold the display and read each "
+            "boxed channel's peak-to-peak and max/min µV, dominant Hz and "
+            "span; tap to resume."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
