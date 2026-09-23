@@ -36,23 +36,63 @@ class BandpassFilter:
         return y.tolist()
 
 
+class _SosBank:
+    """One SOS filter run on N channels, state shared by both paths.
+
+    apply_sample() is the per-frame hot path of the server's broadcast loop.
+    Calling scipy's sosfilt per channel per sample spent nearly all its time
+    on argument handling (at 1000 SPS it took ~2/3 of a core and starved the
+    server). A single sample is a handful of multiply-adds per section, so it
+    runs as a plain-Python direct-form-II-transposed update (~24 µs for a
+    5th-order bandpass on 8 channels on a Pi 4, vs ~1.9 ms). apply_block()
+    runs sosfilt on the whole block; both use the same state, so they can be
+    mixed and still equal batch filtering.
+    """
+
+    def __init__(self, sos, num_channels: int):
+        self._sos = np.asarray(sos, dtype=np.float64)
+        self._coef = [(b0, b1, b2, a1, a2)
+                      for b0, b1, b2, _a0, a1, a2 in self._sos.tolist()]
+        self._n = num_channels
+        # z[section][channel] = [z0, z1]
+        self._z = [[[0.0, 0.0] for _ in range(num_channels)]
+                   for _ in self._coef]
+
+    def apply_sample(self, channels) -> list[float]:
+        out = [float(v) for v in channels[:self._n]]  # zip() semantics, as before
+        for (b0, b1, b2, a1, a2), zs in zip(self._coef, self._z):
+            for i, x in enumerate(out):
+                z = zs[i]
+                y = b0 * x + z[0]
+                z[0] = b1 * x - a1 * y + z[1]
+                z[1] = b2 * x - a2 * y
+                out[i] = y
+        return out
+
+    def apply_block(self, block) -> list[list[float]]:
+        if not block:
+            return []
+        x = np.asarray(block, dtype=np.float64)
+        # sosfilt's zi layout for (samples x channels), axis=0: (sections, 2, ch)
+        zi = np.array(self._z).transpose(0, 2, 1)
+        y, zf = signal.sosfilt(self._sos, x, axis=0, zi=zi)
+        self._z = zf.transpose(0, 2, 1).tolist()
+        return y.tolist()
+
+
 class MultichannelFilter:
-    """Manages independent bandpass filters for N channels."""
+    """Bandpass filters for N channels (independent state per channel)."""
 
     def __init__(self, num_channels: int = 16,
                  lowcut: float = 1.0, highcut: float = 40.0,
                  fs: float = 250.0):
-        self._filters = [
-            BandpassFilter(lowcut, highcut, fs)
-            for _ in range(num_channels)
-        ]
+        sos = signal.butter(5, [lowcut, highcut], btype="band", fs=fs,
+                            output="sos")
+        self._bank = _SosBank(sos, num_channels)
 
     def apply_sample(self, channels: list[float]) -> list[float]:
-        """Filter a single multi-channel sample (wraps each in a 1-element list)."""
-        return [
-            f.apply([ch])[0]
-            for f, ch in zip(self._filters, channels)
-        ]
+        """Filter a single multi-channel sample."""
+        return self._bank.apply_sample(channels)
 
     def apply_block(self, block: list[list[float]]) -> list[list[float]]:
         """
@@ -61,26 +101,7 @@ class MultichannelFilter:
         block: list of N-channel samples (each sample is a list of floats)
         Returns: filtered block in the same shape.
         """
-        if not block:
-            return []
-
-        num_channels = len(block[0])
-        # Transpose: channel-major
-        by_channel = [
-            [sample[ch] for sample in block]
-            for ch in range(num_channels)
-        ]
-
-        filtered_by_channel = [
-            f.apply(ch_data)
-            for f, ch_data in zip(self._filters, by_channel)
-        ]
-
-        # Transpose back: sample-major
-        return [
-            [filtered_by_channel[ch][i] for ch in range(num_channels)]
-            for i in range(len(block))
-        ]
+        return self._bank.apply_block(block)
 
 
 # ── Native accelerator swap ─────────────────────────────────────────
@@ -128,27 +149,23 @@ class NotchFilter:
 
 
 class MultichannelNotchFilter:
-    """Manages independent notch filters for N channels."""
+    """Notch filters for N channels (independent state per channel)."""
 
     def __init__(self, num_channels: int = 16,
                  freq: float = 60.0, q: float = 30.0, fs: float = 250.0):
         self.freq = freq
         self.q = q
-        self._filters = [
-            NotchFilter(freq, q, fs)
-            for _ in range(num_channels)
-        ]
+        b, a = signal.iirnotch(freq, q, fs=fs)
+        self._bank = _SosBank(signal.tf2sos(b, a), num_channels)
+        self._n = num_channels
 
     def apply_sample(self, channels: list[float]) -> list[float]:
         """Filter a single multi-channel sample."""
-        if len(channels) != len(self._filters):
+        if len(channels) != self._n:
             raise ValueError(
-                f"Expected {len(self._filters)} channels, got {len(channels)}"
+                f"Expected {self._n} channels, got {len(channels)}"
             )
-        return [
-            f.apply([ch])[0]
-            for f, ch in zip(self._filters, channels)
-        ]
+        return self._bank.apply_sample(channels)
 
     def apply_block(self, block: list[list[float]]) -> list[list[float]]:
         """
@@ -159,22 +176,8 @@ class MultichannelNotchFilter:
         """
         if not block:
             return []
-
-        num_channels = len(block[0])
-        if num_channels != len(self._filters):
+        if len(block[0]) != self._n:
             raise ValueError(
-                f"Expected {len(self._filters)} channels, got {num_channels}"
+                f"Expected {self._n} channels, got {len(block[0])}"
             )
-        by_channel = [
-            [sample[ch] for sample in block]
-            for ch in range(num_channels)
-        ]
-        filtered_by_channel = [
-            f.apply(ch_data)
-            for f, ch_data in zip(self._filters, by_channel)
-        ]
-        return [
-            [filtered_by_channel[ch][i] for ch in range(num_channels)]
-            for i in range(len(block))
-        ]
-
+        return self._bank.apply_block(block)

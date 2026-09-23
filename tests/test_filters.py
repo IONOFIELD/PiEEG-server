@@ -12,6 +12,7 @@ Validates:
 import math
 import statistics
 
+import numpy as np
 import pytest
 
 # These tests validate the pure-Python reference implementation. The native
@@ -368,3 +369,29 @@ class TestMultichannelNotchFilter:
             mf.apply_block([[0.0] * 6])
         with pytest.raises(ValueError):
             mf.apply_block([[0.0] * 2])
+
+
+class TestPerSampleFastPath:
+    """apply_sample (per frame) must equal scipy filtering of the whole block."""
+
+    def test_bandpass_samples_match_batch(self):
+        from scipy import signal
+        rng = np.random.default_rng(3)
+        x = rng.normal(0, 50, (2000, 8))
+        mf = MultichannelFilter(num_channels=8, lowcut=1.0, highcut=40.0,
+                                fs=SAMPLE_RATE)
+        got = np.array([mf.apply_sample(list(row)) for row in x])
+        sos = signal.butter(5, [1.0, 40.0], btype="band", fs=SAMPLE_RATE,
+                            output="sos")
+        want = signal.sosfilt(sos, x, axis=0)
+        assert np.allclose(got, want, atol=1e-9)
+
+    def test_sample_and_block_share_state(self):
+        rng = np.random.default_rng(4)
+        x = rng.normal(0, 50, (600, 4))
+        a = MultichannelNotchFilter(num_channels=4, freq=60.0, fs=SAMPLE_RATE)
+        b = MultichannelNotchFilter(num_channels=4, freq=60.0, fs=SAMPLE_RATE)
+        whole = np.array(a.apply_block(x.tolist()))
+        mixed = [b.apply_sample(list(r)) for r in x[:300]]
+        mixed += b.apply_block(x[300:].tolist())
+        assert np.allclose(whole, np.array(mixed), atol=1e-9)
