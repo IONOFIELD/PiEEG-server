@@ -1294,7 +1294,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             sx = _rev["info"]
             when = (sx["start"].strftime("%m-%d %H:%M") if sx["start"]
                     else sx["session"])
-            mode_lbl.configure(text=f"REVIEW {when}", fg=C["accent_lt"])
+            nick = sx.get("nickname") or ""
+            if len(nick) > 30:
+                nick = nick[:29] + "…"
+            mode_lbl.configure(text=f"REVIEW {when}" + (f" · {nick}" if nick
+                                                         else ""),
+                               fg=C["accent_lt"])
             live_box.configure(highlightbackground=C["border_hi"],
                                highlightcolor=C["border_hi"], bg=C["raised"])
             live_lbl.configure(bg=C["raised"], fg=C["text"])
@@ -2096,10 +2101,26 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _files_panel():
         win, body = _popup("Recordings")
-        sessions = []
+        sessions = []                       # every session on the drive
+        shown = []                          # the ones the Find text matches
+
+        def entry(parent, var, width):
+            return tk.Entry(parent, textvariable=var, width=width,
+                            bg=C["surface"], fg=C["text"],
+                            insertbackground=C["text"], relief="flat",
+                            font=(_MONO, _fs(10)))
+
+        # Find: filters by name, date or session id as you type
+        frow = tk.Frame(body, bg=C["raised"])
+        frow.pack(fill="x", pady=(4, 0))
+        tk.Label(frow, text="Find", bg=C["raised"], fg=C["text_sec"],
+                 font=(_MONO, _fs(9))).pack(side="left", padx=(0, 4))
+        find_var = tk.StringVar()
+        find_ent = entry(frow, find_var, 20)
+        find_ent.pack(side="left", fill="x", expand=True)
         box = tk.Frame(body, bg=C["raised"])
         box.pack(fill="both", expand=True, pady=(4, 4))
-        lb = tk.Listbox(box, width=44, height=7, bg=C["surface"],
+        lb = tk.Listbox(box, width=58, height=6, bg=C["surface"],
                         fg=C["text"], selectbackground=C["accent"],
                         selectforeground="#ffffff", highlightthickness=0,
                         relief="flat", activestyle="none",
@@ -2115,6 +2136,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                         bg=C["raised"], fg=C["text_sec"], wraplength=400,
                         font=(_MONO, _fs(9)))
         info.pack(fill="x")
+        # Name: the selected recording's name (a label; files keep theirs)
+        nrow = tk.Frame(body, bg=C["raised"])
+        nrow.pack(fill="x", pady=(4, 0))
+        tk.Label(nrow, text="Name", bg=C["raised"], fg=C["text_sec"],
+                 font=(_MONO, _fs(9))).pack(side="left", padx=(0, 4))
+        name_var = tk.StringVar()
+        name_ent = entry(nrow, name_var, 30)
+        name_ent.pack(side="left", fill="x", expand=True)
+        ttk.Button(nrow, text="Save name", width=10,
+                   command=lambda: save_name()).pack(side="left", padx=(4, 0))
         btns = tk.Frame(body, bg=C["raised"])
         btns.pack(fill="x", pady=(4, 0))
         del_btn = ttk.Button(btns, text="Delete", width=18)
@@ -2123,28 +2154,49 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                    command=lambda: open_sel()).pack(side="right")
         armed = {"session": None, "after": None}
 
-        def fill():
+        def when_of(sx):
+            return (sx["start"].strftime("%m-%d %H:%M") if sx["start"]
+                    else sx["session"])
+
+        def fill(keep=None):
             sessions[:] = review_store.list_sessions(recordings_dir)
+            show(keep)
+
+        def show(keep=None):
+            """List the sessions the Find text matches; reselect `keep`."""
             active = _active_session()
+            words = find_var.get().lower().split()
+            shown[:] = [sx for sx in sessions
+                        if all(w in f"{sx['nickname']} {when_of(sx)} "
+                                    f"{sx['session']}".lower()
+                               for w in words)]
             lb.delete(0, "end")
-            for sx in sessions:
-                when = (sx["start"].strftime("%m-%d %H:%M:%S") if sx["start"]
-                        else sx["session"])
+            for sx in shown:
                 n = sx["notes"]
-                tag = ("  ● REC" if sx["session"] == active
-                       else f"  {n} note{'' if n == 1 else 's'}")
-                lb.insert("end", f"{when}  {_mmss(sx['seconds']):>7}{tag}")
+                tag = ("● REC" if sx["session"] == active
+                       else f"{n:>2} note{' ' if n == 1 else 's'}")
+                lb.insert("end", f"{when_of(sx)} {_mmss(sx['seconds']):>7} "
+                                 f"{tag}  {sx['nickname']}")
             if not sessions:
                 info.configure(text=f"no recordings in {recordings_dir}",
+                               fg=C["text_sec"])
+            elif words:
+                info.configure(text=f"{len(shown)} of {len(sessions)} match",
                                fg=C["text_sec"])
             else:
                 info.configure(text=f"{len(sessions)} in {recordings_dir}",
                                fg=C["text_sec"])
+            idx = next((i for i, sx in enumerate(shown)
+                        if sx["session"] == keep), 0 if shown else None)
+            if idx is not None:
+                lb.selection_set(idx)
+                lb.see(idx)
+            name_var.set(shown[idx]["nickname"] if idx is not None else "")
             disarm()
 
         def selected():
             cur = lb.curselection()
-            return sessions[cur[0]] if cur else None
+            return shown[cur[0]] if cur else None
 
         def on_select(_e=None):
             sx = selected()
@@ -2153,7 +2205,25 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                     text=f"{sx['session']} · {sx['bytes'] / 1e6:.1f} MB · "
                          f"{sx['nch']} ch {sx['fs']:.0f} SPS",
                     fg=C["text_sec"])
+                name_var.set(sx["nickname"])
             disarm()
+
+        def save_name():
+            sx = selected()
+            if sx is None:
+                return
+            try:
+                name = review_store.set_nickname(sx["journal"],
+                                                 name_var.get())
+            except Exception as e:          # noqa: BLE001 - report, don't crash
+                info.configure(text=f"not named: {e}", fg=C["red"])
+                return
+            if _rev["on"] and _rev["info"]["journal"] == sx["journal"]:
+                _rev["info"]["nickname"] = name
+                _mode_face()
+            fill(keep=sx["session"])
+            info.configure(text=f"named {name!r}" if name
+                           else "name removed", fg=C["green"])
 
         def disarm():
             if armed["after"] is not None:
@@ -2210,9 +2280,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         del_btn.configure(command=delete_sel)
         lb.bind("<<ListboxSelect>>", on_select)
         lb.bind("<Double-Button-1>", lambda e: open_sel())
+        find_var.trace_add("write", lambda *a: show())
+        name_ent.bind("<Return>", lambda e: save_name())
+        find_ent.bind("<Return>", lambda e: open_sel())
         fill()
-        if sessions:
-            lb.selection_set(0)
+        if shown:
             on_select()
         # centred over the chart
         win.update_idletasks()

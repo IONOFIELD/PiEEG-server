@@ -123,3 +123,26 @@ def test_cal_breaks_find_the_jump_before_each_cal_note():
              {"frame": 1000, "type": "EC", "text": "Eyes closed"}]
     assert review.cal_breaks(uv, notes, fs) == [400, 2000]
     assert review.cal_breaks(uv, notes[2:], fs) == []
+
+
+def test_nickname_is_kept_in_the_summary_and_survives_a_rebuild(tmp_path):
+    j = _session(tmp_path, "s1")
+    assert review.get_nickname(j) == ""
+    # before the Stop export: a stub summary holds it
+    assert review.set_nickname(j, "  EO/EC   baseline ") == "EO/EC baseline"
+    assert review.list_sessions(tmp_path)[0]["nickname"] == "EO/EC baseline"
+    review.rebuild_exports(j)
+    summary = json.loads((tmp_path / "s1" / "s1.json").read_text())
+    assert summary["nickname"] == "EO/EC baseline"
+    assert summary["channels"]                       # the full summary
+    assert review.set_nickname(j, "x" * 80) == "x" * review.NICKNAME_MAX
+    review.set_nickname(j, "")
+    assert review.get_nickname(j) == ""
+    assert "nickname" not in json.loads((tmp_path / "s1" / "s1.json").read_text())
+
+
+def test_flat_sessions_cannot_be_named(tmp_path):
+    j = _session(tmp_path, "old", flat=True)
+    assert review.get_nickname(j) == ""
+    with pytest.raises(ValueError):
+        review.set_nickname(j, "x")

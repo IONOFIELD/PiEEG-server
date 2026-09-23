@@ -72,6 +72,7 @@ def list_sessions(recordings_dir):
                 pass
         out.append({
             "session": session, "journal": journal, "folder": folder,
+            "nickname": get_nickname(journal),
             "flat": flat, "start": start, "samples": samples, "fs": fs,
             "nch": nch, "seconds": samples / fs if fs else 0.0,
             "notes": len(edf_export.read_annotations(journal)),
@@ -89,6 +90,54 @@ def session_files(journal):
     if not flat:
         return [p for p in folder.rglob("*")]
     return [p for p in folder.glob(f"{session}.*")]
+
+
+NICKNAME_MAX = 40
+
+
+def _summary_path(journal):
+    """<session>/<session>.json, the recording's summary (folder layout)."""
+    session, folder, raw, flat = _session_of(journal)
+    return None if flat else folder / f"{session}.json"
+
+
+def get_nickname(journal):
+    """The name the operator gave the recording, or "" (none)."""
+    path = _summary_path(journal)
+    try:
+        return str(json.loads(path.read_text()).get("nickname") or "")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+
+
+def set_nickname(journal, name):
+    """Name a recording (a label only: its session id, folder and files keep
+    their names). Kept in its summary JSON, which a rebuild preserves; if
+    the summary isn't written yet (still recording) a stub holds it until
+    the Stop export fills it in. "" removes the name. Returns the name."""
+    path = _summary_path(journal)
+    if path is None:
+        raise ValueError("recordings from before the one-folder layout "
+                         "can't be named")
+    name = " ".join(str(name).split())[:NICKNAME_MAX]
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            raise ValueError
+    except (OSError, ValueError):
+        data = {"format": "pieeg-recording-v1", "session": path.stem}
+    if name:
+        data["nickname"] = name
+    else:
+        data.pop("nickname", None)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    logger.info("Recording %s named %r", path.stem, name)
+    return name
 
 
 def load(journal):
