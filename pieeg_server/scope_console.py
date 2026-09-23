@@ -210,6 +210,12 @@ SCOPE_CHANGELOG = [
             "uses real millimetres too (it assumed 4 px/mm, so traces were "
             "drawn ~28% small). HFF is 4th order, and Notch defaults to "
             "60 Hz."),
+    ("3.4", "Checked against the chip's own test signal: amplitude and time "
+            "on the panel match the raw data to the pixel. Filters no longer "
+            "ring at start-up or after a filter change when an electrode has "
+            "a DC offset. The sweep head always shows the same small gap. The "
+            "sps readout averages over 10 s, so it no longer jumps between "
+            "248 and 263."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

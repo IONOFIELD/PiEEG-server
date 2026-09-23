@@ -121,6 +121,7 @@ TIMEBASE_CHOICES = [10, 15, 20, 30, 60]
 DEFAULT_TIMEBASE = 30
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
 SWEEP_CHUNK = 8           # trace columns per persistent canvas line
+RATE_WINDOW_S = 10.0      # the "sps" readout counts frames over this long
 # Preferred window size. Smaller screens (the Pi's 7" 800x480 DSI panel) get
 # the window maximised to fit instead.
 WINDOW_W, WINDOW_H = 1000, 640
@@ -228,16 +229,20 @@ class StreamingFilter:
         if chunk.size == 0:
             return chunk
         out = chunk
-        # Prime the delay lines to the first sample so the trace doesn't slam
-        # from zero to the signal level on the first chunk.
+        # Prime each stage's delay line to the steady level of ITS input, as
+        # if the first sample had always been there, so an electrode's DC
+        # offset doesn't ring on the first chunk. The high-pass passes no DC,
+        # so the stages after it start from zero; the low-pass and notch pass
+        # DC unchanged.
         if not self._primed:
-            first = chunk[0]
+            level = chunk[0]
             if self._zi_hp is not None:
-                self._zi_hp = self._zi_hp * first
+                self._zi_hp = self._zi_hp * level
+                level = np.zeros_like(level)
             if self._zi_lp is not None:
-                self._zi_lp = self._zi_lp * first
+                self._zi_lp = self._zi_lp * level
             if self._zi_notch is not None:
-                self._zi_notch = self._zi_notch * first
+                self._zi_notch = self._zi_notch * level
             self._primed = True
         if self._hp is not None:
             b, a = self._hp
@@ -1585,7 +1590,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _CONTACT_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
     _CONTACT_WORD = {"green": "OK", "amber": "LOOSE", "red": "OFF"}
     # Measured sample rate: frames drained per second, re-estimated ~1 Hz.
-    _rate = {"t": time.monotonic(), "n": 0, "sps": None}
+    # Frames reach the viewer in ~50 ms batches, so a 1 s count jumps by a
+    # batch either way (248 / 263 on a steady 250). Count over the last
+    # RATE_WINDOW_S instead: the jitter is then ~0.5%.
+    _rate = {"hist": deque(), "n": 0, "sps": None}
 
     # 2 s of signal per REF/GND verdict: a floating REF shows as a shared
     # drift of a few mV/s, and 0.25 s was too short to measure it steadily
@@ -1628,7 +1636,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _sw = {"sig": None, "chunks": deque(), "open": None}
 
     def _sweep_reset():
-        canvas.delete("sweep")
+        canvas.delete("sweep", "sweep_gap")
         _sw["sig"], _sw["open"] = None, None
         _sw["chunks"].clear()
 
@@ -1686,6 +1694,29 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             ids = chunks.popleft()[2]
             if ids:
                 canvas.delete(*ids)
+        # Chunks go whole, so a lap-old chunk can still reach into the gap.
+        # Blank the gap columns (cur+1 .. cur+gap) with background above the
+        # traces and below the grid/labels, so the sweep head always shows
+        # the same gap.
+        H = canvas.winfo_height()
+        spans = [(cur + 1, min(cur + gap, ncol - 1))]
+        if cur + gap >= ncol:
+            spans.append((0, cur + gap - ncol))
+        rects = canvas.find_withtag("sweep_gap")
+        if len(rects) != 2:
+            canvas.delete("sweep_gap")
+            rects = [canvas.create_rectangle(0, 0, 0, 0, fill=C["canvas_bg"],
+                                             outline="", tags="sweep_gap")
+                     for _ in range(2)]
+        for rid, span in zip(rects, spans + [None]):
+            if span is None or span[0] > span[1]:
+                canvas.coords(rid, 0, 0, 0, 0)
+            else:
+                canvas.coords(rid, span[0] * W / ncol, 0,
+                              (span[1] + 1) * W / ncol, H)
+        if chunks:
+            for rid in rects:
+                canvas.tag_raise(rid, "sweep")
 
     # ---- static chart layer ------------------------------------------------ #
     # Row lines, label boxes, labels and the calibration marker only change
@@ -1781,9 +1812,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _poll_impedance()
         _rate["n"] += got
         _now = time.monotonic()
-        if _now - _rate["t"] >= 1.0:
-            _rate["sps"] = _rate["n"] / (_now - _rate["t"])
-            _rate["t"], _rate["n"] = _now, 0
+        hist = _rate["hist"]
+        if got or not hist:
+            hist.append((_now, _rate["n"]))
+        while len(hist) > 2 and _now - hist[1][0] >= RATE_WINDOW_S:
+            hist.popleft()
+        if got == 0 and hist and _now - hist[-1][0] > 1.0:
+            _rate["sps"] = 0.0                  # stalled: say so at once
+        elif len(hist) > 1 and hist[-1][0] - hist[0][0] >= 2.0:
+            (t0, n0), (t1, n1) = hist[0], hist[-1]
+            _rate["sps"] = (n1 - n0) / (t1 - t0)
         canvas.delete("trace")
         W = canvas.winfo_width()
         H = canvas.winfo_height()

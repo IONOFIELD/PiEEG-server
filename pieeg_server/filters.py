@@ -47,6 +47,11 @@ class _SosBank:
     5th-order bandpass on 8 channels on a Pi 4, vs ~1.9 ms). apply_block()
     runs sosfilt on the whole block; both use the same state, so they can be
     mixed and still equal batch filtering.
+
+    The state starts at the steady state for the first sample seen, as if
+    that value had always been there: an electrode's DC offset (tens of mV)
+    is then not a step at start-up, which would ring through the filter for
+    seconds at hundreds of times the EEG amplitude.
     """
 
     def __init__(self, sos, num_channels: int):
@@ -54,11 +59,17 @@ class _SosBank:
         self._coef = [(b0, b1, b2, a1, a2)
                       for b0, b1, b2, _a0, a1, a2 in self._sos.tolist()]
         self._n = num_channels
-        # z[section][channel] = [z0, z1]
-        self._z = [[[0.0, 0.0] for _ in range(num_channels)]
-                   for _ in self._coef]
+        # z[section][channel] = [z0, z1]; set by _prime() on the first sample
+        self._z = None
+        self._zi_unit = signal.sosfilt_zi(self._sos).tolist()
+
+    def _prime(self, first):
+        self._z = [[[z0 * float(x), z1 * float(x)] for x in first[:self._n]]
+                   for z0, z1 in self._zi_unit]
 
     def apply_sample(self, channels) -> list[float]:
+        if self._z is None:
+            self._prime(channels)
         out = [float(v) for v in channels[:self._n]]  # zip() semantics, as before
         for (b0, b1, b2, a1, a2), zs in zip(self._coef, self._z):
             for i, x in enumerate(out):
@@ -72,6 +83,8 @@ class _SosBank:
     def apply_block(self, block) -> list[list[float]]:
         if not block:
             return []
+        if self._z is None:
+            self._prime(block[0])
         x = np.asarray(block, dtype=np.float64)
         # sosfilt's zi layout for (samples x channels), axis=0: (sections, 2, ch)
         zi = np.array(self._z).transpose(0, 2, 1)
