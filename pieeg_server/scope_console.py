@@ -289,6 +289,10 @@ SCOPE_CHANGELOG = [
             "has. In review, double-clicking a note (its line or its flag) "
             "lists every note there with its own Remove, and still adds a new "
             "note at that spot; times show to the tenth of a second."),
+    ("4.9", "Notch follows the mains line: the chip clock runs slightly off "
+            "250 SPS, so 60 Hz sat ~0.14 Hz off the notch and ~5 µV of hum "
+            "got through. The notch now centres on the line found in the "
+            "signal (live every 5 s, off calibration; review per recording)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

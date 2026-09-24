@@ -88,3 +88,30 @@ def test_ref_out_mains_alone_does_not_turn_gnd_off():
     for i in range(8):                      # no all-off flash, just mains
         tr.update(on, _block(3000.0, seed=i))
     assert tr.gnd() == "green"
+
+
+def test_notch_follows_mains_line_off_nominal_rate():
+    # chip at 249.41 SPS: 60 Hz mains shows as ~60.14 Hz on the 250 axis
+    from pieeg_server.acq_viewer import find_mains_line
+    fs, line = 250, 60.0 * 250 / 249.41
+    t = np.arange(0, 20, 1 / fs)
+    hum = 40 * np.sin(2 * np.pi * line * t)
+    x = (hum + 20 * np.sin(2 * np.pi * 10 * t))[:, None]
+    found = find_mains_line(x, fs, 60.0)
+    assert abs(found - line) < 0.01
+    out = {}
+    for tune in (None, found):
+        f = StreamingFilter(1, fs)
+        f.tune_notch(tune)
+        f.set_cutoffs(None, None, 60.0)
+        y = f.process(x)[fs * 5:, 0] - 20 * np.sin(2 * np.pi * 10 * t[fs * 5:])
+        out[tune] = np.abs(y).max()
+    assert out[None] > 3.0                  # nominal notch leaves the hum
+    assert out[found] < 1.0                 # tuned notch removes it
+
+
+def test_no_mains_line_keeps_nominal_notch():
+    from pieeg_server.acq_viewer import find_mains_line
+    rng = np.random.default_rng(0)
+    assert find_mains_line(rng.standard_normal((2500, 8)), 250, 60.0) is None
+    assert find_mains_line(np.zeros((100, 8)), 250, 60.0) is None   # too short

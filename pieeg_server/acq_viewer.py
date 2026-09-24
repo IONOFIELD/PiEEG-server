@@ -116,6 +116,16 @@ HFF_ORDER = 4
 # LFF roll-off: first order, like an analog RC coupling (time constant).
 LFF_ORDER = 1
 DEFAULT_SENS = 15         # microvolts per millimetre
+# Mains tracking. The chip's clock runs a little off nominal (249.41 SPS
+# measured on this board), and every filter is designed on the nominal 250
+# SPS axis, so 60 Hz mains lands at ~60.14 Hz there, where a Q=30 notch built
+# at 60.00 takes off only ~17 dB. The notch is instead centred on the line as
+# it appears in the data (find_mains_line).
+MAINS_SEARCH_HZ = 1.0     # look this far either side of the nominal mains
+MAINS_MIN_SECONDS = 4.0   # least signal to locate the line from
+MAINS_MAX_SECONDS = 60.0  # most signal a review estimate uses (cost on a Pi 4)
+MAINS_PROMINENCE = 20.0   # line power vs the search band's median power
+MAINS_RETUNE_S = 5.0      # live: re-locate the line this often
 
 WINDOW_SECONDS = 10.0     # initial strip-chart length; the timebase sets it
 PX_PER_MM = 4.0           # fallback pixels per mm when the screen size is unknown
@@ -169,6 +179,32 @@ GEIST = {
 }
 
 
+def find_mains_line(x, fs, mains):
+    """Where the mains line sits in (N x ch) data, in Hz on the nominal fs
+    axis, or None when there is too little signal or no clear line within
+    MAINS_SEARCH_HZ of `mains` (the notch then stays at its nominal Hz)."""
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    n = x.shape[0]
+    if not mains or n < MAINS_MIN_SECONDS * fs:
+        return None
+    x = x - x.mean(axis=0)
+    # zero-padded so the bins are fine enough (<= 0.004 Hz at 250 SPS)
+    nfft = 1 << max(16, int(np.ceil(np.log2(n))) + 2)
+    spec = np.fft.rfft(x * np.hanning(n)[:, None], n=nfft, axis=0)
+    power = (np.abs(spec) ** 2).sum(axis=1)
+    freqs = np.fft.rfftfreq(nfft, 1.0 / fs)
+    band = np.abs(freqs - mains) <= MAINS_SEARCH_HZ
+    if not band.any():
+        return None
+    p = power[band]
+    k = int(np.argmax(p))
+    if p[k] < MAINS_PROMINENCE * np.median(p):
+        return None
+    return float(freqs[band][k])
+
+
 class StreamingFilter:
     """Causal HFF (low-pass) + LFF (high-pass) held across streaming chunks.
 
@@ -183,6 +219,8 @@ class StreamingFilter:
         self._hp = None      # (b, a) high-pass for LFF, or None
         self._lp = None      # (b, a) low-pass for HFF, or None
         self._notch = None   # (b, a) band-stop for mains, or None
+        self._notch_hz = None   # nominal mains Hz chosen in the menu
+        self._notch_at = None   # where the line really sits (tune_notch)
         self._zi_hp = None
         self._zi_lp = None
         self._zi_notch = None
@@ -206,9 +244,25 @@ class StreamingFilter:
         if hff is not None and 0 < hff < nyq:
             self._lp = signal.butter(HFF_ORDER, hff / nyq, btype="lowpass")
         self._notch = None
-        if notch is not None and 0 < notch < nyq:
-            self._notch = signal.iirnotch(notch, Q=30.0, fs=self._fs)
+        self._notch_hz = notch if notch is not None and 0 < notch < nyq \
+            else None
+        if self._notch_hz is not None:
+            self._notch = self._design_notch()
         self._reset_state()
+
+    def _design_notch(self):
+        at = self._notch_at
+        if at is None or abs(at - self._notch_hz) > MAINS_SEARCH_HZ:
+            at = self._notch_hz
+        return signal.iirnotch(at, Q=30.0, fs=self._fs)
+
+    def tune_notch(self, line_hz):
+        """Centre the notch on where mains really sits in the data (from
+        find_mains_line), or None for the nominal Hz. Keeps every delay
+        line, so a live retune doesn't restart the trace."""
+        self._notch_at = line_hz
+        if self._notch_hz is not None:
+            self._notch = self._design_notch()
 
     def _reset_state(self):
         # One filter-delay vector per channel (axis=0 is time, axis=1 channels).
@@ -415,6 +469,7 @@ class ViewerModel:
         self.filled = 0
         self.total = 0              # samples pushed since start (sweep clock)
         self.cutoffs = (None, None, None)   # (lff, hff, notch) Hz in use
+        self.mains_line = None      # mains Hz as seen in the data, or None
         # Display hold for the measure box: a copy of the window taken when
         # the operator presses on the chart. Acquisition keeps going into
         # raw/filt underneath; only the drawing and measuring use the copy.
@@ -648,15 +703,35 @@ class ViewerModel:
 
     # ---- data handling ---------------------------------------------------- #
     def set_filters(self, lff, hff, notch=None):
+        if notch != self.cutoffs[2]:
+            self.mains_line = None          # a different grid: find it again
+            self.filter.tune_notch(None)
         self.cutoffs = (lff, hff, notch)
         self.filter.set_cutoffs(lff, hff, notch)
         # Re-run the whole visible raw window so the filtered view is coherent.
         self.filt = self._refilter(self.raw, self.filled, self.filter)
         if self.frozen is not None:
             f = StreamingFilter(self.nch, self.fs)
+            f.tune_notch(self.mains_line)
             f.set_cutoffs(lff, hff, notch)
             self.frozen["filt"] = self._refilter(self.frozen["raw"],
                                                  self.frozen["filled"], f)
+
+    def track_mains(self):
+        """Re-centre the live notch on the mains line in the current window
+        (see find_mains_line). The redraw loop calls this every
+        MAINS_RETUNE_S, never on the calibration square wave (its harmonics
+        sit near 60 Hz). Returns the line Hz in use, or None."""
+        notch = self.cutoffs[2]
+        if notch is None or self.filled < MAINS_MIN_SECONDS * self.fs:
+            return self.mains_line
+        line = find_mains_line(self.raw[self.win - self.filled:], self.fs,
+                               notch)
+        if line is not None and (self.mains_line is None
+                                 or abs(line - self.mains_line) >= 0.01):
+            self.mains_line = line
+            self.filter.tune_notch(line)
+        return self.mains_line
 
     def _refilter(self, raw, filled, filt):
         out = np.zeros_like(raw)
@@ -2351,10 +2426,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         uv = _rev["uv"]
         cuts = [0] + review_store.cal_breaks(uv, _rev["notes"], model.fs) \
             + [uv.shape[0]]
+        # the recording's own mains line, from its longest piece (a piece
+        # on the calibration square wave has harmonics near 60 Hz, but the
+        # electrode run between the CAL notes is the long one)
+        a, b = max(zip(cuts[:-1], cuts[1:]), key=lambda ab: ab[1] - ab[0])
+        b = min(b, a + int(MAINS_MAX_SECONDS * model.fs))
+        line = find_mains_line(uv[a:b], model.fs, model.cutoffs[2])
         out = np.empty_like(uv)
         for a, b in zip(cuts[:-1], cuts[1:]):
             if b > a:
                 f = StreamingFilter(model.nch, model.fs)
+                f.tune_notch(line)
                 f.set_cutoffs(*model.cutoffs)
                 out[a:b] = f.process(uv[a:b])
         _rev["filt"] = out
@@ -2522,6 +2604,18 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # (on a person, REF out read "off" on 155/169 readings, flickering the
     # word to LOOSE; 2 s read 169/169, with no false alarm while connected).
     _rail_n = max(1, int(2 * fs))
+
+    _mains = {"next": 0.0}
+
+    def _poll_mains():
+        now = time.monotonic()
+        if now < _mains["next"] or _rev["on"]:
+            return
+        _mains["next"] = now + MAINS_RETUNE_S
+        if (_cal["on"] or _cal["future"] is not None
+                or now < _cal["quiet_until"] or _imp["future"] is not None):
+            return                          # not on the calibration signal
+        model.track_mains()
 
     def _poll_contact():
         if contact_source is None or _imp["future"] is not None:
@@ -2836,6 +2930,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return
         got = _drain_queue()
         _poll_contact()
+        _poll_mains()
         _poll_record()
         _poll_marks()
         _poll_exports()
