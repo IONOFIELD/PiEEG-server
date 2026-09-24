@@ -153,6 +153,12 @@ FULL_SCALE_PLUS_1 = 16777215
 NEGATIVE_OFFSET = 16777214
 FULL_SCALE_23 = (1 << 23) - 1   # 8388607: signed 24-bit positive full scale
 VREF_UV = 4.5e6  # 4.5V reference in microvolts
+# PiEEG-16: don't start a chip 2 read this close to its next conversion
+# (see PiEEGHardware._wait_drdy2); a 16-channel frame read takes ~0.2 ms.
+DRDY2_MARGIN_NS = 300_000
+# ...and when its newest sample was already read, wait at most this long for
+# the next one before reading the same sample again.
+DRDY2_WAIT_NS = 1_000_000
 
 # CHnSET register (0x05..0x0C) bit layout, per ADS1299 datasheet (TI SBAS499):
 #   bit 7    PDn     0 = channel powered on
@@ -417,6 +423,11 @@ class PiEEGHardware:
         self._cs_fd = -1
         self._drdy_fd = -1
         self._drdy2_fd = -1
+        self._drdy2_event_fd = -1  # chip 2 falling-edge events (16-ch)
+        self._drdy2_last_ns = 0    # newest chip 2 edge seen
+        self._drdy2_read_ns = 0    # chip 2 edge whose sample was last read
+        self._drdy2_filled = 0     # chip 2 edges the kernel dropped (filled in)
+        self._drdy2_repeats = 0    # chip 2 samples read twice (phase wrap)
         self._drdy_event_fd = -1   # falling-edge interrupt fd (interrupt mode)
         self._spi1 = None
         self._spi2 = None
@@ -450,6 +461,11 @@ class PiEEGHardware:
         configured): the DRDY edge rate the acquisition loop times against."""
         config1 = getattr(self, "_config1", None)
         return None if config1 is None else config1_sample_rate(config1)
+
+    @property
+    def _period_ns(self) -> int:
+        """Nanoseconds between conversions at the programmed chip rate."""
+        return 1_000_000_000 // (self.chip_rate or 250)
 
     @property
     def oversample(self) -> int:
@@ -519,6 +535,9 @@ class PiEEGHardware:
         if self._drdy2_fd >= 0:
             os.close(self._drdy2_fd)
             self._drdy2_fd = -1
+        if self._drdy2_event_fd >= 0:
+            os.close(self._drdy2_event_fd)
+            self._drdy2_event_fd = -1
         if self._chip_fd >= 0:
             os.close(self._chip_fd)
             self._chip_fd = -1
@@ -758,11 +777,69 @@ class PiEEGHardware:
         return buf[0]
 
     def _wait_drdy2(self):
-        """Block until chip 2 DRDY goes LOW (falling edge = data ready)."""
-        while self._drdy2_get() == 0:   # wait out previous low
-            pass
-        while self._drdy2_get() == 1:   # wait for HIGH→LOW
-            pass
+        """Wait until chip 2 holds a sample that is safe to read now.
+
+        The two ADS1299s on the PiEEG-16 run on their own oscillators, so
+        chip 2's conversions slide against chip 1's (measured ~0.4 ms/s, a
+        full 4 ms period every ~10 s); software can't lock them. Their DRDY
+        flags can't say "unread sample" either: the chips share SCLK, so
+        reading chip 1 also knocks chip 2's DRDY high.
+
+        With DRDY2 edge events on (interrupt mode) the kernel timestamps
+        chip 2's conversions, so per chip 1 frame:
+
+        * an unread chip 2 sample is read now, unless its successor is due
+          within DRDY2_MARGIN_NS (a read could straddle that update); then
+          it waits for the successor;
+        * if chip 2's newest sample was already read, it waits for the next
+          one only if that is due within DRDY2_WAIT_NS, else it reads the
+          same sample again.
+
+        So the phase wrap costs one repeated (or, if chip 2 runs fast, one
+        skipped) chip 2 sample every ~10 s and at most DRDY2_WAIT_NS of
+        extra latency, and channels 9-16 stay within one period of 1-8.
+        The old wait always skipped the ready sample for the next one, up to
+        a whole period; chip 1's next edge then landed mid-read and ~89% of
+        16-ch frames were thrown away as torn.
+
+        Without events (busy-poll loops) it keeps the old edge wait.
+        """
+        if self._drdy2_event_fd < 0:
+            while self._drdy2_get() == 0:   # wait out previous low
+                pass
+            while self._drdy2_get() == 1:   # wait for HIGH→LOW
+                pass
+            return
+        fd = self._drdy2_event_fd
+        period = self._period_ns
+        last = self._drdy2_last_ns
+        while select.select([fd], [], [], 0)[0]:
+            last = self._read_edge(fd)
+        if not last:                        # first frame: no edge seen yet
+            if select.select([fd], [], [], period / 1e9)[0]:
+                last = self._read_edge(fd)
+            self._drdy2_last_ns = self._drdy2_read_ns = last
+            return
+        # The kernel now and then drops a DRDY2 edge while both chips are
+        # being read (~1 in 200, sometimes a few in a row). Chip 2's clock is
+        # steady, so a missing edge is put back where it must have been.
+        now = time.monotonic_ns()
+        while now - last >= period:
+            last += period
+            self._drdy2_filled += 1
+        to_next = last + period - now
+        # "Unread" by more than half a period, so a real edge that turns up
+        # just after its filled-in stand-in isn't read as a new sample.
+        unread = last - self._drdy2_read_ns > period // 2
+        if to_next < (DRDY2_MARGIN_NS if unread else DRDY2_WAIT_NS):
+            if select.select([fd], [], [], to_next / 1e9 + 2e-4)[0]:
+                last = self._read_edge(fd)
+            else:
+                last += period
+                self._drdy2_filled += 1
+        elif not unread:
+            self._drdy2_repeats += 1
+        self._drdy2_last_ns = self._drdy2_read_ns = last
 
     # --- private helpers ---
 
@@ -856,6 +933,13 @@ class PiEEGHardware:
         self._drdy_event_fd = self._request_event_line(
             self._chip_fd, DRDY_PIN, consumer=b"pieeg_drdy_evt")
         logger.info("DRDY interrupt mode enabled (falling-edge on GPIO%d)", DRDY_PIN)
+        if self._num_channels == 16:
+            if self._drdy2_fd >= 0:
+                os.close(self._drdy2_fd)
+                self._drdy2_fd = -1
+            self._drdy2_event_fd = self._request_event_line(
+                self._chip_fd, DRDY_PIN_2, consumer=b"pieeg_drdy2_evt")
+            self._drdy2_last_ns = self._drdy2_read_ns = 0
 
     def disable_drdy_events(self):
         """Release the DRDY event fd and restore the level-read handle."""
@@ -866,6 +950,13 @@ class PiEEGHardware:
             self._drdy_fd = self._request_line(
                 self._chip_fd, DRDY_PIN, _GPIOHANDLE_REQUEST_INPUT,
                 consumer=b"pieeg_drdy")
+        if self._drdy2_event_fd >= 0:
+            os.close(self._drdy2_event_fd)
+            self._drdy2_event_fd = -1
+        if self._num_channels == 16 and self._drdy2_fd < 0:
+            self._drdy2_fd = self._request_line(
+                self._chip_fd, DRDY_PIN_2, _GPIOHANDLE_REQUEST_INPUT,
+                consumer=b"pieeg_drdy2")
 
     def wait_drdy_event(self, timeout: float = 0.5):
         """Block until the next DRDY falling edge.
@@ -877,7 +968,12 @@ class PiEEGHardware:
         ready, _, _ = select.select([self._drdy_event_fd], [], [], timeout)
         if not ready:
             return None
-        data = os.read(self._drdy_event_fd, _EVENT_DATA_SIZE)
+        return self._read_edge(self._drdy_event_fd)
+
+    @staticmethod
+    def _read_edge(fd: int) -> int:
+        """One queued edge event's kernel timestamp (ns, CLOCK_MONOTONIC)."""
+        data = os.read(fd, _EVENT_DATA_SIZE)
         # First 8 bytes = u64 timestamp (nanoseconds).
         return struct.unpack_from("Q", data, 0)[0]
 
