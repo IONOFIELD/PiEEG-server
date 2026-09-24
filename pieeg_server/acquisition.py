@@ -388,7 +388,10 @@ class AcquisitionLoop:
         self._dropped_frames += n
         if self._decimator is not None:
             for sample, t in self._decimator.hold(n):
-                self._emit(sample, t, held=True)
+                last = self._last_emitted
+                ts_ns = (last[2] + round(self._nominal_ns * self._decimator.k)
+                         if last is not None and last[2] is not None else None)
+                self._emit(sample, t, ts_ns=ts_ns, held=True)
             return
         # Keep the time grid: a lost sample becomes a copy of the last one,
         # flagged "held" so recordings mark it (a dropped row would shift
@@ -422,8 +425,12 @@ class AcquisitionLoop:
             out = self._decimator.push(sample, t)
             if out is None:
                 return
+            # the output stands for the moment its FIR is centred on: the
+            # edge that completed it, less the filter delay
+            delay_ns = round((t - out[1]) * 1e9)
             sample, t = out
-            ts_ns = t2_ns = None            # a decimated output has no edge
+            ts_ns = None if ts_ns is None else ts_ns - delay_ns
+            t2_ns = None
         self._emit(sample, t, ts_ns=ts_ns, t2_ns=t2_ns)
 
     def _emit(self, sample, t, ts_ns=None, t2_ns=None, held=False):

@@ -175,3 +175,22 @@ def test_bench_refuses_noisy_readings(monkeypatch, tmp_path, capsys):
     points = json.loads((tmp_path / "bench.json").read_text())
     assert [p["name"] for p in points] == ["E1"]
     assert "E2 not recorded: noise 21.0" in capsys.readouterr().out
+
+
+def test_decimated_rows_carry_edge_times_on_the_grid(loop):
+    # recordings time each row from its chip edge (journal .timing): the
+    # output's edge is the one that completed it, less the FIR delay
+    acq = _acq(loop)
+    acq._nominal_ns = 1_000_000                    # chip period (1000 SPS)
+    t0 = 5_000_000_000
+    for i in range(400):
+        acq._deliver([1.0] * 8, i / 1000.0, ts_ns=t0 + i * 1_000_000)
+    acq._lost(4)                                   # one output falls due
+    for i in range(404, 800):
+        acq._deliver([1.0] * 8, i / 1000.0, ts_ns=t0 + i * 1_000_000)
+    frames = _drain(acq, loop)
+    ts = np.array([f["ts_ns"] for f in frames])
+    assert np.all(np.diff(ts) == 4_000_000)        # held rows on the grid too
+    delay_ns = round(acq._decimator.delay_s * 1e9)
+    assert ts[0] == t0 + 3_000_000 - delay_ns      # 4th edge, less the delay
+    assert sum(f.get("held", False) for f in frames) == 1

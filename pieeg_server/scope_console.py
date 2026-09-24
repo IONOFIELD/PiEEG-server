@@ -316,6 +316,12 @@ SCOPE_CHANGELOG = [
             "±0.09 ms on the bench, was ±2 ms); E1-E8 stay bit-exact. A lost "
             "sample now holds the last value so the time grid never shifts, "
             "and each one is marked by a HELD note in the file."),
+    ("5.5", "BDF+ files are on the clock: the measured sample rate (e.g. "
+            "249.76 Hz, not a nominal 250) and the first sample's wall-clock "
+            "time to the microsecond. Every channel is placed at its true "
+            "sample time (the chips' clocks wander ~0.5 ms); pauses such as a "
+            "calibration toggle are held and noted, so later samples and notes "
+            "stay on time. The raw journal is kept exactly as acquired."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

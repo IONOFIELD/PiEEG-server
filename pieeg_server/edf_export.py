@@ -145,37 +145,99 @@ def _write_annotations(writer, annotations, fs, n_samples):
 
 def prepare_export(journal_path, counts, meta):
     """What an export writes, from the journal as recorded: (counts,
-    annotations, per-channel prefilter texts, alignment report or None).
+    annotations, per-channel prefilter texts, time base or None).
 
-    With the journal's .timing file (recorded since Scope v5.4): a PiEEG-16's
-    chip 2 columns are put on chip 1's sample times (see align.py), and every
-    run of held rows (samples lost in acquisition, held at the last value to
-    keep the time grid) gets an annotation. Without it, the journal as is.
+    With the journal's .timing file (recorded since Scope v5.4) the file is
+    put on the clock (timebase.py): every channel resampled from its chip's
+    measured sample times onto one even grid at the measured rate (a
+    PiEEG-16's two chips land on the same times), the first sample's
+    wall-clock time as the start, pauses held; notes go to the exported row
+    at their time, and every held stretch is noted: lost samples ("HELD"),
+    pauses ("GAP") and the end fill ("END FILL").
+
+    Without it (older recordings), the journal as is at the nominal rate.
     """
     nch = int(meta["channel_count"])
     base = meta.get("prefilter") or "raw, no filter"
     prefilters = [base] * nch
     annotations = list(read_annotations(journal_path))
     timing = read_timing(journal_path, rows=counts.shape[0])
-    if timing is None:
+    from . import timebase
+    tb = None
+    if timing is not None:
+        t1, off2, flags = timing
+        tb = timebase.build(counts, t1, off2, flags,
+                            int(meta["sample_rate"]), meta.get("clock"))
+    if tb is None:
+        if timing is not None:
+            for first, length in _runs_of(timing[2] & 1):
+                annotations.append({"frame": first, "type": "held",
+                                    "text": _held_text(length)})
         return counts, annotations, prefilters, None
-    from . import align
-    t1, off2, flags = timing
-    fs = int(meta["sample_rate"])
-    report = None
-    if nch == 16:
-        counts, report = align.align_chip2(counts, t1, off2, flags,
-                                           1e9 / fs, fs)
-        if report["rows_aligned"]:
-            prefilters[8:16] = [f"{base}; {align.METHOD}"] * 8
-    for first, length in align.held_runs(flags):
-        annotations.append({
-            "frame": first, "type": "held",
-            "text": f"HELD {length} lost sample{'s' if length > 1 else ''}"})
-    return counts, annotations, prefilters, report
+    prefilters = [f"{base}; {timebase.METHOD}"] * nch
+    frame_of = tb["frame_of"]
+    last = len(frame_of) - 1
+    for a in annotations:                   # journal row -> exported row
+        a["frame"] = int(frame_of[min(max(int(a["frame"]), 0), last)])
+    pause_rows = {p["row"]: p for p in tb["report"]["pauses_filled"]}
+    n = len(tb["held"])
+    for first, length in _runs_of(tb["held"]):
+        if first in pause_rows:
+            text = f"GAP {pause_rows[first]['ms']} ms no data (held)"
+            kind = "gap"
+        else:
+            text, kind = _held_text(length), "held"
+        annotations.append({"frame": first, "type": kind, "text": text})
+    if tb["pad"]:
+        annotations.append({"frame": n, "type": "pad",
+                            "text": f"END FILL {tb['pad']} samples (held)"})
+    return tb["counts"], annotations, prefilters, tb
 
 
-def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None):
+def _runs_of(mask):
+    """[(first, length)] of consecutive true entries."""
+    m = np.asarray(mask).astype(bool)
+    d = np.diff(np.concatenate([[0], m.astype(np.int8), [0]]))
+    return [(int(a), int(b - a)) for a, b in
+            zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1))]
+
+
+def _held_text(n):
+    return f"HELD {n} lost sample{'s' if n > 1 else ''}"
+
+
+def _file_timing(meta, tb):
+    """(sample rate, start datetime) the file states: the time base's
+    measured rate and first-sample time when there is one."""
+    if tb is None:
+        return int(meta["sample_rate"]), _start_datetime(meta)
+    start = _start_datetime(meta)
+    if tb["start_unix_ns"]:
+        start = datetime.fromtimestamp(tb["start_unix_ns"] / 1e9,
+                                       timezone.utc).astimezone()
+    return tb["rate_hz"], start
+
+
+def _set_record_layout(writer, tb, start):
+    """The data-record duration the time base chose, and the start's
+    fraction of a second. Call after the last header change.
+
+    pyedflib (0.1.42) hands EDFlib the subsecond start as microseconds x 100
+    where EDFlib takes units of 100 ns (microseconds x 10), so any start
+    more than 0.1 s past the second is refused and silently written as .0;
+    set it here in the right unit.
+    """
+    if tb is not None:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Forcing a specific")
+            writer.setDatarecordDuration(tb["record_duration_s"])
+    from pyedflib._extensions._pyedflib import set_starttime_subsecond
+    if start.microsecond:
+        set_starttime_subsecond(writer.handle, start.microsecond * 10)
+
+
+def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None,
+                   tb=None):
     """Write a lossless BDF+ file: journal counts ARE the digital samples.
 
     The mapping is 1:1 -- we never scale the sample values. The header carries
@@ -185,7 +247,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None):
     """
     pyedflib = _require_pyedflib()
     nch = int(meta["channel_count"])
-    fs = int(meta["sample_rate"])
+    fs, start = _file_timing(meta, tb)
     labels = _channel_labels(meta, nch)
     lsb_uv = float(meta["lsb_uv"])   # ground-truth count->uV scale
 
@@ -198,7 +260,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None):
     writer = pyedflib.EdfWriter(str(out_path), nch,
                                file_type=pyedflib.FILETYPE_BDFPLUS)
     try:
-        writer.setStartdatetime(_start_datetime(meta))
+        writer.setStartdatetime(start)
         headers = []
         for ci in range(nch):
             headers.append({
@@ -225,6 +287,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None):
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Physical (minimum|maximum)")
             writer.setSignalHeaders(headers)
+            _set_record_layout(writer, tb, start)
             # digital=True => write the integers straight through, no scaling.
             digital = [np.ascontiguousarray(counts[:, ci].astype(np.int32))
                        for ci in range(nch)]
@@ -252,11 +315,12 @@ def _physical_range(uv_channel):
     return pmin, pmax
 
 
-def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None):
+def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None,
+                   tb=None):
     """Write EDF+ 16-bit. Per-channel adaptive range (some resolution lost)."""
     pyedflib = _require_pyedflib()
     nch = int(meta["channel_count"])
-    fs = int(meta["sample_rate"])
+    fs, start = _file_timing(meta, tb)
     labels = _channel_labels(meta, nch)
     lsb_uv = float(meta["lsb_uv"])
 
@@ -266,7 +330,7 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None):
     writer = pyedflib.EdfWriter(str(out_path), nch,
                                file_type=pyedflib.FILETYPE_EDFPLUS)
     try:
-        writer.setStartdatetime(_start_datetime(meta))
+        writer.setStartdatetime(start)
         channel_info = []
         for ci in range(nch):
             pmin, pmax = _physical_range(uv[:, ci])
@@ -283,6 +347,7 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None):
                               or meta.get("prefilter") or "")[:80],
             })
         writer.setSignalHeaders(channel_info)
+        _set_record_layout(writer, tb, start)
         # writeSamples wants one array per channel (physical uV values).
         writer.writeSamples([np.ascontiguousarray(uv[:, ci]) for ci in range(nch)])
         _write_annotations(writer, annotations, fs, counts.shape[0])
@@ -322,14 +387,14 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    counts, annotations, prefilters, report = prepare_export(
+    counts, annotations, prefilters, tb = prepare_export(
         journal_path, counts, meta)
-    if report and report["rows_aligned"]:
-        logger.info("chip 2 aligned to chip 1: %s", report)
+    if tb is not None:
+        logger.info("time base: %s", tb["report"])
     if fmt == "bdf":
-        _write_bdfplus(counts, meta, out_path, annotations, prefilters)
+        _write_bdfplus(counts, meta, out_path, annotations, prefilters, tb)
     else:
-        _write_edfplus(counts, meta, out_path, annotations, prefilters)
+        _write_edfplus(counts, meta, out_path, annotations, prefilters, tb)
 
     logger.info("Wrote %s %s (%d ch, %d samples, %.1f s, %d annotations)",
                 fmt.upper() + "+", out_path, int(meta["channel_count"]),
@@ -352,8 +417,9 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
     journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
                                         Path(out_path))
     counts, meta = read_journal(journal_path, sidecar_path)
-    counts, annotations, _, report = prepare_export(journal_path, counts, meta)
-    nch, fs = int(meta["channel_count"]), int(meta["sample_rate"])
+    counts, annotations, _, tb = prepare_export(journal_path, counts, meta)
+    nch = int(meta["channel_count"])
+    fs = tb["rate_hz"] if tb is not None else int(meta["sample_rate"])
     labels = _channel_labels(meta, nch)
     inputs = meta.get("channel_inputs") or [f"E{i}" for i in range(1, nch + 1)]
     uv = counts.astype(np.float64) * float(meta["lsb_uv"])
@@ -385,8 +451,10 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         **({"nickname": nickname} if nickname else {}),
         "file_format": "BDF+" if bdf else "EDF+",
         ("bdf_file" if bdf else "edf_file"): rel(edf_path),
-        "start_iso": meta.get("start_iso"),
-        "duration_sec": round(counts.shape[0] / fs, 3),
+        "start_iso": (_file_timing(meta, tb)[1].isoformat(
+            timespec="microseconds") if tb is not None and tb["start_unix_ns"]
+            else meta.get("start_iso")),
+        "duration_sec": round(counts.shape[0] / fs, 6),
         "samples": int(counts.shape[0]),
         "sample_rate": fs,
         "measured_rate_hz": meta.get("measured_rate_hz"),
@@ -395,10 +463,9 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         "reference": (meta.get("reference")
                       or "all inputs against one shared REF electrode (SRB1)"),
         **{k: meta[k] for k in ("acquisition", "timing") if meta.get(k)},
-        **({"alignment": report} if report and report["rows_aligned"]
-           else {}),
         "channels": channels,
-        "annotations": [{"time": round(int(a["frame"]) / fs, 3),
+        **({"time_base": tb["report"]} if tb is not None else {}),
+        "annotations": [{"time": round(int(a["frame"]) / fs, 6),
                          "frame": int(a["frame"]), "text": a.get("text", ""),
                          "type": a.get("type", "note")}
                         for a in sorted(annotations,
