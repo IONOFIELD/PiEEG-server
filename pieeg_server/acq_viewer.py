@@ -20,11 +20,14 @@ WHAT THIS IS
     journal, or the export, and it does NOT consume the secure-link stream's single
     client slot (the laptop still gets its own wss connection).
 
-MONTAGES (bipolar, built from the 8 PiEEG inputs)
-    The 8 inputs map to scalp sites: ch1..ch8 = Fp1 Fp2 C3 C4 T3 T4 O1 O2.
+MONTAGES (bipolar, sized to the board: 8 inputs, or 16 on a PiEEG-16)
+    The 8 inputs map to scalp sites: ch1..ch8 = Fp1 Fp2 C3 C4 T3 T4 O1 O2; a
+    PiEEG-16 adds ch9..ch16 = F3 F4 P3 P4 F7 F8 T5 T6 (classic 10-20 names).
     Each montage row is a DIFFERENCE between two sites (e.g. Fp1-C3), which is
-    what "bipolar" means. Three presets ship in code and are READ-ONLY:
-    Double banana, Transverse, Circumferential. Right-click a lead to edit
+    what "bipolar" means. Four presets ship in code and are READ-ONLY:
+    Adaptive (the default: the double banana at the board's size), Double
+    banana, Transverse, Circumferential, each drawn from every site the board
+    has (MONTAGE_PRESETS / MONTAGE_PRESETS_16). Right-click a lead to edit
     YOUR copy of the current montage (rename / hide / reorder; Custom rows can
     also be removed). Edits mark the montage dirty — the picker shows a star,
     e.g. "Transverse*" — and the Save button persists them to
@@ -85,7 +88,51 @@ MONTAGE_PRESETS: dict[str, list[tuple[str, str]]] = {
         ("O2", "O1"), ("O1", "T3"), ("T3", "Fp1"),
     ],
 }
-DEFAULT_MONTAGE = "Double banana"
+# The same three montages over the 16 sites of a 16-input board (PiEEG-16:
+# E9..E16 = F3 F4 P3 P4 F7 F8 T5 T6, see scope_console._ELECTRODES), in classic
+# 10-20 names like the 8-site set. There is no midline (Fz/Cz/Pz) input, so
+# these are the ACNS chains without their midline links: double banana in the
+# 8-site order (left temporal, left parasagittal, right temporal, right
+# parasagittal), transverse front to back, left to right, and the
+# circumferential ring through every temporal site.
+MONTAGE_PRESETS_16: dict[str, list[tuple[str, str]]] = {
+    "Double banana": [
+        ("Fp1", "F7"), ("F7", "T3"), ("T3", "T5"), ("T5", "O1"),
+        ("Fp1", "F3"), ("F3", "C3"), ("C3", "P3"), ("P3", "O1"),
+        ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"), ("T6", "O2"),
+        ("Fp2", "F4"), ("F4", "C4"), ("C4", "P4"), ("P4", "O2"),
+    ],
+    "Transverse": [
+        ("F7", "Fp1"), ("Fp1", "Fp2"), ("Fp2", "F8"),
+        ("F7", "F3"), ("F3", "F4"), ("F4", "F8"),
+        ("T3", "C3"), ("C3", "C4"), ("C4", "T4"),
+        ("T5", "P3"), ("P3", "P4"), ("P4", "T6"),
+        ("T5", "O1"), ("O1", "O2"), ("O2", "T6"),
+    ],
+    "Circumferential": [
+        ("Fp1", "Fp2"), ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"),
+        ("T6", "O2"), ("O2", "O1"), ("O1", "T5"), ("T5", "T3"),
+        ("T3", "F7"), ("F7", "Fp1"),
+    ],
+}
+
+# The double banana sized to the board that was found: the 8-site one on a
+# PiEEG-8, the 16-site one on a PiEEG-16. The default montage.
+ADAPTIVE_MONTAGE = "Adaptive"
+
+
+def presets_for(electrodes):
+    """The preset set for this electrode map: the 16-site one when every one
+    of its sites is an input, else the 8-site one. So the montages grow with
+    the board (8 rows on a PiEEG-8, 16 on a PiEEG-16) with no setting."""
+    sites = set(electrodes)
+    if all(a in sites and b in sites
+           for rows in MONTAGE_PRESETS_16.values() for a, b in rows):
+        return MONTAGE_PRESETS_16
+    return MONTAGE_PRESETS
+
+
+DEFAULT_MONTAGE = ADAPTIVE_MONTAGE
 CUSTOM_MONTAGE = "Custom"
 # Where saved montage edits live between sessions (plain JSON, user-writable,
 # no network). One file for the whole scope; montages saved unedited are
@@ -94,7 +141,7 @@ STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
 # "Custom" montage you fill channel by channel (right-click → Add). Selecting a
 # preset always snaps straight back to it.
-MONTAGE_NAMES = list(MONTAGE_PRESETS) + [CUSTOM_MONTAGE]
+MONTAGE_NAMES = [ADAPTIVE_MONTAGE] + list(MONTAGE_PRESETS) + [CUSTOM_MONTAGE]
 
 # ── filter menu choices (label, value). None = filter stage off ──────────────
 # HFF = low-pass cutoff (Hz); LFF = high-pass cutoff (Hz).
@@ -353,13 +400,15 @@ class MontageStore:
         except (OSError, ValueError, AttributeError):
             pass
 
-    def put(self, name, rows, filters=None):
-        """Save serialized rows and filters under name; None deletes each."""
-        for table, value in ((self.data, rows), (self.filters, filters)):
+    def put(self, name, rows, filters=None, rows_key=None):
+        """Save serialized rows (under rows_key, default name) and filters
+        under name; None deletes each."""
+        for table, key, value in ((self.data, rows_key or name, rows),
+                                  (self.filters, name, filters)):
             if value is None:
-                table.pop(name, None)
+                table.pop(key, None)
             else:
-                table[name] = value
+                table[key] = value
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
@@ -483,13 +532,20 @@ class ViewerModel:
         # each montage keeps its own, saved with its rows.
         self.session_filters: dict[str, tuple] = {}
         self.store = store          # MontageStore or None (in-memory only)
+        # 8- or 16-site presets, whichever this board's inputs can show.
+        self.presets = presets_for(self.electrodes)
+        # Saved row edits are kept apart per preset set, so an 8-channel
+        # montage saved on a PiEEG-8 never replaces the 16-channel one (its
+        # rows would all still be valid sites). Filters are shared by name.
+        self.rows_prefix = "" if self.presets is MONTAGE_PRESETS else "16ch/"
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
 
     # ---- montage handling ------------------------------------------------- #
     def _fresh_rows(self, name):
         rows = []
-        for a, b in MONTAGE_PRESETS[name]:
+        for a, b in self.presets[
+                "Double banana" if name == ADAPTIVE_MONTAGE else name]:
             # Only keep rows whose two sites are actually available inputs.
             if a in self.site_index and b in self.site_index:
                 rows.append({"pair": (a, b), "name": f"{a}-{b}", "on": True})
@@ -506,10 +562,11 @@ class ViewerModel:
         dropped (the map can change between sessions), as is anything
         malformed — a bad file must never break the viewer.
         """
-        if self.store is None or name not in self.store.data:
+        key = self.rows_prefix + name
+        if self.store is None or key not in self.store.data:
             return None
         rows = []
-        for item in self.store.data[name]:
+        for item in self.store.data[key]:
             try:
                 a, b = item["pair"]
             except (TypeError, KeyError, ValueError):
@@ -608,7 +665,8 @@ class ViewerModel:
         filters = self.session_filters[self.current]
         filt = (None if filters == self.default_filters()
                 else dict(zip(("lff", "hff", "notch"), filters)))
-        return self.store.put(self.current, ser, filt)
+        return self.store.put(self.current, ser, filt,
+                              rows_key=self.rows_prefix + self.current)
 
     # ---- chip-input (E-number) labelling ---------------------------------- #
     def elabel(self, site):
@@ -2873,12 +2931,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             #    top — which physical electrode to reseat — and the scalp
             #    SITE pair (Fp1-C3) dimmed under it. Mono, per the Geist
             #    "numeric data is monospace" convention.
-            cx = box_x + box_w / 2.0
             e_name = model.epair_name(r["pair"])
             s_name = model.row_label(r)
             chip = max(28.0, max(len(e_name), len(s_name)) * 6.0)
-            canvas.create_rectangle(cx - chip / 2, base - 13, cx + chip / 2,
-                                    base + 13, fill=C["canvas_bg"],
+            # Short rows (16 leads on the 480 px panel) make the box narrow;
+            # keep the chip and its left contact dot on the canvas.
+            cx = max(box_x + box_w / 2.0, box_x + chip / 2 + 10)
+            ch = min(13.0, row_h / 2.0)
+            canvas.create_rectangle(cx - chip / 2, base - ch, cx + chip / 2,
+                                    base + ch, fill=C["canvas_bg"],
                                     outline="", tags="deco")
             e_text = canvas.create_text(cx, base - 5, text=e_name,
                                         fill=C["text"],

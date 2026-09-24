@@ -301,6 +301,12 @@ SCOPE_CHANGELOG = [
     ("5.1", "PiEEG-16 streams at the full 250 SPS: the second chip's sample "
             "is read as soon as it is ready instead of waiting a whole period "
             "for the next one, which had thrown away ~89% of 16-ch frames."),
+    ("5.2", "Montages follow the board. New default \"Adaptive\": the double "
+            "banana at the board's size (8 leads on a PiEEG-8, 16 on a "
+            "PiEEG-16). Double banana, Transverse and Circumferential also use "
+            "every 10-20 site the board has (E9-E16 = F3 F4 P3 P4 F7 F8 T5 T6). "
+            "Saved edits are kept per board size. Lead labels stay on screen "
+            "with 16 rows."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
