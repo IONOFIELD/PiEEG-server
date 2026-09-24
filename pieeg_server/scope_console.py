@@ -298,6 +298,9 @@ SCOPE_CHANGELOG = [
             "shows it in the title. Rec works on each; IronBCI-32 recordings "
             "use its own 2.5 V / x8 scale (±312 mV in the BDF). No board: a "
             "window says what was checked. Calibration is PiEEG-only."),
+    ("5.1", "PiEEG-16 streams at the full 250 SPS: the second chip's sample "
+            "is read as soon as it is ready instead of waiting a whole period "
+            "for the next one, which had thrown away ~89% of 16-ch frames."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
