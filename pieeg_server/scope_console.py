@@ -293,12 +293,19 @@ SCOPE_CHANGELOG = [
             "250 SPS, so 60 Hz sat ~0.14 Hz off the notch and ~5 µV of hum "
             "got through. The notch now centres on the line found in the "
             "signal (live every 5 s, off calibration; review per recording)."),
+    ("5.0", "One launch for any board: the Scope finds what is attached — an "
+            "IronBCI-32 on USB, else a PiEEG-8 or PiEEG-16 shield — and "
+            "shows it in the title. Rec works on each; IronBCI-32 recordings "
+            "use its own 2.5 V / x8 scale (±312 mV in the BDF). No board: a "
+            "window says what was checked. Calibration is PiEEG-only."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
 # ch1..chN -> scalp labels used by the viewer's montages (first 8 are named).
-_ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
-               "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
+# Inputs 17-32 (IronBCI-32) have no agreed site yet, so they go by input.
+_ELECTRODES = (["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
+                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
+               + [f"E{i}" for i in range(17, 33)])
 
 
 def _num_channels(device: str) -> int:
@@ -631,9 +638,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         description="PiEEG Scope console: the plain ws:// server + local live "
                     "viewer + a shutdown button, in one launch.")
-    parser.add_argument("--device", default="pieeg8",
-                        choices=["pieeg8", "pieeg16", "ironbci8", "ironbci32"],
-                        help="hardware profile (default: pieeg8)")
+    parser.add_argument("--device", default="auto",
+                        choices=["auto", "pieeg8", "pieeg16", "ironbci8",
+                                 "ironbci32"],
+                        help="hardware profile (default: auto = find the "
+                             "attached board: IronBCI-32 on USB, else a "
+                             "PiEEG-8/16 shield on SPI)")
     parser.add_argument("--profile", default="pi5",
                         choices=["auto", "pi4", "pi5"],
                         help="Raspberry Pi profile (default: pi5)")
@@ -671,11 +681,31 @@ def main(argv=None):
     # Import here so --help works even off the Pi. These are the EXISTING
     # public pieces of the serve path; we do not modify them.
     from .acquisition import AcquisitionLoop
-    from .hardware import VREF_UV
     from .impedance import unsupported_reason
     from .journal import referential_labels
     from .server import PiEEGServer
     from . import profiles
+    from .detect import BOARD_NAMES, detect
+
+    # ---- which board ------------------------------------------------------- #
+    if args.device == "auto" and args.mock:
+        args.device = "pieeg8"
+    elif args.device == "auto":
+        found = detect(args.gpio_chip, args.profile)
+        if found.device is None:
+            return _startup_error(
+                args, "No EEG board found",
+                "Nothing answered:\n  • " + "\n  • ".join(found.tried)
+                + "\n\nIronBCI-32: plug its USB cable into the Pi and make "
+                "sure the board is powered. PiEEG-8/16: press the shield "
+                "fully onto all 40 GPIO pins and switch its battery on. "
+                "Then launch the Scope again.")
+        args.device = found.device
+        if found.serial_port:
+            args.serial_port = found.serial_port
+        logger.info("board detected: %s%s", found.name,
+                    f" on {found.serial_port}" if found.serial_port else "")
+    board = BOARD_NAMES.get(args.device, args.device)
 
     num_ch = _num_channels(args.device)
     fs = _sample_rate(args.device)
@@ -733,6 +763,9 @@ def main(argv=None):
                          channel_labels=referential_labels(electrodes))
     server._lsl_groups = profiles.load_lsl_groups()
     server._recordings_dir = args.recordings_dir
+    if serial:
+        server._reference_text = ("as wired on the IronBCI-32 board "
+                                  "(not the PiEEG's SRB1 REF)")
     server.enable_webhooks()
 
     dashboard = None
@@ -812,6 +845,9 @@ def main(argv=None):
     _chn = range(0x05, 0x0D)
     _cal_test, _cal_normal = (0x05, 0x00) if args.mock else (0x65, 0x60)
     _cal = {"on": False, "saved": None}
+    # The square wave is the ADS1299's own test signal (PiEEG over SPI, or
+    # the mock); the IronBCI boards have no such switch here.
+    can_calibrate = not (ble or serial)
 
     async def _calibrate(on):
         on = bool(on)
@@ -896,7 +932,8 @@ def main(argv=None):
     # stalls it for tens of ms, which would drop samples mid-stream.
     targets = _connect_targets(args.host)
     mode, ip = targets[0]
-    title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   ws://{ip}:{args.port}"
+    title = (f"PiEEG Scope v{SCOPE_VERSION}   ·   {board}"
+             f"   ·   ws://{ip}:{args.port}"
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
     # ---- viewer (its own process; closing its window is the shutdown) ------ #
@@ -906,7 +943,7 @@ def main(argv=None):
              connect_popup={"ip": ip, "port": args.port, "mode": mode,
                             "targets": targets, "version": SCOPE_VERSION,
                             "changelog": SCOPE_CHANGELOG},
-             full_scale_uv=VREF_UV / (acq.pga_gain or 24),
+             full_scale_uv=acq.vref_uv / (acq.pga_gain or 24),
              recordings_dir=str(args.recordings_dir),
              auto_close_ms=(int(args.seconds * 1000) if args.seconds else None)),
         leadoff=_contact_source(hw),
@@ -922,8 +959,8 @@ def main(argv=None):
         annotate=None if args.mock else (
             lambda text, unix_t, kind=None: asyncio.run_coroutine_threadsafe(
                 server._add_annotation(text, unix_t, kind), loop)),
-        calibrate=lambda on: asyncio.run_coroutine_threadsafe(
-            _calibrate(on), loop))
+        calibrate=None if not can_calibrate else (
+            lambda on: asyncio.run_coroutine_threadsafe(_calibrate(on), loop)))
     try:
         link_ref["link"] = link
         link.start()
@@ -936,11 +973,11 @@ def main(argv=None):
                 logger.warning("dashboard not started (port %d: %s); "
                                "continuing without it.", args.dashboard_port, e)
                 dashboard = None
-        logger.info("Scope up: %s  (%d ch @ %d Hz%s) + viewer. Close the "
-                    "window to stop the server.",
+        logger.info("Scope up: %s  (%s, %d ch @ %d Hz%s) + viewer. Close "
+                    "the window to stop the server.",
                     ", ".join(f"ws://{t_ip}:{args.port} [{t_mode}]"
                               for t_mode, t_ip in targets),
-                    acq.num_channels, fs, " · MOCK" if args.mock else "")
+                    board, acq.num_channels, fs, " · MOCK" if args.mock else "")
         code = link.wait()
         if code:
             logger.warning("viewer process exited with code %s", code)

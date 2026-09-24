@@ -102,6 +102,11 @@ class AcquisitionLoop:
         return getattr(self._hw, "pga_gain", None)
 
     @property
+    def vref_uv(self) -> float:
+        """ADC reference in µV (the ADS1299's 4.5 V unless the board says)."""
+        return getattr(self._hw, "vref_uv", VREF_UV)
+
+    @property
     def prefilter(self) -> str | None:
         """What the samples went through before they were handed on, for
         recording headers: the decimation FIR when oversampling, else None
@@ -357,7 +362,7 @@ class AcquisitionLoop:
             gain = getattr(self._hw, "pga_gain", None)
             self._decimator = Decimator(
                 k, chip_rate, self._hw.num_channels,
-                limit_uv=VREF_UV / gain if gain else None)
+                limit_uv=self.vref_uv / gain if gain else None)
             logger.info("oversampling: chip %d SPS, FIR %d taps, decimated "
                         "x%d to %d SPS (delay %.0f ms, taken off timestamps)",
                         chip_rate, len(self._decimator.taps), k,

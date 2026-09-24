@@ -34,7 +34,7 @@ from .auth import AuthManager
 from .cloud_relay import CloudRelayBridge
 from .filters import MultichannelFilter, MultichannelNotchFilter
 from .recorder import Recorder
-from .journal import JournalWriter
+from .journal import JournalWriter, VREF_UV
 from . import edf_export
 from .webhooks import WebhookStore
 from .osc_vrchat import VRChatOSCBridge, OSCConfig
@@ -606,7 +606,12 @@ class PiEEGServer:
         # calibration matches the chip; fall back to the JournalWriter default
         # only if the hardware doesn't report a gain (e.g. mock).
         gain = self._acq.pga_gain
-        journal_kwargs = {} if gain is None else {"gain": gain}
+        journal_kwargs = {} if gain is None else {
+            "gain": gain,
+            "vref_uv": getattr(self._acq, "vref_uv", VREF_UV)}
+        reference = getattr(self, "_reference_text", None)
+        if reference:
+            journal_kwargs["reference"] = reference
         self._journal = JournalWriter(
             self._acq, out_dir=raw_dir, session_name=session,
             num_channels=self._acq.num_channels,

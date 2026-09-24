@@ -139,7 +139,7 @@ class JournalWriter:
 
     def __init__(self, acquisition, out_dir, session_name=None,
                  num_channels=None, sample_rate=250, channel_labels=None,
-                 gain=GAIN, vref_uv=VREF_UV, prefilter=None):
+                 gain=GAIN, vref_uv=VREF_UV, prefilter=None, reference=None):
         self._acq = acquisition
         # Large buffer: tolerate an occasional fsync stall without dropping.
         self._queue = acquisition.subscribe(maxsize=8192)
@@ -157,6 +157,9 @@ class JournalWriter:
         # the decimation FIR's output, rounded to the nearest count (the
         # 0.022 µV count is far below the noise), and this says so.
         self._prefilter = prefilter
+        # How the inputs are referenced, for boards other than the PiEEG
+        # (None = the PiEEG's shared SRB1 REF; the summary says so).
+        self._reference = reference
 
         if session_name is None:
             session_name = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
@@ -209,6 +212,7 @@ class JournalWriter:
             "lsb_uv": self._lsb_uv,
             "physical_dimension": "uV",
             "prefilter": self._prefilter,
+            **({"reference": self._reference} if self._reference else {}),
             "start_unix": self._start_time,
             "start_iso": (datetime.fromtimestamp(self._start_time, timezone.utc)
                           .astimezone().isoformat()) if self._start_time else None,
