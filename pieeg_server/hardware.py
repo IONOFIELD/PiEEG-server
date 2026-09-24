@@ -570,27 +570,30 @@ class PiEEGHardware:
             raw2 = self._spi2.readbytes(BYTES_PER_READ)
             self._cs_set(1)
 
-            # Update lead-off status from both STATUS words. Done BEFORE the
-            # spike/validity gates below so a floating electrode (which reads as
-            # huge noise and is spike-rejected) still reports its "off" state.
-            self._update_leadoff(raw1, raw2)
-
-            # Spike detection: check last channel of chip 2 (bytes 24-26)
-            if not self._is_valid_frame(raw2):
-                return None
-
-            # Validate the frame sync marker on chip 2. Only the fixed 1100
-            # nibble is checked — the rest of the STATUS word now carries live
-            # lead-off/GPIO bits (see STATUS_SYNC_MASK) and legitimately varies.
-            if not _status_sync_ok(raw2):
-                return None
-
-            channels = []
-            channels.extend(self._decode_channels(raw1))
-            channels.extend(self._decode_channels(raw2))
-            return channels
+            return self.decode_frame16(raw1, raw2)
         else:
             return self.decode_frame(raw1)
+
+    def decode_frame16(self, raw1, raw2):
+        """Decode chip 1 + chip 2 frames into 16 values in µV (None if
+        rejected). Shared by read_sample() and the drdy_reader process path.
+        """
+        # Update lead-off status from both STATUS words. Done BEFORE the
+        # spike/validity gates below so a floating electrode (which reads as
+        # huge noise and is spike-rejected) still reports its "off" state.
+        self._update_leadoff(raw1, raw2)
+
+        # Spike detection: check last channel of chip 2 (bytes 24-26)
+        if not self._is_valid_frame(raw2):
+            return None
+
+        # Both frames must carry the 1100 sync marker. Only that fixed nibble
+        # is checked — the rest of the STATUS word carries live lead-off/GPIO
+        # bits (see STATUS_SYNC_MASK) and legitimately varies.
+        if not (_status_sync_ok(raw1) and _status_sync_ok(raw2)):
+            return None
+
+        return self._decode_channels(raw1) + self._decode_channels(raw2)
 
     def decode_frame(self, raw1):
         """Decode one 27-byte 8-channel frame into µV (None if rejected).
@@ -905,14 +908,19 @@ class PiEEGHardware:
         return drdy_reader.request_falling_edge_events(chip_fd, pin, consumer)
 
     def reader_handles(self):
-        """(gpiochip fd, DRDY pin, spidev fd) for the drdy_reader process.
+        """(gpiochip fd, DRDY pin, spidev fd) for the drdy_reader process;
+        a PiEEG-16 adds (chip 2 spidev fd, chip-select line fd, DRDY2 pin).
 
-        None when it can't be used: 16-channel boards read a second chip
-        with its own DRDY and chip-select sequence, which stays in-thread.
+        None when it can't be used (not open yet).
         """
-        if self._num_channels != 8 or self._spi1 is None or self._chip_fd < 0:
+        if self._spi1 is None or self._chip_fd < 0:
             return None
-        return self._chip_fd, DRDY_PIN, self._spi1.fileno()
+        if self._num_channels == 8:
+            return self._chip_fd, DRDY_PIN, self._spi1.fileno()
+        if self._spi2 is None or self._cs_fd < 0:
+            return None
+        return (self._chip_fd, DRDY_PIN, self._spi1.fileno(),
+                self._spi2.fileno(), self._cs_fd, DRDY_PIN_2)
 
     def release_drdy_level(self):
         """Free the DRDY level handle so the reader process can request the
@@ -920,6 +928,9 @@ class PiEEGHardware:
         if self._drdy_fd >= 0:
             os.close(self._drdy_fd)
             self._drdy_fd = -1
+        if self._drdy2_fd >= 0:
+            os.close(self._drdy2_fd)
+            self._drdy2_fd = -1
 
     def enable_drdy_events(self):
         """Switch chip-1 DRDY to interrupt mode (falling-edge events).

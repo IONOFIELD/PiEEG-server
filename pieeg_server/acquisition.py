@@ -74,6 +74,13 @@ class AcquisitionLoop:
         self.realtime = False        # reading thread/process got SCHED_FIFO
         self._rt_warned = False
         self._reader_mode = None     # "process" or "thread" once running
+        # PiEEG-16 chip 2 timing (reader process only; see _handle_record16)
+        self._chip2_prev = None      # (chip 1 edge ns, chip 2 edge ns)
+        self._chip2_repeats = 0      # chip 2 samples used for two frames
+        self._chip2_skips = 0        # chip 2 samples never used
+        self._chip2_skew_max_ns = 0  # largest |chip 2 - chip 1| edge time
+        self._chip2_filled = 0       # chip 2 edges the kernel dropped
+        self._chip2_rereads = 0      # chip 2 reads redone (updated mid-read)
         self._reader_announced = False
         self._nominal_ns = 1_000_000_000 / SAMPLE_RATE
         self._prev_edge_ns = None
@@ -310,6 +317,7 @@ class AcquisitionLoop:
         # restart_with_config(): the pause for the register write is not an
         # interval, and not a drop.
         self._prev_edge_ns = None
+        self._chip2_prev = None
 
         handles = self._reader_handles()
         if handles is not None:
@@ -475,15 +483,17 @@ class AcquisitionLoop:
 
     def _spawn_reader(self, handles, fs):
         """Start drdy_reader; returns (process, control write fd, data read fd)."""
-        chip_fd, pin, spi_fd = handles
+        chip_fd, pin, spi_fd = handles[:3]
+        extra = tuple(handles[3:])          # PiEEG-16: spi2 fd, cs fd, pin2
         ctrl_r, ctrl_w = os.pipe()
         data_r, data_w = os.pipe()
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-I", "-S", drdy_reader.__file__,
                  str(spi_fd), str(chip_fd), str(pin), str(fs),
-                 str(RT_PRIORITY), str(ctrl_r), str(data_w)],
-                pass_fds=(spi_fd, chip_fd, ctrl_r, data_w),
+                 str(RT_PRIORITY), str(ctrl_r), str(data_w)]
+                + [str(a) for a in extra],
+                pass_fds=(spi_fd, chip_fd, ctrl_r, data_w) + extra[:2],
                 stdin=subprocess.DEVNULL)
         except BaseException:
             for fd in (ctrl_r, ctrl_w, data_r, data_w):
@@ -507,8 +517,12 @@ class AcquisitionLoop:
                            "in-thread", e)
             return False
         self._reader_mode = "process"
-        size = drdy_reader.RECORD.size
-        unpack = drdy_reader.RECORD.unpack_from
+        if len(handles) > 3:                # PiEEG-16: chip 2 rides along
+            record, handle = drdy_reader.RECORD16, self._handle_record16
+        else:
+            record, handle = drdy_reader.RECORD, self._handle_record
+        size = record.size
+        unpack = record.unpack_from
         buf = bytearray()
         exited = False
         try:
@@ -526,7 +540,7 @@ class AcquisitionLoop:
                 buf += chunk
                 whole = len(buf) - len(buf) % size
                 for off in range(0, whole, size):
-                    self._handle_record(*unpack(buf, off))
+                    handle(*unpack(buf, off))
                 del buf[:whole]
         finally:
             os.close(ctrl_w)                # tells the reader to exit
@@ -568,6 +582,42 @@ class AcquisitionLoop:
             t = time.time() - (time.monotonic_ns() - ts_ns) / 1e9
             self._deliver(self._hw.decode_frame(list(raw)), t)
 
+    def _handle_record16(self, ts_ns, ts2_ns, kind, flags, raw):
+        """A PiEEG-16 record: the 8-ch bookkeeping, plus chip 2's timing.
+
+        Chip 2 runs on its own clock; the reader pairs each chip 1 frame with
+        the chip 2 conversion nearest in time. Between two delivered frames
+        chip 2 should have advanced as many periods as chip 1 did; one less
+        is a chip 2 sample used twice, one more a chip 2 sample skipped.
+        """
+        if kind == drdy_reader.READY:
+            self._handle_record(ts_ns, kind, raw[:drdy_reader.BYTES_PER_READ])
+            return
+        if flags & drdy_reader.FILLED:
+            self._chip2_filled += 1
+        if flags & drdy_reader.REREAD:
+            self._chip2_rereads += 1
+        if kind != drdy_reader.FRAME:
+            self._handle_record(ts_ns, kind, b"")
+            return
+        self._account_edge(ts_ns)
+        skew = ts2_ns - ts_ns
+        self._chip2_skew_max_ns = max(self._chip2_skew_max_ns, abs(skew))
+        prev = self._chip2_prev
+        if prev is not None:
+            p = self._nominal_ns
+            slip = (round((ts2_ns - prev[1]) / p)
+                    - round((ts_ns - prev[0]) / p))
+            if slip < 0:
+                self._chip2_repeats -= slip
+            else:
+                self._chip2_skips += slip
+        self._chip2_prev = (ts_ns, ts2_ns)
+        t = time.time() - (time.monotonic_ns() - ts_ns) / 1e9
+        n = drdy_reader.BYTES_PER_READ
+        self._deliver(self._hw.decode_frame16(list(raw[:n]), list(raw[n:])),
+                      t)
+
     def capture_stats(self) -> dict:
         """Drop-detection summary for the interrupt loop.
 
@@ -594,6 +644,12 @@ class AcquisitionLoop:
             "oversample": getattr(self._hw, "oversample", 1),
             "held_samples": (self._decimator.held
                              if self._decimator is not None else 0),
+            **({"chip2_repeats": self._chip2_repeats,
+                "chip2_skips": self._chip2_skips,
+                "chip2_skew_max_ms": round(self._chip2_skew_max_ns / 1e6, 3),
+                "chip2_filled_edges": self._chip2_filled,
+                "chip2_rereads": self._chip2_rereads}
+               if self._chip2_prev is not None else {}),
         }
 
     def _enqueue(self, frame: dict):

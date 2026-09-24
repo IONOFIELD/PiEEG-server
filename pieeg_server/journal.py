@@ -233,6 +233,7 @@ class JournalWriter:
         """Record until the task is cancelled (or the loop stops)."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._start_time = time.time()
+        self._stats0 = _capture_stats(self._acq)
         # Sidecar first: metadata must exist before any sample does.
         self._write_sidecar()
         logger.info("Journal started: %s (%d ch @ %d Hz)",
@@ -282,11 +283,52 @@ class JournalWriter:
                     "duration_sec": round(time.time() - self._start_time, 3),
                     "measured_rate_hz": measured_rate(
                         self.samples_written, self._first_t, self._last_t),
+                    **_timing_extra(self._stats0,
+                                    _capture_stats(self._acq)),
                 })
             except OSError as exc:
                 logger.warning("Could not finalize sidecar: %s", exc)
             logger.info("Journal stopped: %d samples -> %s",
                         self.samples_written, self.journal_path)
+
+
+def _capture_stats(acq):
+    get = getattr(acq, "capture_stats", None)
+    try:
+        return get() if callable(get) else None
+    except Exception:                       # noqa: BLE001 - metadata only
+        return None
+
+
+# What a PiEEG-16 recording's E9-E16 columns are, for whoever analyses it.
+CHIP2_TIMING = (
+    "E1-E8 and E9-E16 come from two ADS1299s on separate oscillators. Each "
+    "row holds chip 1's sample and the chip 2 conversion nearest in time, "
+    "unaltered (no interpolation). E9-E16 are offset from E1-E8 by a slow "
+    "sawtooth within +/-chip2_skew_max_ms (about half a sample), and as the "
+    "clocks drift one E9-E16 sample is used for two rows (chip2_repeats) or "
+    "left out (chip2_skips), roughly once every 10 s.")
+
+
+def _timing_extra(before, after):
+    """Sidecar fields on how the recording's samples were acquired: frames
+    lost during it and, on a PiEEG-16, chip 2's pairing (see CHIP2_TIMING).
+    Counts are over the recording only."""
+    if not after:
+        return {}
+    before = before or {}
+
+    def delta(key):
+        return int(after.get(key, 0)) - int(before.get(key, 0))
+
+    acq = {"frames_lost": delta("dropped_frames"),
+           "reader": after.get("reader")}
+    if "chip2_repeats" in after:
+        acq.update({"chip2_repeats": delta("chip2_repeats"),
+                    "chip2_skips": delta("chip2_skips"),
+                    "chip2_skew_max_ms": after.get("chip2_skew_max_ms")})
+        return {"acquisition": acq, "timing": CHIP2_TIMING}
+    return {"acquisition": acq}
 
 
 def read_journal(journal_path, sidecar_path=None):
