@@ -307,6 +307,10 @@ SCOPE_CHANGELOG = [
             "every 10-20 site the board has (E9-E16 = F3 F4 P3 P4 F7 F8 T5 T6). "
             "Saved edits are kept per board size. Lead labels stay on screen "
             "with 16 rows."),
+    ("5.3", "PiEEG-16 reads in its own realtime process like the PiEEG-8: 1 "
+            "frame lost in 16,108 (was ~3%). Channels 9-16 use the second "
+            "chip's sample nearest in time, unaltered, within ±2.3 ms of 1-8. "
+            "Each recording's summary lists frames lost and chip 2's timing."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

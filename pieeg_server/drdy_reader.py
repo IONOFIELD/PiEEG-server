@@ -1,5 +1,6 @@
 """
-Timing-critical DRDY reader for the PiEEG-8, run as its own process.
+Timing-critical DRDY reader for the PiEEG-8 and PiEEG-16, run as its own
+process.
 
 Why a separate process: at 250 SPS a sample stays readable for only ~3.6 ms
 after DRDY falls. Inside the server or the Scope, the reading thread has to
@@ -26,6 +27,23 @@ kind:
 
 It exits when its control pipe closes (the parent stopped it, or died) or
 when its output pipe breaks.
+
+PiEEG-16 (read_loop16): the second ADS1299 runs on its own oscillator, so
+its conversions slide against chip 1's (~0.4 ms/s on the bench, a full
+period every ~10 s). Each chip 1 frame is paired with the chip 2 conversion
+NEAREST in time to chip 1's edge, read as it is (no interpolation), so
+channels 9-16 are within half a period (±2 ms at 250 SPS) of 1-8, and the
+drift shows up as one chip 2 sample used twice (or skipped) per wrap. Each
+record carries chip 2's own edge time, so the parent counts every repeat
+and skip and knows the skew:
+
+    RECORD16 = <Q chip 1 edge ns> <Q chip 2 edge ns> <B kind> <B flags>
+               <54s chip 1 frame + chip 2 frame>
+
+flags: FILLED  chip 2's edge event was lost by the kernel (it happens ~1 in
+               200 while both chips are read); its time is put back one
+               period after the previous one, chip 2's clock being steady
+       REREAD  chip 2 updated during its read; it was read again at once
 """
 
 import os
@@ -34,8 +52,17 @@ import sys
 import time
 
 RECORD = struct.Struct("<QB27s")
+RECORD16 = struct.Struct("<QQBB54s")
 FRAME, LATE, TORN, READY = 0, 1, 2, 3
+FILLED, REREAD = 1, 2
 BYTES_PER_READ = 27
+# Don't start a chip 2 read this close to its next conversion (the read
+# takes ~0.15 ms; a conversion landing in it tears the bytes).
+CHIP2_MARGIN_NS = 300_000
+# Hysteresis on the nearest-conversion choice: the pairing keeps stepping one
+# chip 2 period per frame until the skew passes half a period by this much,
+# so edge jitter at the boundary can't flip it (a repeat then a skip).
+CHIP2_HYST_NS = 250_000
 
 # Linux GPIO chardev v1 (include/uapi/linux/gpio.h); hardware.py uses these too.
 GPIO_GET_LINEEVENT = 0xC030B404          # _IOWR(0xB4, 0x04, 48)
@@ -43,6 +70,8 @@ GPIOHANDLE_REQUEST_INPUT = 1 << 0
 GPIOEVENT_REQUEST_FALLING_EDGE = 1 << 1  # ADS1299 DRDY asserts LOW = data ready
 EVENT_REQUEST_SIZE = 48                  # sizeof(struct gpioevent_request)
 EVENT_DATA_SIZE = 16                     # u64 timestamp + u32 id
+GPIOHANDLE_SET_LINE_VALUES = 0xC040B409  # _IOWR(0xB4, 0x09, 64)
+HANDLE_DATA_SIZE = 64                    # sizeof(struct gpiohandle_data)
 
 _TIMESTAMP = struct.Struct("Q")
 
@@ -142,16 +171,171 @@ def read_loop(evt_fd, spi_fd, fs, ctrl_fd, out_fd, realtime=False):
         return 0
 
 
+def pick_chip2(t1, last2, now, period, prev=None):
+    """Which chip 2 conversion goes with the chip 1 edge at t1.
+
+    last2 is chip 2's newest known edge (<= now), filled in period by period
+    if the kernel dropped some. prev is the (chip 1, chip 2) edge pair used
+    last: the pairing carries on from it (one chip 2 period per chip 1
+    period) and only moves by a period once the skew passes half a period
+    plus CHIP2_HYST_NS, i.e. once per drift wrap. Returns (last2, filled,
+    wait): wait is True when the conversion to use is the next one,
+    last2 + period, or when that is due too soon to read last2 safely; the
+    caller then waits for that edge and reads it.
+    """
+    filled = 0
+    while now - last2 >= period:
+        last2 += period
+        filled += 1
+    nxt = last2 + period
+    if prev is None:
+        target = t1
+    else:
+        target = prev[1] + round((t1 - prev[0]) / period) * period
+        if target - t1 > period // 2 + CHIP2_HYST_NS:
+            target -= period
+        elif t1 - target > period // 2 + CHIP2_HYST_NS:
+            target += period
+    wait = (abs(nxt - target) < abs(target - last2)
+            or nxt - now < CHIP2_MARGIN_NS)
+    return last2, filled, wait
+
+
+def read_loop16(evt_fd, evt2_fd, spi_fd, spi2_fd, cs_fd, fs, ctrl_fd, out_fd,
+                realtime=False):
+    """read_loop for the PiEEG-16: chip 1 on its DRDY edge as before, then
+    the chip 2 sample nearest in time to that edge (see the module doc)."""
+    import fcntl
+    import select
+
+    period = int(round(1_000_000_000 / fs))
+    read_deadline_ns = max(period / 2, period - 400_000)
+    pack, write, read, now = RECORD16.pack, os.write, os.read, time.monotonic_ns
+    empty = bytes(2 * BYTES_PER_READ)
+    cs_low, cs_high = bytearray(HANDLE_DATA_SIZE), bytearray(HANDLE_DATA_SIZE)
+    cs_high[0] = 1
+
+    waiting = select.poll()
+    waiting.register(evt_fd, select.POLLIN)
+    waiting.register(ctrl_fd, select.POLLIN)
+    queued = select.poll()
+    queued.register(evt_fd, select.POLLIN)
+    queued2 = select.poll()
+    queued2.register(evt2_fd, select.POLLIN)
+
+    def edge(fd):
+        return _TIMESTAMP.unpack_from(read(fd, EVENT_DATA_SIZE))[0]
+
+    def queued_edge():
+        return edge(evt_fd) if queued.poll(0) else None
+
+    def edge2(timeout_ms=0):
+        return edge(evt2_fd) if queued2.poll(timeout_ms) else None
+
+    def read2():
+        fcntl.ioctl(cs_fd, GPIOHANDLE_SET_LINE_VALUES, cs_low)
+        try:
+            return read(spi2_fd, BYTES_PER_READ)
+        finally:
+            fcntl.ioctl(cs_fd, GPIOHANDLE_SET_LINE_VALUES, cs_high)
+
+    last2 = 0
+    prev = None                              # (chip 1, chip 2) edges last paired
+    # The chip hands a conversion out once: a second read of it returns
+    # zeros. A repeat (chip 2 behind by a sample at the wrap) reuses these.
+    got2, got2_raw = None, None
+    try:
+        write(out_fd, pack(0, 0, READY, 0,
+                           bytes([1 if realtime else 0]) + empty[1:]))
+        pending = None
+        while True:
+            if pending is None:
+                ready = waiting.poll(1000)
+                if any(fd == ctrl_fd for fd, _ in ready):
+                    return 0                 # parent closed the control pipe
+                if not ready:
+                    continue
+                ts = edge(evt_fd)
+            else:
+                ts, pending = pending, None
+
+            newer = queued_edge()
+            while newer is not None:         # this edge's data was overwritten
+                write(out_fd, pack(ts, 0, LATE, 0, empty))
+                ts, newer = newer, queued_edge()
+
+            if now() - ts > read_deadline_ns:
+                write(out_fd, pack(ts, 0, LATE, 0, empty))
+                continue
+
+            raw1 = read(spi_fd, BYTES_PER_READ)
+            read1_end = now()
+
+            # chip 2: newest edge seen, then the nearest conversion to ts
+            t2 = edge2()
+            while t2 is not None:
+                last2, t2 = t2, edge2()
+            if not last2:                    # first frame: wait for one
+                last2 = edge2(int(period / 1e6) + 1) or now()
+            flags = 0
+            last2, filled, wait = pick_chip2(ts, last2, now(), period, prev)
+            if filled:
+                flags |= FILLED
+            if wait:
+                due_ms = (last2 + period - now()) / 1e6
+                t2 = edge2(max(0, int(due_ms + 0.999)) + 1)
+                if t2 is None:
+                    last2 += period
+                    flags |= FILLED
+                else:
+                    last2 = t2
+            if got2 is not None and abs(last2 - got2) < period // 2:
+                raw2 = got2_raw              # already read: same conversion
+            else:
+                start2 = now()
+                raw2 = read2()
+                t2 = edge2()
+                if t2 is not None:
+                    if t2 >= start2:         # chip 2 updated during the read
+                        last2, raw2 = t2, read2()
+                        flags |= REREAD
+                    else:                    # a late event for what was read
+                        last2 = t2
+                got2, got2_raw = last2, raw2
+
+            prev = (ts, last2)
+            nxt = queued_edge()
+            if nxt is not None:
+                pending = nxt
+                if nxt <= read1_end:         # chip 1 updated mid-read
+                    write(out_fd, pack(ts, last2, TORN, flags, empty))
+                    continue
+            write(out_fd, pack(ts, last2, FRAME, flags, raw1 + raw2))
+    except BrokenPipeError:
+        return 0
+
+
 def main(argv):
     spi_fd, chip_fd, pin = (int(a) for a in argv[1:4])
     fs = float(argv[4])
     priority, ctrl_fd, out_fd = (int(a) for a in argv[5:8])
+    # PiEEG-16 adds: chip 2 spidev fd, chip-select line handle fd, DRDY2 pin
+    extra = [int(a) for a in argv[8:11]]
     realtime = make_realtime(priority)
     evt_fd = request_falling_edge_events(chip_fd, pin, b"pieeg_drdy_reader")
+    evt2_fd = -1
     try:
+        if extra:
+            spi2_fd, cs_fd, pin2 = extra
+            evt2_fd = request_falling_edge_events(chip_fd, pin2,
+                                                  b"pieeg_drdy2_reader")
+            return read_loop16(evt_fd, evt2_fd, spi_fd, spi2_fd, cs_fd, fs,
+                               ctrl_fd, out_fd, realtime)
         return read_loop(evt_fd, spi_fd, fs, ctrl_fd, out_fd, realtime)
     finally:
         os.close(evt_fd)
+        if evt2_fd >= 0:
+            os.close(evt2_fd)
 
 
 if __name__ == "__main__":
