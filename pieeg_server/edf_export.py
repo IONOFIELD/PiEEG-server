@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .journal import read_journal
+from .journal import read_journal, read_timing
 
 logger = logging.getLogger("pieeg.edf_export")
 
@@ -143,7 +143,39 @@ def _write_annotations(writer, annotations, fs, n_samples):
         writer.writeAnnotation(frame / fs, -1, str(a.get("text", ""))[:40])
 
 
-def _write_bdfplus(counts, meta, out_path, annotations=()):
+def prepare_export(journal_path, counts, meta):
+    """What an export writes, from the journal as recorded: (counts,
+    annotations, per-channel prefilter texts, alignment report or None).
+
+    With the journal's .timing file (recorded since Scope v5.4): a PiEEG-16's
+    chip 2 columns are put on chip 1's sample times (see align.py), and every
+    run of held rows (samples lost in acquisition, held at the last value to
+    keep the time grid) gets an annotation. Without it, the journal as is.
+    """
+    nch = int(meta["channel_count"])
+    base = meta.get("prefilter") or "raw, no filter"
+    prefilters = [base] * nch
+    annotations = list(read_annotations(journal_path))
+    timing = read_timing(journal_path, rows=counts.shape[0])
+    if timing is None:
+        return counts, annotations, prefilters, None
+    from . import align
+    t1, off2, flags = timing
+    fs = int(meta["sample_rate"])
+    report = None
+    if nch == 16:
+        counts, report = align.align_chip2(counts, t1, off2, flags,
+                                           1e9 / fs, fs)
+        if report["rows_aligned"]:
+            prefilters[8:16] = [f"{base}; {align.METHOD}"] * 8
+    for first, length in align.held_runs(flags):
+        annotations.append({
+            "frame": first, "type": "held",
+            "text": f"HELD {length} lost sample{'s' if length > 1 else ''}"})
+    return counts, annotations, prefilters, report
+
+
+def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None):
     """Write a lossless BDF+ file: journal counts ARE the digital samples.
 
     The mapping is 1:1 -- we never scale the sample values. The header carries
@@ -179,8 +211,11 @@ def _write_bdfplus(counts, meta, out_path, annotations=()):
                 "digital_max": _BDF_DIG_MAX,
                 "transducer": "",
                 # Truthful: the journal is the chip's raw output, or says
-                # which decimation filter made it (oversampling).
-                "prefilter": (meta.get("prefilter") or "raw, no filter")[:80],
+                # which decimation filter made it (oversampling), and which
+                # channels were resampled onto chip 1's times (PiEEG-16).
+                "prefilter": ((prefilters[ci] if prefilters else None)
+                              or meta.get("prefilter")
+                              or "raw, no filter")[:80],
             })
         # pyedflib warns that phys_min/max (~ +/-2.25e6) don't fit the header's
         # 8-char field and get rounded to whole microvolts. That is EXPECTED and
@@ -217,7 +252,7 @@ def _physical_range(uv_channel):
     return pmin, pmax
 
 
-def _write_edfplus(counts, meta, out_path, annotations=()):
+def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None):
     """Write EDF+ 16-bit. Per-channel adaptive range (some resolution lost)."""
     pyedflib = _require_pyedflib()
     nch = int(meta["channel_count"])
@@ -244,7 +279,8 @@ def _write_edfplus(counts, meta, out_path, annotations=()):
                 "digital_min": _EDF_DIG_MIN,
                 "digital_max": _EDF_DIG_MAX,
                 "transducer": "",
-                "prefilter": (meta.get("prefilter") or "")[:80],
+                "prefilter": ((prefilters[ci] if prefilters else None)
+                              or meta.get("prefilter") or "")[:80],
             })
         writer.setSignalHeaders(channel_info)
         # writeSamples wants one array per channel (physical uV values).
@@ -286,11 +322,14 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    annotations = read_annotations(journal_path)
+    counts, annotations, prefilters, report = prepare_export(
+        journal_path, counts, meta)
+    if report and report["rows_aligned"]:
+        logger.info("chip 2 aligned to chip 1: %s", report)
     if fmt == "bdf":
-        _write_bdfplus(counts, meta, out_path, annotations)
+        _write_bdfplus(counts, meta, out_path, annotations, prefilters)
     else:
-        _write_edfplus(counts, meta, out_path, annotations)
+        _write_edfplus(counts, meta, out_path, annotations, prefilters)
 
     logger.info("Wrote %s %s (%d ch, %d samples, %.1f s, %d annotations)",
                 fmt.upper() + "+", out_path, int(meta["channel_count"]),
@@ -313,6 +352,7 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
     journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
                                         Path(out_path))
     counts, meta = read_journal(journal_path, sidecar_path)
+    counts, annotations, _, report = prepare_export(journal_path, counts, meta)
     nch, fs = int(meta["channel_count"]), int(meta["sample_rate"])
     labels = _channel_labels(meta, nch)
     inputs = meta.get("channel_inputs") or [f"E{i}" for i in range(1, nch + 1)]
@@ -355,11 +395,13 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         "reference": (meta.get("reference")
                       or "all inputs against one shared REF electrode (SRB1)"),
         **{k: meta[k] for k in ("acquisition", "timing") if meta.get(k)},
+        **({"alignment": report} if report and report["rows_aligned"]
+           else {}),
         "channels": channels,
         "annotations": [{"time": round(int(a["frame"]) / fs, 3),
                          "frame": int(a["frame"]), "text": a.get("text", ""),
                          "type": a.get("type", "note")}
-                        for a in sorted(read_annotations(journal_path),
+                        for a in sorted(annotations,
                                         key=lambda a: a["frame"])],
         "raw": {"journal": rel(journal_path),
                 "sidecar": rel(Path(sidecar_path) if sidecar_path

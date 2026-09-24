@@ -36,6 +36,7 @@ import asyncio
 import json
 import logging
 import os
+import struct
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -166,6 +167,7 @@ class JournalWriter:
         self._out_dir = Path(out_dir)
         self.journal_path = self._out_dir / f"{session_name}.eegj"
         self.sidecar_path = self._out_dir / f"{session_name}.json"
+        self.timing_path = self._out_dir / f"{session_name}.timing"
 
         self.samples_written = 0
         self._start_time = None
@@ -213,6 +215,9 @@ class JournalWriter:
             "physical_dimension": "uV",
             "prefilter": self._prefilter,
             **({"reference": self._reference} if self._reference else {}),
+            # one TIMING record per journal row (see TIMING)
+            "timing_file": self.timing_path.name,
+            "timing_format": TIMING_FORMAT,
             "start_unix": self._start_time,
             "start_iso": (datetime.fromtimestamp(self._start_time, timezone.utc)
                           .astimezone().isoformat()) if self._start_time else None,
@@ -240,6 +245,7 @@ class JournalWriter:
                     self.journal_path, self._nch, self._fs)
 
         fh = open(self.journal_path, "wb", buffering=0)
+        tf = open(self.timing_path, "wb", buffering=0)
         try:
             while True:
                 frame = await self._queue.get()
@@ -256,6 +262,7 @@ class JournalWriter:
                     np.asarray(channels, dtype=np.float64) / self._lsb_uv
                 ).astype(JOURNAL_DTYPE)
                 fh.write(counts.tobytes())
+                tf.write(timing_record(frame))
                 self.samples_written += 1
                 t = frame.get("t")
                 if t is not None:
@@ -267,12 +274,15 @@ class JournalWriter:
                 # second. buffering=0 already avoids Python-side buffering.
                 if self.samples_written % FLUSH_EVERY == 0:
                     os.fsync(fh.fileno())
+                    os.fsync(tf.fileno())
         finally:
             try:
                 fh.flush()
                 os.fsync(fh.fileno())
+                os.fsync(tf.fileno())
             finally:
                 fh.close()
+                tf.close()
             self._acq.unsubscribe(self._queue)
             # Best-effort: record the final sample count. Recovery does NOT
             # depend on this -- edf_export derives the count from file size.
@@ -290,6 +300,48 @@ class JournalWriter:
                 logger.warning("Could not finalize sidecar: %s", exc)
             logger.info("Journal stopped: %d samples -> %s",
                         self.samples_written, self.journal_path)
+
+
+# Per-row timing beside the journal (<session>.timing): for row i,
+#   t1_ns   the DRDY edge of the sample (kernel CLOCK_MONOTONIC), 0 unknown
+#   off2_ns PiEEG-16: chip 2's conversion edge minus t1_ns; NO_OFF2 if none
+#   flags   HELD: the row stands in for a lost sample (a copy of the last)
+# The samples themselves stay exactly as acquired; this is what lets an
+# export put chip 2 on chip 1's sample times and mark the held rows.
+TIMING = struct.Struct("<qiI")
+TIMING_FORMAT = "<qiI t1_ns, off2_ns (-2**31 = none), flags (1 = held)"
+NO_OFF2 = -2 ** 31
+HELD = 1
+
+
+def timing_record(frame) -> bytes:
+    """The TIMING record for one frame from the acquisition loop."""
+    t1 = frame.get("ts_ns") or 0
+    t2 = frame.get("t2_ns")
+    off2 = t2 - t1 if (t2 and t1 and abs(t2 - t1) < 2 ** 31) else NO_OFF2
+    return TIMING.pack(t1, off2, HELD if frame.get("held") else 0)
+
+
+def read_timing(journal_path, rows=None, sidecar_path=None):
+    """(t1_ns, off2_ns, flags) arrays for a journal, or None if it has no
+    timing file (recorded before it existed). Trimmed/padded to rows."""
+    journal_path = Path(journal_path)
+    path = journal_path.with_suffix(".timing")
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    n = len(data) // TIMING.size
+    arr = np.frombuffer(data[:n * TIMING.size],
+                        dtype=np.dtype([("t1", "<i8"), ("off2", "<i4"),
+                                        ("flags", "<u4")]))
+    if rows is not None:
+        if n < rows:                        # crash between the two writes
+            pad = np.zeros(rows - n, dtype=arr.dtype)
+            pad["off2"] = NO_OFF2
+            arr = np.concatenate([arr, pad])
+        arr = arr[:rows]
+    return (arr["t1"].astype(np.int64), arr["off2"].astype(np.int64),
+            arr["flags"].astype(np.int64))
 
 
 def _capture_stats(acq):

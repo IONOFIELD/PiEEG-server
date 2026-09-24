@@ -311,6 +311,11 @@ SCOPE_CHANGELOG = [
             "frame lost in 16,108 (was ~3%). Channels 9-16 use the second "
             "chip's sample nearest in time, unaltered, within ±2.3 ms of 1-8. "
             "Each recording's summary lists frames lost and chip 2's timing."),
+    ("5.4", "PiEEG-16 BDF+ files are time-aligned: E9-E16 are resampled onto "
+            "E1-E8's sample times from the recorded edge times (within "
+            "±0.09 ms on the bench, was ±2 ms); E1-E8 stay bit-exact. A lost "
+            "sample now holds the last value so the time grid never shifts, "
+            "and each one is marked by a HELD note in the file."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

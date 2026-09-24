@@ -84,8 +84,11 @@ def test_parent_counts_chip2_repeats_and_skips():
     # chip 2 two conversions on: a skip
     acq._handle_record16(t0 + 3 * P, t0 + 3 * P + MS, ff, 0, _raw(4, 4))
     acq._handle_record16(t0 + 4 * P, 0, rdr.TORN, 0, bytes(54))
+    # the torn frame is held (a copy of the last row, flagged)
     assert [f["channels"][:2] for f in loop_got] == [
-        [1.0, 1.0], [2.0, 2.0], [3.0, 2.0], [4.0, 4.0]]
+        [1.0, 1.0], [2.0, 2.0], [3.0, 2.0], [4.0, 4.0], [4.0, 4.0]]
+    assert loop_got[-1]["held"] and "t2_ns" not in loop_got[-1]
+    assert loop_got[2]["t2_ns"] == t0 + P + MS
     s = acq.capture_stats()
     assert (s["chip2_repeats"], s["chip2_skips"], s["chip2_filled_edges"],
             s["torn_reads"], s["dropped_frames"]) == (1, 1, 1, 1, 1)
