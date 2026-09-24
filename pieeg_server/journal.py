@@ -218,6 +218,10 @@ class JournalWriter:
             # one TIMING record per journal row (see TIMING)
             "timing_file": self.timing_path.name,
             "timing_format": TIMING_FORMAT,
+            # wall clock <-> CLOCK_MONOTONIC (the .timing edge times) at the
+            # start, so an export can put each sample on the wall clock
+            **({"clock": self._clock0} if getattr(self, "_clock0", None)
+               else {}),
             "start_unix": self._start_time,
             "start_iso": (datetime.fromtimestamp(self._start_time, timezone.utc)
                           .astimezone().isoformat()) if self._start_time else None,
@@ -238,6 +242,7 @@ class JournalWriter:
         """Record until the task is cancelled (or the loop stops)."""
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._start_time = time.time()
+        self._clock0 = clock_pair()
         self._stats0 = _capture_stats(self._acq)
         # Sidecar first: metadata must exist before any sample does.
         self._write_sidecar()
@@ -293,6 +298,7 @@ class JournalWriter:
                     "duration_sec": round(time.time() - self._start_time, 3),
                     "measured_rate_hz": measured_rate(
                         self.samples_written, self._first_t, self._last_t),
+                    "clock_stop": clock_pair(),
                     **_timing_extra(self._stats0,
                                     _capture_stats(self._acq)),
                 })
@@ -342,6 +348,26 @@ def read_timing(journal_path, rows=None, sidecar_path=None):
         arr = arr[:rows]
     return (arr["t1"].astype(np.int64), arr["off2"].astype(np.int64),
             arr["flags"].astype(np.int64))
+
+
+NTP_SYNCED_FLAG = Path("/run/systemd/timesync/synchronized")
+
+
+def clock_pair():
+    """Wall clock and CLOCK_MONOTONIC read at (nearly) the same instant: the
+    closest of a few tries, with how far apart the two reads were. Plus
+    whether systemd-timesyncd had the wall clock synchronized (the Pi 4 has
+    no battery clock; offline, its wall time after a boot can be wrong)."""
+    best = None
+    for _ in range(5):
+        m0 = time.monotonic_ns()
+        u = time.time_ns()
+        m1 = time.monotonic_ns()
+        if best is None or m1 - m0 < best[2]:
+            best = (u, (m0 + m1) // 2, m1 - m0)
+    return {"unix_ns": best[0], "monotonic_ns": best[1],
+            "uncertainty_ns": best[2],
+            "ntp_synchronized": NTP_SYNCED_FLAG.exists()}
 
 
 def _capture_stats(acq):
