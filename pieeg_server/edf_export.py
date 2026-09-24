@@ -352,7 +352,8 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
         "measured_rate_hz": meta.get("measured_rate_hz"),
         "gain": meta.get("gain"),
         "prefilter": meta.get("prefilter") or "raw, no filter",
-        "reference": "all inputs against one shared REF electrode (SRB1)",
+        "reference": (meta.get("reference")
+                      or "all inputs against one shared REF electrode (SRB1)"),
         "channels": channels,
         "annotations": [{"time": round(int(a["frame"]) / fs, 3),
                          "frame": int(a["frame"]), "text": a.get("text", ""),

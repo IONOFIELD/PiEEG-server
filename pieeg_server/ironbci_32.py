@@ -239,6 +239,18 @@ class IronBCI32Hardware:
         # Not negotiated over the wire.
         return DEFAULT_SAMPLE_RATE
 
+    # The front end's fixed scale, in the same terms the PiEEG reports from
+    # its registers, so recordings derive this board's count -> µV step
+    # (Vref / (gain · (2^23 - 1)) = SCALE_UV) and ±Vref/gain range from it
+    # instead of the ADS1299's 4.5 V / x24.
+    @property
+    def pga_gain(self) -> int:
+        return int(ADS_GAIN)
+
+    @property
+    def vref_uv(self) -> float:
+        return ADS_VREF * 1e6
+
     @property
     def spike_threshold(self) -> int:
         return self._spike_threshold
