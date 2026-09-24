@@ -76,6 +76,7 @@ class AcquisitionLoop:
         self._reader_mode = None     # "process" or "thread" once running
         # PiEEG-16 chip 2 timing (reader process only; see _handle_record16)
         self._chip2_prev = None      # (chip 1 edge ns, chip 2 edge ns)
+        self._last_emitted = None    # (sample, t, ts_ns): what a hold repeats
         self._chip2_repeats = 0      # chip 2 samples used for two frames
         self._chip2_skips = 0        # chip 2 samples never used
         self._chip2_skew_max_ns = 0  # largest |chip 2 - chip 1| edge time
@@ -318,6 +319,7 @@ class AcquisitionLoop:
         # interval, and not a drop.
         self._prev_edge_ns = None
         self._chip2_prev = None
+        self._last_emitted = None           # no hold across a restart
 
         handles = self._reader_handles()
         if handles is not None:
@@ -386,11 +388,27 @@ class AcquisitionLoop:
         self._dropped_frames += n
         if self._decimator is not None:
             for sample, t in self._decimator.hold(n):
-                self._emit(sample, t)
+                self._emit(sample, t, held=True)
+            return
+        # Keep the time grid: a lost sample becomes a copy of the last one,
+        # flagged "held" so recordings mark it (a dropped row would shift
+        # everything after it by a sample period).
+        last = self._last_emitted
+        if last is None or self._settle_remaining > 0:
+            return
+        sample, t, ts_ns = last
+        period_s = self._nominal_ns / 1e9
+        for j in range(1, int(n) + 1):
+            self._emit(sample, t + j * period_s,
+                       ts_ns=(None if ts_ns is None
+                              else ts_ns + round(j * self._nominal_ns)),
+                       held=True)
 
-    def _deliver(self, sample, t):
+    def _deliver(self, sample, t, ts_ns=None, t2_ns=None):
         """Pass one read on: count a rejected read, drop settling frames,
-        otherwise decimate (when oversampling), filter, number, enqueue."""
+        otherwise decimate (when oversampling), filter, number, enqueue.
+        ts_ns is the sample's DRDY edge (kernel CLOCK_MONOTONIC ns) and, on a
+        PiEEG-16, t2_ns the edge of the chip 2 conversion in it."""
         if sample is None:
             self._bad_frames += 1
             self._lost(1)
@@ -405,9 +423,10 @@ class AcquisitionLoop:
             if out is None:
                 return
             sample, t = out
-        self._emit(sample, t)
+            ts_ns = t2_ns = None            # a decimated output has no edge
+        self._emit(sample, t, ts_ns=ts_ns, t2_ns=t2_ns)
 
-    def _emit(self, sample, t):
+    def _emit(self, sample, t, ts_ns=None, t2_ns=None, held=False):
         sample = self._hampel.apply(sample)
         self._sample_count += 1
         frame = {
@@ -415,6 +434,16 @@ class AcquisitionLoop:
             "n": self._sample_count,
             "channels": sample,
         }
+        # Timing for recordings (journal .timing file): the chip's own edge
+        # times, and whether this row stands in for a lost sample.
+        if ts_ns is not None:
+            frame["ts_ns"] = ts_ns
+        if t2_ns is not None:
+            frame["t2_ns"] = t2_ns
+        if held:
+            frame["held"] = True
+        # the next hold repeats this sample one period after this row
+        self._last_emitted = (sample, t, ts_ns)
         self._loop.call_soon_threadsafe(self._enqueue, frame)
 
     def _finish_streaming(self):
@@ -469,7 +498,9 @@ class AcquisitionLoop:
                         self._lost(1)
                         self._torn_reads += 1
                         continue
-                self._deliver(sample, time.time())
+                t2 = getattr(self._hw, "_drdy2_read_ns", 0) or None
+                self._deliver(sample, time.time(), ts_ns=ts_ns,
+                              t2_ns=t2 if self.num_channels == 16 else None)
         finally:
             self._finish_streaming()
 
@@ -580,7 +611,7 @@ class AcquisitionLoop:
         else:
             # Wall-clock time of the edge itself, not of this (later) decode.
             t = time.time() - (time.monotonic_ns() - ts_ns) / 1e9
-            self._deliver(self._hw.decode_frame(list(raw)), t)
+            self._deliver(self._hw.decode_frame(list(raw)), t, ts_ns=ts_ns)
 
     def _handle_record16(self, ts_ns, ts2_ns, kind, flags, raw):
         """A PiEEG-16 record: the 8-ch bookkeeping, plus chip 2's timing.
@@ -616,7 +647,7 @@ class AcquisitionLoop:
         t = time.time() - (time.monotonic_ns() - ts_ns) / 1e9
         n = drdy_reader.BYTES_PER_READ
         self._deliver(self._hw.decode_frame16(list(raw[:n]), list(raw[n:])),
-                      t)
+                      t, ts_ns=ts_ns, t2_ns=ts2_ns)
 
     def capture_stats(self) -> dict:
         """Drop-detection summary for the interrupt loop.

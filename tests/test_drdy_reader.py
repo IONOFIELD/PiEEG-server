@@ -159,8 +159,12 @@ class TestParentRecords:
         acq._handle_record(t0 + 3 * period, rdr.FRAME, bytes(27))   # bad sync
         acq._handle_record(t0 + 5 * period, rdr.FRAME, _frame(11))  # one edge missed
         loop.close()
-        assert [f["channels"][0] for f in got] == [10.0, 11.0]
-        assert [f["n"] for f in got] == [1, 2]
+        # the 4 lost samples (late, torn, bad sync, missed edge) are held
+        # copies of the last one, so the row grid stays on the chip's clock
+        assert [f["channels"][0] for f in got] == [10.0] * 5 + [11.0]
+        assert [f.get("held", False) for f in got] == [False] + [True] * 4 + [False]
+        assert [f["ts_ns"] for f in got] == [t0 + k * period for k in range(6)]
+        assert [f["n"] for f in got] == [1, 2, 3, 4, 5, 6]
         s = acq.capture_stats()
         assert (s["drdy_events"], s["late_skips"], s["torn_reads"],
                 s["bad_frames"], s["gap_count"]) == (5, 1, 1, 1, 1)
