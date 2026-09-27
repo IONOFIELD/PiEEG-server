@@ -388,6 +388,15 @@ CHIP2_TIMING = (
     "left out (chip2_skips), roughly once every 10 s.")
 
 
+# What an IronBCI-32 recording's times are, for whoever analyses it.
+SERIAL_TIMING = (
+    "IronBCI-32 samples arrive over USB serial with no per-sample clock from "
+    "the board; rows are its frames in order, spaced at the board rate "
+    "measured against the Pi clock when the stream opened (board_rate_hz). "
+    "Frames the board's counter shows as lost are held (the previous sample "
+    "repeated, held_samples) so later samples keep their place in time.")
+
+
 def _timing_extra(before, after):
     """Sidecar fields on how the recording's samples were acquired: frames
     lost during it and, on a PiEEG-16, chip 2's pairing (see CHIP2_TIMING).
@@ -401,6 +410,18 @@ def _timing_extra(before, after):
 
     acq = {"frames_lost": delta("dropped_frames"),
            "reader": after.get("reader")}
+    if "serial" in after:
+        # IronBCI-32: lost frames are found by the board's frame counter
+        # and held (the previous sample repeated) so the grid never shifts.
+        s0, s1 = before.get("serial") or {}, after["serial"]
+        lost = int(s1.get("lost_frames", 0)) - int(s0.get("lost_frames", 0))
+        acq.update({"frames_lost": acq["frames_lost"] + lost,
+                    "held_samples": lost,
+                    "resyncs": (int(s1.get("resyncs", 0))
+                                - int(s0.get("resyncs", 0))),
+                    "counter_step": s1.get("counter_step"),
+                    "board_rate_hz": s1.get("measured_rate_hz")})
+        return {"acquisition": acq, "timing": SERIAL_TIMING}
     if "chip2_repeats" in after:
         acq.update({"chip2_repeats": delta("chip2_repeats"),
                     "chip2_skips": delta("chip2_skips"),

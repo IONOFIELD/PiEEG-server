@@ -688,6 +688,8 @@ class AcquisitionLoop:
                 "chip2_filled_edges": self._chip2_filled,
                 "chip2_rereads": self._chip2_rereads}
                if self._chip2_prev is not None else {}),
+            **({"serial": self._hw.serial_stats()}
+               if hasattr(self._hw, "serial_stats") else {}),
         }
 
     def _enqueue(self, frame: dict):
