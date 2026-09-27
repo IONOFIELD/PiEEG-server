@@ -421,6 +421,8 @@ def _timing_extra(before, after):
                                 - int(s0.get("resyncs", 0))),
                     "counter_step": s1.get("counter_step"),
                     "board_rate_hz": s1.get("measured_rate_hz")})
+        if s1.get("board_warning"):
+            acq["board_warning"] = s1["board_warning"]
         return {"acquisition": acq, "timing": SERIAL_TIMING}
     if "chip2_repeats" in after:
         acq.update({"chip2_repeats": delta("chip2_repeats"),

@@ -101,6 +101,22 @@ READ_CHUNK = 2048
 # the last sample is HELD in their place so the time grid never shifts.
 COUNTER_LEARN = 16
 
+# --- Reconnect --------------------------------------------------------------
+RECONNECT_POLL_S = 0.5        # how often to look for the board once it drops
+MAX_HOLD_S = 60.0             # longest outage held on the grid
+
+
+def _ranges(nums: list[int]) -> str:
+    """[3, 4, 5, 8] -> "3-5, 8"."""
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(f"{nums[i]}-{nums[j]}" if j > i else f"{nums[i]}")
+        i = j + 1
+    return ", ".join(out)
+
 
 def snap_rate(measured: float) -> int:
     """Nearest standard rate within RATE_SNAP_TOL, else the rounded value."""
@@ -248,6 +264,9 @@ class IronBCI32Hardware:
         self._rate_probe_s = rate_probe_s
         self._sample_rate = DEFAULT_SAMPLE_RATE
         self._measured_rate: float | None = None
+        self._board_warning: str | None = None
+        self._usb_serial: str | None = None
+        self._disconnects = 0
         self._reset_counters()
         # Shared spike-filter knobs (kept identical to other drivers).
         self._spike_threshold = 5000
@@ -275,6 +294,12 @@ class IronBCI32Hardware:
         return self._measured_rate
 
     @property
+    def board_warning(self) -> str | None:
+        """What looked wrong with the board when it connected (an odd frame
+        rate, inputs reading exactly zero), or None. Checked by open()."""
+        return self._board_warning
+
+    @property
     def lost_frames(self) -> int:
         """Frames the counter says never arrived (held in the stream)."""
         return self._lost_frames
@@ -289,6 +314,8 @@ class IronBCI32Hardware:
             "counter_glitches": self._counter_glitches,
             "measured_rate_hz": (None if self._measured_rate is None
                                  else round(self._measured_rate, 3)),
+            "board_warning": self._board_warning,
+            "disconnects": self._disconnects,
         }
 
     # The front end's fixed scale, in the same terms the PiEEG reports from
@@ -512,6 +539,7 @@ class IronBCI32Hardware:
         self._bytes_received = 0
         self._frames_decoded = 0
         self._reset_counters()
+        self._usb_serial = self._usb_serial_number(self._serial_port)
         self._reader_thread = threading.Thread(
             target=self._read_loop, name="ironbci32-reader", daemon=True,
         )
@@ -519,6 +547,9 @@ class IronBCI32Hardware:
         self._connected = True
         if self._rate_probe_s > 0:
             self._measure_rate(self._rate_probe_s)
+            self._board_warning = self._check_board()
+            if self._board_warning:
+                logger.warning("IronBCI-32: %s", self._board_warning)
         logger.info(
             "IronBCI-32: streaming at %d Hz, %d channels (frame size auto-detect)",
             self.sample_rate, self._num_channels,
@@ -534,6 +565,91 @@ class IronBCI32Hardware:
         self._first_frame_t: float | None = None
         self._rate_mark0: tuple[int, float] | None = None
         self._rate_mark: tuple[int, float] | None = None
+
+    def _usb_serial_number(self, path: str) -> str | None:
+        try:
+            from serial.tools import list_ports
+            for p in list_ports.comports():
+                if p.device == path:
+                    return p.serial_number
+        except Exception:                   # noqa: BLE001 - best-effort
+            pass
+        return None
+
+    def _find_same_board(self) -> str | None:
+        """Where this board is now: the port with its USB serial number (a
+        reconnect can land on ttyACM1), else its old path if that is back."""
+        try:
+            from serial.tools import list_ports
+            ports = list(list_ports.comports())
+        except Exception:                   # noqa: BLE001
+            ports = []
+        if self._usb_serial:
+            for p in ports:
+                if p.serial_number == self._usb_serial:
+                    return p.device
+            return None
+        return self._serial_port if any(
+            p.device == self._serial_port for p in ports) else None
+
+    def _reconnect(self, err) -> "serial.Serial | None":
+        """The port failed (board unplugged, reset or power-cycled): close
+        it, wait for the same board to come back, reopen it. The time it was
+        away is HELD (last sample repeated, counted as lost frames) so later
+        samples keep their place on the time grid, as for any lost frame."""
+        mark = self._rate_mark
+        logger.warning("IronBCI-32: lost %s (%s) — waiting for the board",
+                       self._serial_port, err)
+        try:
+            self._port.close()
+        except Exception:                   # noqa: BLE001
+            pass
+        while not self._stop_event.wait(RECONNECT_POLL_S):
+            path = self._find_same_board()
+            if path is None:
+                continue
+            try:
+                port = serial.Serial(path, self._baudrate,
+                                     timeout=self._timeout)
+            except Exception:               # noqa: BLE001 - not ready yet
+                continue
+            gap_s = time.monotonic() - (mark[1] if mark else time.monotonic())
+            held = min(int(round(gap_s * self._sample_rate)),
+                       int(MAX_HOLD_S * self._sample_rate))
+            if held and self._last_sample is not None:
+                self._buffer.extend([self._last_sample] * held)
+                self._lost_frames += held
+            self._counter_prev = None       # a fresh start, not a gap
+            self._port = port
+            self._serial_port = path
+            self._disconnects += 1
+            note = (f"USB dropped at {time.strftime('%H:%M:%S')} for "
+                    f"{gap_s:.1f} s")
+            self._board_warning = "; ".join(
+                w for w in (self._board_warning, note) if w)
+            logger.warning("IronBCI-32: back on %s after %.1f s (%d samples "
+                           "held)", path, gap_s, held)
+            return port
+        return None
+
+    def _check_board(self) -> str | None:
+        """Look over the frames buffered while the rate was counted. A
+        healthy board runs at a standard rate with every input varying;
+        after a bad power-up it has been seen at 878.8 frames/s with 24 of
+        its 32 inputs reading exactly zero."""
+        problems = []
+        if (self._measured_rate is not None
+                and self._sample_rate not in STANDARD_RATES):
+            problems.append(f"odd rate {self._measured_rate:.1f} SPS")
+        rows = list(self._buffer)
+        if len(rows) >= 50:
+            dead = [ch + 1 for ch in range(self._num_channels)
+                    if all(r[ch] == 0.0 for r in rows)]
+            if dead:
+                problems.append(f"{len(dead)} inputs read 0 ({_ranges(dead)})")
+        if not problems:
+            return None
+        return "; ".join(problems) + " - power-cycle the board"
 
     def _measure_rate(self, probe_s: float) -> None:
         """Block until probe_s of frames have been counted, then set
@@ -657,7 +773,12 @@ class IronBCI32Hardware:
                 waiting = getattr(port, "in_waiting", READ_CHUNK)
                 chunk = self._read_bytes(min(READ_CHUNK, max(1, waiting)))
             except Exception as e:
-                logger.warning("IronBCI-32 serial read error: %s", e)
+                # Unplugged or reset: without this the loop spun on the dead
+                # port (thousands of errors a second) and never recovered.
+                port = self._reconnect(e)
+                if port is None:
+                    break
+                rx.clear()
                 continue
             # Less than a full chunk waiting means no backlog is left: frames
             # now arrive at the board's pace, so the rate count may start.

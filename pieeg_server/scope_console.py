@@ -331,6 +331,12 @@ SCOPE_CHANGELOG = [
             "15 = Cz … 32 = POz, 10-10 names) on screen and in recordings. "
             "Its montages are the full 18-row ACNS chains with the midline "
             "(Fz-Cz, Cz-Pz); the other 10-10 sites can be added as rows."),
+    ("5.8", "Traces are coloured by type: EEG blue, EKG/ECG rows red, EMG "
+            "rows white (from the row name). Sensitivity starts at 20 µV/mm. "
+            "An IronBCI-32 that comes up wrong (odd rate, dead inputs) gets a "
+            "red BOARD banner, repeated at REC and saved in the recording "
+            "summary. If its USB drops, the Scope waits for the same board, "
+            "reconnects and holds the gap on the time grid."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -992,6 +998,7 @@ def main(argv=None):
                             "changelog": SCOPE_CHANGELOG},
              full_scale_uv=acq.vref_uv / (acq.pga_gain or 24),
              recordings_dir=str(args.recordings_dir),
+             board_warning=getattr(hw, "board_warning", None),
              auto_close_ms=(int(args.seconds * 1000) if args.seconds else None)),
         leadoff=_contact_source(hw),
         record_status=_record_status,
