@@ -27,7 +27,7 @@ MONTAGES (bipolar, sized to the board: 8 inputs, or 16 on a PiEEG-16)
     what "bipolar" means. Four presets ship in code and are READ-ONLY:
     Adaptive (the default: the double banana at the board's size), Double
     banana, Transverse, Circumferential, each drawn from every site the board
-    has (MONTAGE_PRESETS / MONTAGE_PRESETS_16). Right-click a lead to edit
+    has (MONTAGE_PRESETS / _16 / _32). Right-click a lead to edit
     YOUR copy of the current montage (rename / hide / reorder; Custom rows can
     also be removed). Edits mark the montage dirty — the picker shows a star,
     e.g. "Transverse*" — and the Save button persists them to
@@ -116,20 +116,55 @@ MONTAGE_PRESETS_16: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
+# The same three over the IronBCI-32's 32 sites (10-10 names from its
+# electrode map, see scope_console._IRONBCI32_ELECTRODES). It has the midline,
+# so these are the full 18-row ACNS chains, in the same order as the 16-site
+# set with the midline last. Its other 10-10 sites (FT7, CP3, POz …) are
+# recorded; add rows for them from the channel box.
+MONTAGE_PRESETS_32: dict[str, list[tuple[str, str]]] = {
+    "Double banana": [
+        ("Fp1", "F7"), ("F7", "T7"), ("T7", "P7"), ("P7", "O1"),
+        ("Fp1", "F3"), ("F3", "C3"), ("C3", "P3"), ("P3", "O1"),
+        ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"), ("P8", "O2"),
+        ("Fp2", "F4"), ("F4", "C4"), ("C4", "P4"), ("P4", "O2"),
+        ("Fz", "Cz"), ("Cz", "Pz"),
+    ],
+    "Transverse": [
+        ("F7", "Fp1"), ("Fp1", "Fp2"), ("Fp2", "F8"),
+        ("F7", "F3"), ("F3", "Fz"), ("Fz", "F4"), ("F4", "F8"),
+        ("T7", "C3"), ("C3", "Cz"), ("Cz", "C4"), ("C4", "T8"),
+        ("P7", "P3"), ("P3", "Pz"), ("Pz", "P4"), ("P4", "P8"),
+        ("P7", "O1"), ("O1", "O2"), ("O2", "P8"),
+    ],
+    "Circumferential": [
+        ("Fp1", "Fp2"), ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"),
+        ("P8", "O2"), ("O2", "O1"), ("O1", "P7"), ("P7", "T7"),
+        ("T7", "F7"), ("F7", "Fp1"),
+    ],
+}
+
 # The double banana sized to the board that was found: the 8-site one on a
-# PiEEG-8, the 16-site one on a PiEEG-16. The default montage.
+# PiEEG-8, the 16-site one on a PiEEG-16, the 32-site one on an IronBCI-32.
+# The default montage.
 ADAPTIVE_MONTAGE = "Adaptive"
 
 
 def presets_for(electrodes):
-    """The preset set for this electrode map: the 16-site one when every one
-    of its sites is an input, else the 8-site one. So the montages grow with
-    the board (8 rows on a PiEEG-8, 16 on a PiEEG-16) with no setting."""
+    """The preset set for this electrode map: the largest set (32, 16, then
+    8 sites) whose every site is an input. So the montages grow with the
+    board (8 rows on a PiEEG-8, 16 on a PiEEG-16, 18 on an IronBCI-32) with
+    no setting."""
     sites = set(electrodes)
-    if all(a in sites and b in sites
-           for rows in MONTAGE_PRESETS_16.values() for a, b in rows):
-        return MONTAGE_PRESETS_16
+    for presets in (MONTAGE_PRESETS_32, MONTAGE_PRESETS_16):
+        if all(a in sites and b in sites
+               for rows in presets.values() for a, b in rows):
+            return presets
     return MONTAGE_PRESETS
+
+
+# Saved row edits are keyed apart per preset set (see ViewerModel).
+_ROWS_PREFIX = {id(MONTAGE_PRESETS): "", id(MONTAGE_PRESETS_16): "16ch/",
+                id(MONTAGE_PRESETS_32): "32ch/"}
 
 
 DEFAULT_MONTAGE = ADAPTIVE_MONTAGE
@@ -532,12 +567,12 @@ class ViewerModel:
         # each montage keeps its own, saved with its rows.
         self.session_filters: dict[str, tuple] = {}
         self.store = store          # MontageStore or None (in-memory only)
-        # 8- or 16-site presets, whichever this board's inputs can show.
+        # 8-, 16- or 32-site presets, whichever this board's inputs can show.
         self.presets = presets_for(self.electrodes)
         # Saved row edits are kept apart per preset set, so an 8-channel
         # montage saved on a PiEEG-8 never replaces the 16-channel one (its
         # rows would all still be valid sites). Filters are shared by name.
-        self.rows_prefix = "" if self.presets is MONTAGE_PRESETS else "16ch/"
+        self.rows_prefix = _ROWS_PREFIX[id(self.presets)]
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
 

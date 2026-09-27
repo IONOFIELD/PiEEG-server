@@ -327,14 +327,32 @@ SCOPE_CHANGELOG = [
             "of in ~80 ms clumps, frames lost on the USB link are found by the "
             "board's counter and held on the time grid (counted in the "
             "recording summary), and 32-channel CSVs name all 32 columns."),
+    ("5.7", "IronBCI-32 inputs carry the board's own sites (1 = F7, 12 = Fp1, "
+            "15 = Cz … 32 = POz, 10-10 names) on screen and in recordings. "
+            "Its montages are the full 18-row ACNS chains with the midline "
+            "(Fz-Cz, Cz-Pz); the other 10-10 sites can be added as rows."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
-# ch1..chN -> scalp labels used by the viewer's montages (first 8 are named).
-# Inputs 17-32 (IronBCI-32) have no agreed site yet, so they go by input.
-_ELECTRODES = (["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
-                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
-               + [f"E{i}" for i in range(17, 33)])
+# ch1..chN -> scalp labels used by the viewer's montages and recordings.
+# PiEEG-8/16: the harness order, first 8 = the 8-channel hookup.
+_ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
+               "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
+# IronBCI-32: its own input -> site map (10-10 names), from the board's
+# electrode location drawing (pieeg-club/ironbci-32 images/Electrode_Location
+# .png). REF and BIAS are the ear clips.
+_IRONBCI32_ELECTRODES = [
+    "F7", "FT7", "T7", "TP7", "P7", "O1", "P3", "CP3",          # 1-8
+    "C3", "FC3", "F3", "Fp1", "Fz", "FCz", "Cz", "CPz",         # 9-16
+    "Pz", "Oz", "O2", "P4", "CP4", "C4", "FC4", "F4",           # 17-24
+    "Fp2", "F8", "FT8", "T8", "TP8", "P8", "Fpz", "POz",        # 25-32
+]
+
+
+def _electrodes(device: str, num_ch: int) -> list[str]:
+    if device == "ironbci32":
+        return list(_IRONBCI32_ELECTRODES)
+    return _ELECTRODES[:num_ch]
 
 
 def _num_channels(device: str) -> int:
@@ -738,7 +756,7 @@ def main(argv=None):
 
     num_ch = _num_channels(args.device)
     fs = _sample_rate(args.device)
-    electrodes = _ELECTRODES[:num_ch]
+    electrodes = _electrodes(args.device, num_ch)
 
     # ---- hardware ---------------------------------------------------------- #
     ble = args.device == "ironbci8"
