@@ -80,9 +80,34 @@ SCALE_UV = ADS_VREF / FULL_SCALE / ADS_GAIN * 1_000_000.0  # ≈ 0.03725 µV / L
 DEFAULT_BAUDRATE = 921_600
 DEFAULT_READ_TIMEOUT = 1.0    # seconds
 DEFAULT_BUFFER_LIMIT = 8192   # max samples to keep in buffer (~16 s @ 500 Hz)
-DEFAULT_SAMPLE_RATE = 500     # Hz — firmware-fixed (BrainFlow descriptor: 512)
+DEFAULT_SAMPLE_RATE = 500     # Hz — used only if the rate can't be measured
 # How long to wait after the first byte before declaring a stall.
 _STALL_WARN_AFTER_S = 2.0
+
+# --- Measured rate ----------------------------------------------------------
+# Sources disagree on the rate (driver notes ~500 SPS, BrainFlow's descriptor
+# 512, the upstream README 250), so open() counts frames against the Pi's
+# monotonic clock and snaps to the nearest standard rate. USB-CDC hands bytes
+# over in ~1 ms chunks, so a 2 s count lands well inside the snap tolerance.
+STANDARD_RATES = (250, 256, 500, 512, 1000, 1024, 2000, 2048, 4000, 8000)
+RATE_SNAP_TOL = 0.02          # ±2 %
+RATE_PROBE_S = 2.0            # counting window
+RATE_SKIP_S = 0.3             # ignore the first frames (stale USB backlog)
+READ_CHUNK = 2048
+
+# --- Frame counter ----------------------------------------------------------
+# The byte after 0xA0 counts frames. Its step is learned from the first
+# frames; a larger jump afterwards means frames were lost on the wire, and
+# the last sample is HELD in their place so the time grid never shifts.
+COUNTER_LEARN = 16
+
+
+def snap_rate(measured: float) -> int:
+    """Nearest standard rate within RATE_SNAP_TOL, else the rounded value."""
+    best = min(STANDARD_RATES, key=lambda r: abs(measured / r - 1.0))
+    if abs(measured / best - 1.0) <= RATE_SNAP_TOL:
+        return best
+    return int(round(measured))
 
 
 def _require_pyserial():
@@ -197,6 +222,7 @@ class IronBCI32Hardware:
         baudrate: int = DEFAULT_BAUDRATE,
         timeout: float = DEFAULT_READ_TIMEOUT,
         buffer_limit: int = DEFAULT_BUFFER_LIMIT,
+        rate_probe_s: float = RATE_PROBE_S,
     ) -> None:
         if num_channels != NUM_CHANNELS:
             raise ValueError(
@@ -219,6 +245,10 @@ class IronBCI32Hardware:
         self._dropped_frames = 0
         self._bytes_received = 0
         self._frames_decoded = 0
+        self._rate_probe_s = rate_probe_s
+        self._sample_rate = DEFAULT_SAMPLE_RATE
+        self._measured_rate: float | None = None
+        self._reset_counters()
         # Shared spike-filter knobs (kept identical to other drivers).
         self._spike_threshold = 5000
         self._spike_reset_after = 50
@@ -235,9 +265,31 @@ class IronBCI32Hardware:
 
     @property
     def sample_rate(self) -> int:
-        # Firmware-fixed (~500 SPS, BrainFlow's board descriptor lists 512).
-        # Not negotiated over the wire.
-        return DEFAULT_SAMPLE_RATE
+        # Firmware-fixed, not negotiated over the wire: measured by open()
+        # (snapped to a standard rate); DEFAULT_SAMPLE_RATE until then.
+        return self._sample_rate
+
+    @property
+    def measured_rate(self) -> float | None:
+        """Frames per second counted by open(), before snapping."""
+        return self._measured_rate
+
+    @property
+    def lost_frames(self) -> int:
+        """Frames the counter says never arrived (held in the stream)."""
+        return self._lost_frames
+
+    def serial_stats(self) -> dict:
+        """Wire-level health for capture stats and recordings."""
+        return {
+            "frames_decoded": self._frames_decoded,
+            "lost_frames": self._lost_frames,
+            "resyncs": self._dropped_frames,
+            "counter_step": self._counter_step,
+            "counter_glitches": self._counter_glitches,
+            "measured_rate_hz": (None if self._measured_rate is None
+                                 else round(self._measured_rate, 3)),
+        }
 
     # The front end's fixed scale, in the same terms the PiEEG reports from
     # its registers, so recordings derive this board's count -> µV step
@@ -459,15 +511,85 @@ class IronBCI32Hardware:
         self._dropped_frames = 0
         self._bytes_received = 0
         self._frames_decoded = 0
+        self._reset_counters()
         self._reader_thread = threading.Thread(
             target=self._read_loop, name="ironbci32-reader", daemon=True,
         )
         self._reader_thread.start()
         self._connected = True
+        if self._rate_probe_s > 0:
+            self._measure_rate(self._rate_probe_s)
         logger.info(
             "IronBCI-32: streaming at %d Hz, %d channels (frame size auto-detect)",
             self.sample_rate, self._num_channels,
         )
+
+    def _reset_counters(self) -> None:
+        self._counter_prev: int | None = None
+        self._counter_diffs: list[int] = []
+        self._counter_step: int | None = None   # 0 = counter unusable
+        self._counter_glitches = 0
+        self._lost_frames = 0
+        self._last_sample: list[float] | None = None
+        self._first_frame_t: float | None = None
+        self._rate_mark0: tuple[int, float] | None = None
+        self._rate_mark: tuple[int, float] | None = None
+
+    def _measure_rate(self, probe_s: float) -> None:
+        """Block until probe_s of frames have been counted, then set
+        sample_rate. Frame slots include lost ones, so a lossy link still
+        measures the board's rate, not the delivered one."""
+        deadline = time.monotonic() + RATE_SKIP_S + probe_s + 1.5
+        while time.monotonic() < deadline:
+            m0, m = self._rate_mark0, self._rate_mark
+            if m0 is not None and m is not None and m[1] - m0[1] >= probe_s:
+                break
+            time.sleep(0.05)
+        m0, m = self._rate_mark0, self._rate_mark
+        if m0 is None or m is None or m[0] - m0[0] < 10 or m[1] <= m0[1]:
+            logger.warning(
+                "IronBCI-32: no steady frames on %s to measure the rate — "
+                "assuming %d SPS. Is the board's battery on?",
+                self._serial_port, self._sample_rate,
+            )
+            return
+        self._measured_rate = (m[0] - m0[0]) / (m[1] - m0[1])
+        self._sample_rate = snap_rate(self._measured_rate)
+        level = (logging.INFO if self._sample_rate in STANDARD_RATES
+                 else logging.WARNING)
+        logger.log(level, "IronBCI-32: measured %.2f frames/s -> %d SPS",
+                   self._measured_rate, self._sample_rate)
+
+    def _count_gap(self, counter: int) -> int:
+        """Frames lost before this one, judged by the frame counter."""
+        prev, self._counter_prev = self._counter_prev, counter
+        if prev is None:
+            return 0
+        d = (counter - prev) % 256
+        if self._counter_step is None:
+            self._counter_diffs.append(d)
+            if len(self._counter_diffs) >= COUNTER_LEARN:
+                steps = set(self._counter_diffs)
+                self._counter_step = (steps.pop() if len(steps) == 1
+                                      and 0 not in steps else 0)
+                if self._counter_step:
+                    logger.info("IronBCI-32: frame counter steps by %d",
+                                self._counter_step)
+                else:
+                    logger.warning(
+                        "IronBCI-32: frame counter irregular (%s) — lost "
+                        "frames can't be counted",
+                        sorted(set(self._counter_diffs)))
+            return 0
+        step = self._counter_step
+        if step == 0 or d == step:
+            return 0
+        if d and d % step == 0:
+            gap = d // step - 1
+            self._lost_frames += gap
+            return gap
+        self._counter_glitches += 1
+        return 0
 
     def close(self) -> None:
         """Stop the reader thread and close the serial port."""
@@ -529,10 +651,17 @@ class IronBCI32Hardware:
         while not self._stop_event.is_set():
             # --- 1. Pull bytes from the port -------------------------------
             try:
-                chunk = self._read_bytes(2048)
+                # Take what is waiting (or block for the next byte): a fixed
+                # read(2048) blocks until 2048 bytes are in, handing frames
+                # over in ~80 ms clumps at 250 SPS.
+                waiting = getattr(port, "in_waiting", READ_CHUNK)
+                chunk = self._read_bytes(min(READ_CHUNK, max(1, waiting)))
             except Exception as e:
                 logger.warning("IronBCI-32 serial read error: %s", e)
                 continue
+            # Less than a full chunk waiting means no backlog is left: frames
+            # now arrive at the board's pace, so the rate count may start.
+            caught_up = waiting < READ_CHUNK
             if chunk:
                 rx.extend(chunk)
                 if len(rx) > MAX_RX:
@@ -626,8 +755,20 @@ class IronBCI32Hardware:
                         "(counter=%d, frame=%d B)",
                         self._serial_port, counter, frame_size,
                     )
+                gap = self._count_gap(counter)
+                if gap and self._last_sample is not None:
+                    self._buffer.extend([self._last_sample] * gap)
                 self._frames_decoded += 1
                 self._buffer.append(channels)
+                self._last_sample = channels
+                t = time.monotonic()
+                slots = self._frames_decoded + self._lost_frames
+                if self._first_frame_t is None:
+                    self._first_frame_t = t
+                elif (self._rate_mark0 is None and caught_up
+                      and t - self._first_frame_t >= RATE_SKIP_S):
+                    self._rate_mark0 = (slots, t)
+                self._rate_mark = (slots, t)
 
             # If we drained everything but no new bytes are coming, sleep
             # briefly to avoid busy-looping on the timeout.

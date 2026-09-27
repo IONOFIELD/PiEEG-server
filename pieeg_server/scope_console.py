@@ -322,6 +322,11 @@ SCOPE_CHANGELOG = [
             "sample time (the chips' clocks wander ~0.5 ms); pauses such as a "
             "calibration toggle are held and noted, so later samples and notes "
             "stay on time. The raw journal is kept exactly as acquired."),
+    ("5.6", "IronBCI-32 ready: the board's sample rate is measured when it "
+            "connects (sources say 250 or 500), frames arrive as sent instead "
+            "of in ~80 ms clumps, frames lost on the USB link are found by the "
+            "board's counter and held on the time grid (counted in the "
+            "recording summary), and 32-channel CSVs name all 32 columns."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

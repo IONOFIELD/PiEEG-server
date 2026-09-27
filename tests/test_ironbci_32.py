@@ -91,6 +91,10 @@ class _FakeSerial:
             del self._buf[:n]
             return chunk
 
+    @property
+    def in_waiting(self) -> int:
+        return len(self._buf)
+
     def reset_input_buffer(self) -> None:
         # No-op: the driver calls this on open() to flush stale bytes from a
         # real port; clearing our pre-loaded test stream would defeat the test.
@@ -186,7 +190,7 @@ class TestDetectFrameSize:
 
 @pytest.fixture
 def hw():
-    h = IronBCI32Hardware(serial_port="FAKE")
+    h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=0)
     yield h
     h.close()
 
@@ -313,3 +317,115 @@ class _StubSerialModule:
 
     def Serial(self, *_args, **_kwargs):  # noqa: N802 — mirrors pyserial API
         return self._fake
+
+
+# --- Tests: measured rate + frame counter ----------------------------------
+
+class _PacedSerial(_FakeSerial):
+    """Releases frames at a fixed rate, in ~1 ms USB-like chunks."""
+
+    def __init__(self, frames: list[bytes], rate: float) -> None:
+        super().__init__(b"")
+        self._frames = frames
+        self._rate = rate
+        self._t0 = time.monotonic()
+        self._sent = 0
+
+    def _due(self) -> int:
+        return min(len(self._frames),
+                   int((time.monotonic() - self._t0) * self._rate))
+
+    @property
+    def in_waiting(self) -> int:
+        return sum(map(len, self._frames[self._sent:self._due()]))
+
+    def read(self, n: int) -> bytes:
+        time.sleep(0.001)
+        due = self._due()
+        out = b"".join(self._frames[self._sent:due])
+        self._sent = due
+        return out
+
+
+class TestMeasuredRate:
+    @pytest.mark.parametrize("measured,expected", [
+        (249.7, 250), (251.9, 250), (498.0, 500), (511.0, 512),
+        (256.3, 256), (300.0, 300),
+    ])
+    def test_snap_rate(self, measured, expected):
+        assert drv.snap_rate(measured) == expected
+
+    @pytest.mark.parametrize("rate", [250, 500])
+    def test_open_measures_the_wire_rate(self, monkeypatch, rate):
+        frames = [_build_frame(i, [i] * NUM_CHANNELS)
+                  for i in range(int(rate * 3))]
+        fake = _PacedSerial(frames, rate)
+        monkeypatch.setattr(drv, "serial", _StubSerialModule(fake))
+        h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=1.0)
+        try:
+            h.open()
+            assert h.sample_rate == rate
+            assert abs(h.measured_rate / rate - 1) < RATE_TOL
+        finally:
+            h.close()
+
+    def test_no_frames_keeps_default(self, monkeypatch):
+        monkeypatch.setattr(drv, "serial", _StubSerialModule(_FakeSerial(b"")))
+        monkeypatch.setattr(drv, "RATE_SKIP_S", 0.0)
+        h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=0.1)
+        try:
+            h.open()
+            assert h.sample_rate == drv.DEFAULT_SAMPLE_RATE
+            assert h.measured_rate is None
+        finally:
+            h.close()
+
+
+RATE_TOL = 0.02
+
+
+class TestFrameCounter:
+    def _run(self, hw, monkeypatch, counters, codes_of=lambda c: c):
+        stream = b"".join(_build_frame(c, [codes_of(c)] * NUM_CHANNELS)
+                          for c in counters)
+        monkeypatch.setattr(drv, "serial", _StubSerialModule(_FakeSerial(stream)))
+        hw.open()
+        return _drain_until(hw, len(counters) + 10, timeout=1.0)
+
+    def test_lost_frames_are_held_on_the_grid(self, hw, monkeypatch):
+        # learn a step of 1, then frames 30 and 31 never arrive
+        counters = list(range(30)) + list(range(32, 40))
+        out = self._run(hw, monkeypatch, counters)
+        assert hw.lost_frames == 2
+        assert len(out) == 40
+        ch0 = [round(s[0] / SCALE_UV) for s in out]
+        assert ch0[:30] == list(range(30))
+        assert ch0[30:32] == [29, 29]            # held
+        assert ch0[32:] == list(range(32, 40))
+
+    def test_counter_wraps_at_256(self, hw, monkeypatch):
+        counters = [(200 + i) % 256 for i in range(100)]
+        self._run(hw, monkeypatch, counters)
+        assert hw.lost_frames == 0
+        assert hw.serial_stats()["counter_step"] == 1
+
+    def test_irregular_counter_counts_nothing(self, hw, monkeypatch):
+        counters = [0, 5, 1, 9, 2, 7] * 6
+        out = self._run(hw, monkeypatch, counters)
+        assert hw.serial_stats()["counter_step"] == 0
+        assert hw.lost_frames == 0
+        assert len(out) == len(counters)
+
+
+def test_recording_sidecar_counts_serial_lost_frames():
+    from pieeg_server.journal import SERIAL_TIMING, _timing_extra
+    before = {"dropped_frames": 0, "reader": None,
+              "serial": {"lost_frames": 3, "resyncs": 1}}
+    after = {"dropped_frames": 0, "reader": None,
+             "serial": {"lost_frames": 10, "resyncs": 1, "counter_step": 1,
+                        "measured_rate_hz": 249.97}}
+    extra = _timing_extra(before, after)
+    assert extra["timing"] == SERIAL_TIMING
+    assert extra["acquisition"] == {
+        "frames_lost": 7, "reader": None, "held_samples": 7, "resyncs": 0,
+        "counter_step": 1, "board_rate_hz": 249.97}

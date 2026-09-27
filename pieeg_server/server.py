@@ -599,7 +599,8 @@ class PiEEGServer:
         raw_dir = self._recordings_dir / session / "raw"
         raw_dir.mkdir(parents=True, exist_ok=True)
         output = raw_dir / f"{session}.csv"
-        self._recorder = Recorder(self._acq, output=output)
+        self._recorder = Recorder(self._acq, output=output,
+                                  num_channels=self._num_channels)
 
         # Authoritative journal. Channel count/labels come from the hardware.
         # gain comes from the register readback so the sidecar's microvolt
