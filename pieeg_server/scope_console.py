@@ -337,6 +337,9 @@ SCOPE_CHANGELOG = [
             "red BOARD banner, repeated at REC and saved in the recording "
             "summary. If its USB drops, the Scope waits for the same board, "
             "reconnects and holds the gap on the time grid."),
+    ("5.9", "Recordings stay raw: the spike filters set from the dashboard "
+            "now act on the live stream only (hardware spike rejection is "
+            "switched off when a recording starts)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
