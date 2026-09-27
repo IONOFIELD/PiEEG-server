@@ -197,7 +197,7 @@ DEFAULT_NOTCH = "60 Hz"   # local mains (US grid)
 HFF_ORDER = 4
 # LFF roll-off: first order, like an analog RC coupling (time constant).
 LFF_ORDER = 1
-DEFAULT_SENS = 15         # microvolts per millimetre
+DEFAULT_SENS = 20         # microvolts per millimetre
 # Mains tracking. The chip's clock runs a little off nominal (249.41 SPS
 # measured on this board), and every filter is designed on the nominal 250
 # SPS axis, so 60 Hz mains lands at ~60.14 Hz there, where a Q=30 notch built
@@ -255,10 +255,29 @@ GEIST = {
     "grid":      "#21262d",   # row separators / grid
     "axis":      "#8b949e",   # --canvas-axis-text
     "curve":     "#58a6ff",   # --canvas-curve
-    # live traces: grey-blue while not recording, strong blue while recording
-    "curve_idle": "#7f8ea6",
-    "curve_rec":  "#3d8bff",
+    # trace colour by row type (see row_kind): EEG blue, EKG red, EMG white
+    "trace_eeg": "#3d8bff",
+    "trace_ekg": "#ee4444",
+    "trace_emg": "#ffffff",
 }
+
+_EKG_NAME = re.compile(r"(?<![A-Za-z])(EKG|ECG)(?![A-Za-z])", re.I)
+_EMG_NAME = re.compile(r"(?<![A-Za-z])EMG(?![A-Za-z])", re.I)
+
+
+def row_kind(name: str) -> str:
+    """"ekg", "emg" or "eeg" for a montage row, from its name: a row named
+    with EKG/ECG or EMG (e.g. "EKG", "EMG 1", "L tib EMG") is polygraphy,
+    anything else is EEG."""
+    if _EKG_NAME.search(name or ""):
+        return "ekg"
+    if _EMG_NAME.search(name or ""):
+        return "emg"
+    return "eeg"
+
+
+def row_colour(name: str) -> str:
+    return GEIST["trace_" + row_kind(name)]
 
 
 def find_mains_line(x, fs, mains):
@@ -1118,8 +1137,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                record_control=None, full_scale_uv=VREF_UV / 24,
                impedance_control=None, stop_event=None,
                annotate_control=None, recordings_dir=None,
-               calibrate_control=None):
+               calibrate_control=None, board_warning=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
+
+    board_warning: text shown as a red banner on the chart for the whole
+    session (the board came up wrong, e.g. dead inputs or an odd rate), and
+    repeated when a recording starts.
 
     frame_queue yields dicts like {"channels": [.. nch floats in uV ..]}.
     on_close(): optional callback fired when the operator closes the window.
@@ -1599,7 +1622,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _refresh_montage_label()
 
     _rec = {"future": None}
-    _live = {"recording": False}            # colours the live traces
 
     def _toggle_record():
         if _rec["future"] is not None:
@@ -1620,7 +1642,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             except Exception as e:          # noqa: BLE001
                 _hint(f"recording failed: {e}", seconds=8, fg=C["red"])
             else:
-                if "started" in res:
+                if "started" in res and board_warning:
+                    _hint(f"recording {res['started']} · board: "
+                          f"{board_warning}", seconds=10, fg=C["red"])
+                elif "started" in res:
                     _hint(f"recording {res['started']}", fg=C["red"])
                 elif res.get("saved"):
                     _hint(f"saved {res['stopped']} ({res.get('seconds', 0):.0f} s)"
@@ -1633,7 +1658,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             st = record_control["status"]()
         except Exception:                   # noqa: BLE001 - display only
             return
-        _live["recording"] = bool(st.get("recording"))
         if ann_bar is not None:
             shown = bool(ann_bar.winfo_manager())
             if st.get("recording") and not shown and not _rev["on"]:
@@ -2755,9 +2779,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _sweep_draw(rows, W, row_h, half, sens):
         ncol = max(1, min(W, model.win))
         vfilt, head, _ = model.view()
-        curve = C["curve_rec"] if _live["recording"] else C["curve_idle"]
+        colours = [row_colour(r["name"]) for r in rows]
         sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
-               id(model.frozen), model.win, _rev["on"] and _rev["gen"], curve)
+               id(model.frozen), model.win, _rev["on"] and _rev["gen"],
+               tuple(colours))
         if _rev["on"]:
             if sig != _sw["sig"]:
                 _sweep_reset()
@@ -2784,11 +2809,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             a0 = a - 1 if a > 0 else a
             ids = []
             if b > a0:
-                for y in ys:
+                for y, colour in zip(ys, colours):
                     co = np.empty(2 * (b - a0 + 1) * 2)
                     co[0::2] = xs[2 * a0:2 * (b + 1)]
                     co[1::2] = y[2 * a0:2 * (b + 1)]
-                    lid = canvas.create_line(*co.tolist(), fill=curve,
+                    lid = canvas.create_line(*co.tolist(), fill=colour,
                                              width=1, tags="sweep")
                     canvas.tag_lower(lid)
                     ids.append(lid)
@@ -2852,7 +2877,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             co = np.empty(2 * xs.size)
             co[0::2], co[1::2] = xs, y
             canvas.tag_lower(canvas.create_line(*co.tolist(),
-                                                fill=C["curve_idle"],
+                                                fill=row_colour(r["name"]),
                                                 width=1, tags="sweep"))
 
     # ---- static chart layer ------------------------------------------------ #
@@ -2861,7 +2886,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # only when their signature changes. Rebuilding them every frame made Tk
     # repaint the whole chart 15 times a second.
     _deco = {"sig": None, "dots": [], "dot_sig": None}
-    _overlay = {"toast": None, "stream": None, "marks": None}
+    _overlay = {"toast": None, "stream": None, "marks": None, "board": None}
 
     def _draw_marks(W, H):
         if _rev["on"]:
@@ -2927,6 +2952,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _flag_boxes[key] = box
         canvas.tag_raise("marks")
         canvas.tag_raise("toast")
+        canvas.tag_raise("board")
 
     def _draw_review_marks(W, H):
         s, win = _rev["start"], model.win
@@ -3091,6 +3117,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                              outline=C["border_hi"],
                                              tags="toast")
                 canvas.tag_lower(bg, tid)
+        # Board warning: a persistent red banner along the chart's bottom
+        # left, rebuilt only on resize like the toast.
+        sig = (board_warning, W, H) if board_warning and W > 2 else None
+        if sig != _overlay["board"]:
+            _overlay["board"] = sig
+            canvas.delete("board")
+            if sig is not None:
+                bid = canvas.create_text(
+                    12, H - 12, anchor="sw", text=f"⚠ BOARD: {board_warning}",
+                    fill=C["red"], width=max(200, W - 160),
+                    font=(_MONO, _fs(9), "bold"), tags="board")
+                x0, y0, x1, y1 = canvas.bbox(bid)
+                bg = canvas.create_rectangle(x0 - 6, y0 - 3, x1 + 6, y1 + 3,
+                                             fill=C["surface"],
+                                             outline=C["red"], tags="board")
+                canvas.tag_lower(bg, bid)
         if W > 2 and H > 2:
             _draw_measure(W, H)
         if impedance_control is not None and W > 2 and H > 2:

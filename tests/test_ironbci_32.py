@@ -430,3 +430,89 @@ def test_recording_sidecar_counts_serial_lost_frames():
     assert extra["acquisition"] == {
         "frames_lost": 7, "reader": None, "held_samples": 7, "resyncs": 0,
         "counter_step": 1, "board_rate_hz": 249.97}
+
+
+class TestBoardCheck:
+    def _open(self, monkeypatch, codes_of, n=300):
+        frames = [_build_frame(i, codes_of(i)) for i in range(n)]
+        monkeypatch.setattr(drv, "serial",
+                            _StubSerialModule(_FakeSerial(b"".join(frames))))
+        monkeypatch.setattr(drv, "RATE_SKIP_S", 0.0)
+        h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=0.2)
+        h.open()
+        return h
+
+    def test_dead_inputs_are_reported(self, monkeypatch):
+        # the fault seen on the bench: only inputs 1-2 of each ADC alive
+        live = {0, 1, 8, 9, 16, 17, 24, 25}
+        h = self._open(monkeypatch, lambda i: [
+            (i % 7 + 1) if ch in live else 0 for ch in range(NUM_CHANNELS)])
+        try:
+            w = h.board_warning
+            assert "24 inputs read 0 (3-8, 11-16, 19-24, 27-32)" in w
+            assert "power-cycle" in w
+            assert h.serial_stats()["board_warning"] == w
+        finally:
+            h.close()
+
+    def test_healthy_inputs_give_no_dead_input_warning(self, monkeypatch):
+        h = self._open(monkeypatch, lambda i: [(i + ch) % 9 + 1
+                                               for ch in range(NUM_CHANNELS)])
+        try:
+            assert "inputs read 0" not in (h.board_warning or "")
+        finally:
+            h.close()
+
+    def test_ranges(self):
+        assert drv._ranges([3, 4, 5, 8, 10, 11]) == "3-5, 8, 10-11"
+
+
+def test_recording_sidecar_carries_the_board_warning():
+    from pieeg_server.journal import _timing_extra
+    after = {"dropped_frames": 0, "serial": {"lost_frames": 0,
+             "board_warning": "odd rate 878.8 SPS"}}
+    extra = _timing_extra({"dropped_frames": 0}, after)
+    assert extra["acquisition"]["board_warning"] == "odd rate 878.8 SPS"
+
+
+class _DyingSerial(_FakeSerial):
+    """Streams its frames, then fails like an unplugged USB port."""
+
+    def read(self, n: int) -> bytes:
+        out = super().read(n)
+        if not out:
+            raise OSError(5, "Input/output error")
+        return out
+
+
+def test_unplug_reconnects_and_holds_the_gap(monkeypatch):
+    first = b"".join(_build_frame(i, [i + 1] * NUM_CHANNELS)
+                     for i in range(40))
+    second = b"".join(_build_frame(i, [500] * NUM_CHANNELS)
+                      for i in range(100, 140))
+    ports = iter([_DyingSerial(first), _FakeSerial(second)])
+
+    class _Mod(_StubSerialModule):
+        def Serial(self, *_a, **_k):        # noqa: N802
+            return next(ports)
+
+    monkeypatch.setattr(drv, "serial", _Mod(None))
+    monkeypatch.setattr(drv, "RECONNECT_POLL_S", 0.3)
+    h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=0)
+    h._sample_rate = 250
+    monkeypatch.setattr(h, "_find_same_board", lambda: "FAKE2")
+    try:
+        h.open()
+        out = _drain_until(h, 200, timeout=3.0)
+        st = h.serial_stats()
+        assert st["disconnects"] == 1
+        assert h.serial_port == "FAKE2"
+        assert "USB dropped" in h.board_warning
+        held = st["lost_frames"]
+        assert held >= 250 * 0.3 * 0.8     # ~the time it was away
+        ch0 = [round(s[0] / SCALE_UV) for s in out]
+        assert ch0[:40] == list(range(1, 41))
+        assert set(ch0[40:40 + held]) == {40}          # held last sample
+        assert ch0[40 + held:] == [500] * 40
+    finally:
+        h.close()
