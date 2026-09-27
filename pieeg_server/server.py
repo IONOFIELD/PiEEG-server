@@ -590,6 +590,16 @@ class PiEEGServer:
             # The check's 31.25 Hz test current would be in the recording.
             logger.warning("Impedance check running; not starting a recording")
             return
+        hw = self._acq._hw
+        if getattr(hw, "spike_threshold", -1) != -1:
+            # Hardware spike rejection drops frames in the driver (they are
+            # then held), which would alter the recording: off while
+            # recording — recordings are raw. Live-stream filters don't reach
+            # the recording, so they stay as they are.
+            hw.spike_threshold = -1
+            logger.warning("Hardware spike rejection turned off: "
+                           "recordings are raw")
+            await self._broadcast_spike_config()
 
         # One timestamp -> one base name shared by the CSV, the journal, its
         # sidecar, and the eventual EDF, so a session's files stay together.
@@ -856,6 +866,13 @@ class PiEEGServer:
                 # (clients were told the check started), and it stays out of
                 # the filters and band powers.
                 continue
+
+            # The spike filter is for the live stream only; recordings
+            # subscribe to the acquisition directly and stay raw.
+            hampel = self._acq.hampel
+            if hampel.enabled:
+                frame = frame.copy()
+                frame["channels"] = hampel.apply(frame["channels"])
 
             if self._filter or self._notch_filter:
                 frame = frame.copy()
@@ -1313,6 +1330,9 @@ class PiEEGServer:
 
     # ── Spike config ───────────────────────────────────────────────────
 
+    def _recording_active(self) -> bool:
+        return bool(self._recorder_task and not self._recorder_task.done())
+
     def _get_spike_config(self) -> dict:
         hw = self._acq._hw
         return {
@@ -1326,7 +1346,14 @@ class PiEEGServer:
         config = msg.get("config")
         if config and isinstance(config, dict):
             if "threshold" in config:
-                hw.spike_threshold = int(config["threshold"])
+                threshold = int(config["threshold"])
+                if threshold != -1 and self._recording_active():
+                    # It drops frames in the driver, so it would reach the
+                    # recording; recordings are raw.
+                    logger.warning("Spike rejection not enabled: a "
+                                   "recording is running (recordings are raw)")
+                else:
+                    hw.spike_threshold = threshold
             if "reset_after" in config:
                 hw.spike_reset_after = int(config["reset_after"])
             logger.info("Spike config updated: threshold=%d, reset_after=%d",

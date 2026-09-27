@@ -87,7 +87,8 @@ class AcquisitionLoop:
         self._prev_edge_ns = None
         # Oversampling (hw.oversample > 1): chip samples in, decimated out.
         self._decimator: Decimator | None = None
-        # Device-agnostic Hampel spike filter (runs in acquisition thread)
+        # Device-agnostic Hampel spike filter. The server applies it to the
+        # live stream only: recordings (journal, CSV) always get raw samples.
         self._hampel = HampelFilter(num_channels=hardware.num_channels)
         # Default both spike filters to OFF (user can enable via dashboard)
         self._hampel.enabled = False
@@ -225,7 +226,6 @@ class AcquisitionLoop:
         interval = 1.0 / getattr(self._hw, "sample_rate", SAMPLE_RATE)
         while not self._stop_event.is_set():
             sample = self._hw.read_sample()
-            sample = self._hampel.apply(sample)
             self._sample_count += 1
             frame = {
                 "t": round(time.time(), 6),
@@ -273,7 +273,6 @@ class AcquisitionLoop:
                 self._settle_remaining -= 1
                 continue
 
-            sample = self._hampel.apply(sample)
             self._sample_count += 1
             timestamp = time.time()
 
@@ -434,7 +433,6 @@ class AcquisitionLoop:
         self._emit(sample, t, ts_ns=ts_ns, t2_ns=t2_ns)
 
     def _emit(self, sample, t, ts_ns=None, t2_ns=None, held=False):
-        sample = self._hampel.apply(sample)
         self._sample_count += 1
         frame = {
             "t": round(t, 6),
@@ -739,7 +737,6 @@ class AcquisitionLoop:
                 next_t = time.monotonic()
                 continue
 
-            sample = self._hampel.apply(sample)
             self._sample_count += 1
             frame = {
                 "t": round(time.time(), 6),
@@ -789,7 +786,6 @@ class AcquisitionLoop:
             if sample is None:
                 time.sleep(idle_sleep)
                 continue
-            sample = self._hampel.apply(sample)
             self._sample_count += 1
             self._loop.call_soon_threadsafe(self._enqueue, {
                 "t": round(time.time(), 6),
