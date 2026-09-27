@@ -358,10 +358,11 @@ class TestMeasuredRate:
     @pytest.mark.parametrize("rate", [250, 500])
     def test_open_measures_the_wire_rate(self, monkeypatch, rate):
         frames = [_build_frame(i, [i] * NUM_CHANNELS)
-                  for i in range(int(rate * 3))]
+                  for i in range(int(rate * 5))]
         fake = _PacedSerial(frames, rate)
         monkeypatch.setattr(drv, "serial", _StubSerialModule(fake))
-        h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=1.0)
+        # a 2 s count keeps sleep jitter under a loaded suite inside ±2 %
+        h = IronBCI32Hardware(serial_port="FAKE", rate_probe_s=2.0)
         try:
             h.open()
             assert h.sample_rate == rate
