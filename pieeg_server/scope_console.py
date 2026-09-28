@@ -379,6 +379,13 @@ SCOPE_CHANGELOG = [
             "each raw at its own rate with its own summary. The session "
             "keeps one notes file; each board's BDF+ gets the notes at its "
             "own samples, by time. Files lists the session once."),
+    ("6.8", "Master file: with two boards, Stop also writes <session>_synced"
+            ".bdf with every board on the Pi's clock: EEG at 512 Hz and "
+            "EKG/EMG at 1000 Hz, starting together, with the notes. The "
+            "IronBCI-32's frames are timestamped on arrival and a clock fit "
+            "recovers its sample times (within ~0.35 ms, plus a fixed USB "
+            "latency of ~1 ms to be measured). New montage: Adaptive "
+            "(reduced), the EEG cut to 16 leads on a 32-channel board."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

@@ -176,3 +176,18 @@ def test_unwiring_a_pieeg_input_hides_its_row_only(tmp_path):
     m.set_wired(["X5"], False)
     labels = [m.row_label(r) for r in m.visible_rows()]
     assert "EMG 2" not in labels and "EKG" in labels and len(labels) == 21
+
+
+def test_adaptive_reduced_cuts_the_eeg_to_16_leads(tmp_path):
+    m = _dual(tmp_path / "s.json")
+    assert av.ADAPTIVE_REDUCED in m.montage_names()
+    m.load_montage(av.ADAPTIVE_REDUCED)
+    labels = [m.row_label(r) for r in m.rows()]
+    assert labels[:16] == [f"{a}-{b}" for a, b in
+                           av.MONTAGE_PRESETS_16["Double banana"]]
+    assert labels[16:] == ["EKG", "EMG 1", "EMG 2", "EMG 3"]
+    assert _model(32, tmp_path / "t.json").montage_names()[1] == \
+        av.ADAPTIVE_REDUCED
+    for n in (8, 16):                       # nothing to cut: not offered
+        assert av.ADAPTIVE_REDUCED not in _model(n, tmp_path / f"{n}.json"
+                                                 ).montage_names()

@@ -889,15 +889,24 @@ class AcquisitionLoop:
         # enough to avoid busy-spinning when the driver is between USB-CDC
         # chunks (which arrive every 8–16 ms).
         idle_sleep = min(0.005, 1.0 / sample_rate)
+        # USB arrival times (IronBCI-32) go into recordings' timing files, so
+        # an export can fit the board's sample clock to the Pi's
+        timed = getattr(self._hw, "read_sample_timed", None)
         while not self._stop_event.is_set():
-            sample = self._hw.read_sample()
+            if timed is not None:
+                item = timed()
+                sample, ts_ns, held = item if item is not None else (None,) * 3
+            else:
+                sample, ts_ns, held = self._hw.read_sample(), 0, False
             if sample is None:
                 self._flush()               # caught up: send what we have
                 time.sleep(idle_sleep)
                 continue
             self._sample_count += 1
-            self._post(self._enqueue, {
-                "t": round(time.time(), 6),
-                "n": self._sample_count,
-                "channels": sample,
-            })
+            frame = {"t": round(time.time(), 6), "n": self._sample_count,
+                     "channels": sample}
+            if ts_ns:
+                frame["ts_ns"] = ts_ns
+            if held:
+                frame["held"] = True
+            self._post(self._enqueue, frame)

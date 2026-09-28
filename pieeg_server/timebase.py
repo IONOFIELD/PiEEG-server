@@ -149,6 +149,54 @@ def _evaluate(streams, T, nch):
     return y, covered, lost, shift
 
 
+ARRIVAL_WINDOW_S = 1.0      # one lower-envelope point per window
+ARRIVAL_SMOOTH = 5          # rolling median over this many points
+
+
+def arrival_times(t1, flags=None):
+    """Sample times (ns, float) from USB arrival stamps (IronBCI-32).
+
+    An arrival is the sample time plus the USB latency plus up to one read
+    gap: never early, often late by a few ms. Against a steady clock (the
+    overall rate), each window's EARLIEST arrival sits just above the true
+    sample clock, so the fit follows those minima (rolling median against a
+    stray, linear between them): the board's crystal drift is followed, the
+    read-gap jitter removed. What remains is the fixed part of the USB
+    latency (~1 ms), common to every sample; the GPIO square-wave test
+    measures it. Held rows (flags & HELD, or no stamp) get times on the fit
+    like the others. Returns None with fewer than 2 stamps."""
+    t1 = np.asarray(t1, dtype=np.int64)
+    n = len(t1)
+    ok = t1 > 0
+    if flags is not None:
+        ok &= (np.asarray(flags) & HELD) == 0
+    idx = np.flatnonzero(ok)
+    if len(idx) < 2:
+        return None
+    t = t1[idx].astype(np.float64)
+    p0 = (t[-1] - t[0]) / (idx[-1] - idx[0])
+    resid = t - idx * p0
+    per = max(8, int(round(ARRIVAL_WINDOW_S * 1e9 / p0)))
+    bins = idx // per
+    starts = np.flatnonzero(np.r_[True, np.diff(bins) > 0])
+    pts_i, pts_r = [], []
+    for a, b in zip(starts, np.r_[starts[1:], len(idx)]):
+        j = a + int(np.argmin(resid[a:b]))
+        pts_i.append(idx[j])
+        pts_r.append(resid[j])
+    pts_i, pts_r = np.array(pts_i), np.array(pts_r)
+    if len(pts_r) >= ARRIVAL_SMOOTH:
+        k = ARRIVAL_SMOOTH // 2
+        padded = np.pad(pts_r, k, mode="edge")
+        pts_r = np.median(np.lib.stride_tricks.sliding_window_view(
+            padded, ARRIVAL_SMOOTH), axis=1)
+    rows = np.arange(n)
+    if len(pts_i) == 1:
+        return rows * p0 + pts_r[0]
+    # beyond the first/last point, carry on at the fitted slope
+    return rows * p0 + np.interp(rows, pts_i, pts_r)
+
+
 def record_layout(rate_hz):
     """(samples per record, duration s) whose 10 µs-step duration best
     matches rate_hz; the rate the file then states is n / duration."""
