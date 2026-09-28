@@ -56,6 +56,9 @@ class AcquisitionLoop:
         # instead of busy-polling the DRDY level (lower CPU, no missed edges).
         self._interrupt = interrupt
         self._subscribers: list[asyncio.Queue] = []
+        # Recordings: the chip's own samples (see subscribe_raw)
+        self._raw_subscribers: list[asyncio.Queue] = []
+        self._last_raw = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._sample_count = 0
@@ -134,12 +137,31 @@ class AcquisitionLoop:
         self._subscribers.append(q)
         return q
 
+    def subscribe_raw(self, maxsize: int = 8192) -> asyncio.Queue:
+        """A queue of the chip's own samples, for recordings: with
+        oversampling, every chip sample (e.g. 1000 SPS) before the decimation
+        FIR, each with its own edge time; otherwise the same frames
+        subscribe() gets. Lost chip samples arrive as held copies."""
+        q: asyncio.Queue = asyncio.Queue(maxsize=maxsize)
+        self._raw_subscribers.append(q)
+        return q
+
+    @property
+    def raw_rate(self) -> int:
+        """Samples per second on the subscribe_raw() feed (the chip rate)."""
+        chip = getattr(self._hw, "chip_rate", None)
+        if chip:
+            return int(chip)
+        rate = getattr(self._hw, "sample_rate", SAMPLE_RATE) or SAMPLE_RATE
+        return int(rate * max(1, getattr(self._hw, "oversample", 1)))
+
     def unsubscribe(self, q: asyncio.Queue):
-        """Remove a subscriber queue."""
-        try:
-            self._subscribers.remove(q)
-        except ValueError:
-            pass
+        """Remove a subscriber queue (either feed)."""
+        for subs in (self._subscribers, self._raw_subscribers):
+            try:
+                subs.remove(q)
+            except ValueError:
+                pass
 
     @property
     def queue(self) -> asyncio.Queue:
@@ -362,6 +384,7 @@ class AcquisitionLoop:
     def _setup_decimator(self, chip_rate):
         """A fresh (or reset) decimator for this run, or None without
         oversampling."""
+        self._last_raw = None
         k = getattr(self._hw, "oversample", 1)
         if k <= 1:
             self._decimator = None
@@ -386,6 +409,15 @@ class AcquisitionLoop:
         on its 250 SPS time grid (counted in capture_stats "held_samples")."""
         self._dropped_frames += n
         if self._decimator is not None:
+            last = self._last_raw
+            if last is not None and self._settle_remaining <= 0:
+                sample, t, ts_ns = last
+                for j in range(1, int(n) + 1):
+                    self._emit_raw(
+                        sample, t + j * self._nominal_ns / 1e9,
+                        ts_ns=(None if ts_ns is None
+                               else ts_ns + round(j * self._nominal_ns)),
+                        held=True)
             for sample, t in self._decimator.hold(n):
                 last = self._last_emitted
                 ts_ns = (last[2] + round(self._nominal_ns * self._decimator.k)
@@ -421,6 +453,7 @@ class AcquisitionLoop:
             return
         self._frames_read += 1
         if self._decimator is not None:
+            self._emit_raw(sample, t, ts_ns)
             out = self._decimator.push(sample, t)
             if out is None:
                 return
@@ -431,6 +464,18 @@ class AcquisitionLoop:
             ts_ns = None if ts_ns is None else ts_ns - delay_ns
             t2_ns = None
         self._emit(sample, t, ts_ns=ts_ns, t2_ns=t2_ns)
+
+    def _emit_raw(self, sample, t, ts_ns=None, held=False):
+        """One chip sample onto the raw feed (oversampling only: without it
+        _emit's frames are the raw feed)."""
+        frame = {"t": round(t, 6), "channels": sample}
+        if ts_ns is not None:
+            frame["ts_ns"] = ts_ns
+        if held:
+            frame["held"] = True
+        self._last_raw = (sample, t, ts_ns)
+        if self._raw_subscribers:
+            self._loop.call_soon_threadsafe(self._enqueue_raw, frame)
 
     def _emit(self, sample, t, ts_ns=None, t2_ns=None, held=False):
         self._sample_count += 1
@@ -691,7 +736,18 @@ class AcquisitionLoop:
         }
 
     def _enqueue(self, frame: dict):
-        for q in self._subscribers:
+        """Hand a frame to the subscribers, and to the raw feed too when
+        these frames are the chip's own samples (no oversampling)."""
+        self._put(self._subscribers, frame)
+        if self._decimator is None:
+            self._put(self._raw_subscribers, frame)
+
+    def _enqueue_raw(self, frame: dict):
+        self._put(self._raw_subscribers, frame)
+
+    @staticmethod
+    def _put(subscribers, frame: dict):
+        for q in subscribers:
             try:
                 q.put_nowait(frame)
             except asyncio.QueueFull:

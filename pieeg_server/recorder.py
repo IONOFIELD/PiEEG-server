@@ -38,7 +38,9 @@ class Recorder:
         duration : optional recording duration in seconds (None = until stopped)
         """
         self._acq = acquisition
-        self._queue = acquisition.subscribe(maxsize=4096)
+        # raw chip samples, like the journal (see AcquisitionLoop.subscribe_raw)
+        subscribe = getattr(acquisition, "subscribe_raw", acquisition.subscribe)
+        self._queue = subscribe(maxsize=4096)
         self._output = Path(output)
         self._duration = duration
         self._num_channels = num_channels

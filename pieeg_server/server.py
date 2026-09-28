@@ -626,8 +626,9 @@ class PiEEGServer:
         self._journal = JournalWriter(
             self._acq, out_dir=raw_dir, session_name=session,
             num_channels=self._acq.num_channels,
-            sample_rate=self._sample_rate(),
-            prefilter=getattr(self._acq, "prefilter", None),
+            # raw: the chip's rate and samples, no decimation filter
+            sample_rate=getattr(self._acq, "raw_rate", None) or self._sample_rate(),
+            prefilter=None,
             channel_labels=self._channel_labels,
             **journal_kwargs,
         )
@@ -744,12 +745,24 @@ class PiEEGServer:
             bdf_path = await loop.run_in_executor(
                 None, edf_export.export_journal,
                 journal_path, sidecar_path, folder / f"{session}.bdf", "bdf")
+            # the same recording on the clock, as a separate file; the
+            # recording's own BDF+ above stays raw
+            try:
+                synced = await loop.run_in_executor(
+                    None, edf_export.export_synced, journal_path,
+                    sidecar_path, bdf_path)
+            except Exception as exc:  # noqa: BLE001 - the raw file is what counts
+                logger.warning("synced copy not built (%s)", exc)
+                synced = None
             summary = await loop.run_in_executor(
                 None, edf_export.write_summary, journal_path, bdf_path,
-                folder / f"{session}.json", sidecar_path)
-            logger.info("BDF+ exported: %s (+ %s)", bdf_path, summary.name)
+                folder / f"{session}.json", sidecar_path, synced)
+            logger.info("BDF+ exported: %s (+ %s%s)", bdf_path, summary.name,
+                        f", {synced.name}" if synced else "")
             info.update(bdf=str(bdf_path.resolve()),
-                        summary=str(summary.resolve()))
+                        summary=str(summary.resolve()),
+                        **({"bdf_synced": str(synced.resolve())}
+                           if synced else {}))
         except Exception as exc:  # noqa: BLE001 - export must not block stop
             logger.warning("BDF export deferred (%s); journal is safe at %s",
                            exc, journal_path)
