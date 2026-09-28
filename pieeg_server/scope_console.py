@@ -386,6 +386,13 @@ SCOPE_CHANGELOG = [
             "recovers its sample times (within ~0.35 ms, plus a fixed USB "
             "latency of ~1 ms to be measured). New montage: Adaptive "
             "(reduced), the EEG cut to 16 leads on a 32-channel board."),
+    ("6.9", "Impedance per board: with two boards the Ω box checks the "
+            "PiEEG (EKG/EMG) in kΩ while the IronBCI-32 keeps streaming. "
+            "IronBCI-32 leads get a live contact dot instead (it can't "
+            "measure impedance): each input's 60 Hz pickup against the "
+            "median of the wired inputs — amber 3x, red 10x, or an input "
+            "that is flat or railed. An estimate, not kΩ: it can't show "
+            "every lead being equally poor, so check with a meter at hookup."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -1077,11 +1084,22 @@ def main(argv=None):
                 logger.warning("calibration note not saved: %s", e)
         return {"on": on, "note": note}
 
+    # Ω checks the board that can inject its test current: the PiEEG, which
+    # is the second board beside an IronBCI-32 (no current source there; its
+    # leads get the live contact estimate instead). Its result says where
+    # its leads sit on the combined screen (first_input, 1-based).
+    imp_acq, imp_first = acq, 1
+    if acq2 is not None:
+        imp_acq, imp_first = acq2, acq.num_channels + 1
+
+    async def _impedance():
+        res = await server.run_impedance_check(imp_acq)
+        return dict(res, first_input=imp_first)
+
     def _impedance_unless_cal():
         if _cal["on"]:
             raise RuntimeError("turn calibration off first")
-        return asyncio.run_coroutine_threadsafe(
-            server.run_impedance_check(), loop)
+        return asyncio.run_coroutine_threadsafe(_impedance(), loop)
 
 
     async def _shutdown():
@@ -1145,11 +1163,16 @@ def main(argv=None):
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
     # ---- viewer (its own process; closing its window is the shutdown) ------ #
-    view = dict(num_channels=acq.num_channels, electrodes=electrodes)
+    view = dict(num_channels=acq.num_channels, electrodes=electrodes,
+                impedance_first_input=imp_first,
+                # no lead-off comparators (IronBCI): the live contact estimate
+                signal_contact_inputs=(0 if callable(getattr(
+                    hw, "leadoff_status", None)) else acq.num_channels))
     leadoff = _contact_source(hw)
     if acq2 is not None:
         pg = _pg_keys(pg_n)
         view = dict(
+            view,
             num_channels=acq.num_channels + pg_n, electrodes=electrodes + pg,
             input_labels={k: f"E{i}" for i, k in enumerate(pg, start=1)},
             boards=[(BOARD_NAMES.get(args.device, args.device), electrodes),
@@ -1172,8 +1195,8 @@ def main(argv=None):
         toggle_record=None if args.mock else (
             lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)),
         # Ω: the electrode impedance check (PiEEG-8 only; works on --mock too,
-        # which simulates it).
-        impedance=None if unsupported_reason(acq) else _impedance_unless_cal,
+        # which simulates it). With two boards, on the PiEEG.
+        impedance=None if unsupported_reason(imp_acq) else _impedance_unless_cal,
         # EC / EO marks in the running recording (same no-mock rule as Rec)
         annotate=None if args.mock else (
             lambda text, unix_t, kind=None: asyncio.run_coroutine_threadsafe(

@@ -147,3 +147,50 @@ class TestAverageImpedance:
         assert inputs and all(1 <= i <= 8 for i in inputs)
         visible = {s for r in model.rows() if r["on"] for s in r["pair"]}
         assert inputs == sorted(model.site_index[s] + 1 for s in visible)
+
+
+def test_second_board_check_leaves_the_stream_running(monkeypatch):
+    """Two boards: the check runs on the PiEEG beside the IronBCI-32, so the
+    streamed (first) board keeps broadcasting and clients aren't told."""
+    seen = {}
+    loop = asyncio.new_event_loop()
+    hw2 = MockHardware(num_channels=8)
+    hw2.open()
+    acq2 = AcquisitionLoop(hw2, loop, mock=True)
+
+    async def check(srv):
+        seen["checked"] = srv._impedance_acq
+        await srv._queue.put({"t": 0, "n": 1, "channels": [1.0] * 8})
+        await asyncio.sleep(0.05)
+        return _Result()
+
+    _, srv, ws = _server(monkeypatch, check)
+
+    async def main():
+        broadcaster = asyncio.create_task(srv._broadcast_loop())
+        try:
+            return await srv.run_impedance_check(acq2)
+        finally:
+            broadcaster.cancel()
+
+    loop.run_until_complete(main())
+    loop.close()
+    assert seen["checked"] is acq2
+    assert srv._impedance_active is False and srv._impedance_acq is None
+    assert not any(m.get("status") == "impedance" for m in ws.sent)
+    assert any("channels" in m for m in ws.sent), "stream paused"
+
+
+class TestSecondBoardResult:
+    # a PiEEG-8 check shown after a 32-input EEG board: its leads are 33-40
+    RESULT = {"problem": None, "first_input": 33, "leads": [
+        {"ohms": 4000.0, "status": "ok"}, {"ohms": 6000.0, "status": "ok"}]
+        + [{"ohms": None, "status": "off"}] * 6}
+
+    def test_average_maps_leads_to_their_inputs(self):
+        assert acq_viewer.average_impedance(self.RESULT, [33, 34]) == (
+            5000.0, 0)
+        assert acq_viewer.average_impedance(self.RESULT, [1, 2, 3]) == (
+            None, 0)
+        assert acq_viewer.average_impedance(
+            self.RESULT, list(range(1, 41))) == (5000.0, 6)

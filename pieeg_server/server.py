@@ -104,8 +104,10 @@ class PiEEGServer:
         self._cloud_relay_meta: dict | None = None  # {relay_id, share_url}
         self._noise_test_running = False
         # True while an electrode impedance check runs (see
-        # run_impedance_check): the sample broadcast pauses meanwhile.
+        # run_impedance_check): the sample broadcast pauses meanwhile if
+        # the board under test (_impedance_acq) is the one streamed.
         self._impedance_active = False
+        self._impedance_acq = None
         # Spectral cache — updated at ~4 Hz, served by GET /api/spectrum
         self._spec_buffers: list = []   # populated lazily on first frame
         self._spec_frame: int = 0
@@ -871,27 +873,36 @@ class PiEEGServer:
             logger.warning("Could not compute CSV integrity for %s: %s", path, exc)
             return 0, None
 
-    async def run_impedance_check(self) -> dict:
+    async def run_impedance_check(self, acquisition=None) -> dict:
         """Measure electrode impedance on the live stream (a few seconds).
+
+        acquisition: the board to check; default the streamed one. With two
+        boards the second (a PiEEG beside an IronBCI-32) is checked on its
+        own and the stream, which carries only the first, keeps going.
 
         The check injects a 31.25 Hz test current, which would land in every
         client's data and in a recording. So it refuses while recording, and
-        the sample and lead-off broadcast pause while it runs. Clients get
-        {"status": "impedance", "active": true} first, then {"status":
-        "impedance", "active": false} with "results" (ImpedanceResult
-        .to_dict()) or "error". Returns the results dict.
+        the sample and lead-off broadcast pause while it runs on the streamed
+        board. Clients get {"status": "impedance", "active": true} first, then
+        {"status": "impedance", "active": false} with "results"
+        (ImpedanceResult.to_dict()) or "error". Returns the results dict.
         """
         from .impedance import ImpedanceCheck
 
+        acq = acquisition if acquisition is not None else self._acq
+        streamed = acq is self._acq
         if self._impedance_active:
             raise RuntimeError("an impedance check is already running")
         if self._recorder_task is not None and not self._recorder_task.done():
             raise RuntimeError("stop the recording before checking impedance")
         self._impedance_active = True
+        self._impedance_acq = acq
         done = {"status": "impedance", "active": False}
         try:
-            await self._broadcast_json({"status": "impedance", "active": True})
-            result = (await ImpedanceCheck(self._acq).run()).to_dict()
+            if streamed:
+                await self._broadcast_json({"status": "impedance",
+                                            "active": True})
+            result = (await ImpedanceCheck(acq).run()).to_dict()
             done["results"] = result
             # Raw carrier/noise (µV) per lead as well, so any check can be
             # re-examined against the calibration later.
@@ -906,7 +917,9 @@ class PiEEGServer:
             raise
         finally:
             self._impedance_active = False
-            await self._broadcast_json(done)
+            self._impedance_acq = None
+            if streamed:
+                await self._broadcast_json(done)
 
     async def _broadcast_json(self, message: dict):
         """Send one JSON message to every connected client."""
@@ -965,7 +978,7 @@ class PiEEGServer:
             await asyncio.sleep(STREAM_BATCH_S)
             while not queue.empty():
                 batch.append(queue.get_nowait())
-            if self._impedance_active:
+            if self._impedance_active and self._impedance_acq is self._acq:
                 # Test current on every channel: not EEG. Nothing goes out
                 # (clients were told the check started), and it stays out of
                 # the filters and band powers.
