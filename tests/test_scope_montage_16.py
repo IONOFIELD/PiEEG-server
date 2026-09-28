@@ -108,3 +108,20 @@ def test_show_only_one_side_on_the_ironbci(tmp_path):
                                                           ("Cz", "Pz")]
     m.show_only("all")
     assert all(r["on"] for r in m.rows())
+
+
+def test_unwired_electrodes_leave_every_montage(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    wired = {"Fp1", "F3", "C3", "P3", "O1", "Fz", "Cz", "Pz"}
+    m.set_wired(m.electrodes, False)
+    m.set_wired(wired, True)
+    assert [r["pair"] for r in m.visible_rows()] == [
+        ("Fp1", "F3"), ("F3", "C3"), ("C3", "P3"), ("P3", "O1"),
+        ("Fz", "Cz"), ("Cz", "Pz")]
+    assert not m.dirty()                  # a session choice, not an edit
+    assert set(m.montage_inputs()) == {m.site_index[s] + 1 for s in
+                                       wired - {"Fz"} | {"Fz"}}
+    m.load_montage("Transverse")
+    assert {p for r in m.visible_rows() for p in r["pair"]} <= wired
+    m.set_wired(m.electrodes, True)
+    assert len(m.visible_rows()) == len(m.rows())

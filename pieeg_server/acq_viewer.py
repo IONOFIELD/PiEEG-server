@@ -116,30 +116,29 @@ MONTAGE_PRESETS_16: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-# The same three over the IronBCI-32's 32 sites (10-10 names from its
-# electrode map, see scope_console._IRONBCI32_ELECTRODES). It has the midline,
-# so these are the full 18-row ACNS chains, in the same order as the 16-site
-# set with the midline last. Its other 10-10 sites (FT7, CP3, POz …) are
-# recorded; add rows for them from the channel box.
+# The same three over the IronBCI-32's sites (classic 10-20 names, see
+# scope_console._IRONBCI32_ELECTRODES). It has the midline, so these are the
+# full 18-row ACNS chains, in the same order as the 16-site set with the
+# midline last.
 MONTAGE_PRESETS_32: dict[str, list[tuple[str, str]]] = {
     "Double banana": [
-        ("Fp1", "F7"), ("F7", "T7"), ("T7", "P7"), ("P7", "O1"),
+        ("Fp1", "F7"), ("F7", "T3"), ("T3", "T5"), ("T5", "O1"),
         ("Fp1", "F3"), ("F3", "C3"), ("C3", "P3"), ("P3", "O1"),
-        ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"), ("P8", "O2"),
+        ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"), ("T6", "O2"),
         ("Fp2", "F4"), ("F4", "C4"), ("C4", "P4"), ("P4", "O2"),
         ("Fz", "Cz"), ("Cz", "Pz"),
     ],
     "Transverse": [
         ("F7", "Fp1"), ("Fp1", "Fp2"), ("Fp2", "F8"),
         ("F7", "F3"), ("F3", "Fz"), ("Fz", "F4"), ("F4", "F8"),
-        ("T7", "C3"), ("C3", "Cz"), ("Cz", "C4"), ("C4", "T8"),
-        ("P7", "P3"), ("P3", "Pz"), ("Pz", "P4"), ("P4", "P8"),
-        ("P7", "O1"), ("O1", "O2"), ("O2", "P8"),
+        ("T3", "C3"), ("C3", "Cz"), ("Cz", "C4"), ("C4", "T4"),
+        ("T5", "P3"), ("P3", "Pz"), ("Pz", "P4"), ("P4", "T6"),
+        ("T5", "O1"), ("O1", "O2"), ("O2", "T6"),
     ],
     "Circumferential": [
-        ("Fp1", "Fp2"), ("Fp2", "F8"), ("F8", "T8"), ("T8", "P8"),
-        ("P8", "O2"), ("O2", "O1"), ("O1", "P7"), ("P7", "T7"),
-        ("T7", "F7"), ("F7", "Fp1"),
+        ("Fp1", "Fp2"), ("Fp2", "F8"), ("F8", "T4"), ("T4", "T6"),
+        ("T6", "O2"), ("O2", "O1"), ("O1", "T5"), ("T5", "T3"),
+        ("T3", "F7"), ("F7", "Fp1"),
     ],
 }
 
@@ -565,6 +564,11 @@ class ViewerModel:
         self.fs = fs
         self.electrodes = list(electrodes)
         self.site_index = {name: i for i, name in enumerate(self.electrodes)}
+        # Electrodes switched off for this session (Choose leads >
+        # Electrodes): the ones not wired for this study. Every lead that
+        # uses one is off the screen in every montage. Not saved: each
+        # launch starts with the whole board.
+        self.unwired: set[str] = set()
         self.win = int(round(WINDOW_SECONDS * fs))
         self.raw = np.zeros((self.win, num_channels), dtype=np.float64)
         self.filt = np.zeros((self.win, num_channels), dtype=np.float64)
@@ -912,11 +916,24 @@ class ViewerModel:
         """Sweep position (0..win-1) the next sample will be written to."""
         return self.total % self.win
 
+    def shown(self, row):
+        """True when a row is on screen: switched on, and both of its
+        electrodes wired."""
+        return row["on"] and not (set(row["pair"]) & self.unwired)
+
+    def visible_rows(self):
+        return [r for r in self.rows() if self.shown(r)]
+
+    def set_wired(self, sites, wired):
+        """Mark electrodes wired (True) or not (False) for this session."""
+        for site in sites:
+            if site in self.site_index:
+                (self.unwired.discard if wired else self.unwired.add)(site)
+
     def montage_inputs(self):
         """1-based chip inputs of the electrodes in the visible rows."""
-        return sorted({self.site_index[site] + 1 for r in self.rows()
-                       if r["on"] for site in r["pair"]
-                       if site in self.site_index})
+        return sorted({self.site_index[site] + 1 for r in self.visible_rows()
+                       for site in r["pair"] if site in self.site_index})
 
     def derivation(self, pair, filt=None):
         """Filtered (upper - lower) trace across the window, in microvolts."""
@@ -1708,50 +1725,95 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     canvas.bind("<Button-3>", lambda e: _channel_box(e))
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
 
-    def _leads_box():
-        # Pick which of the montage's leads are on screen, many at a time:
-        # one tap-toggle per lead, plus quick sets by side of the head.
-        # Edits the current montage's rows (the "*" until Save), like Hide
-        # in the channel box. Recordings always keep every input.
-        win, body = _popup(f"Leads · {model.current}")
+    def _leads_box(view="leads"):
+        # Which leads are on screen, two ways:
+        #   Leads      — one tap-toggle per row of the current montage (the
+        #                "*" until Save, like Hide in the channel box)
+        #   Electrodes — the board's inputs ("E1 F7"): switch off the ones
+        #                not wired for this study and every lead using them
+        #                leaves the screen, in every montage (this session)
+        # Quick sets by side of the head in both. Display only: recordings
+        # always keep every input.
+        win, body = _popup(f"Choose leads · {model.current}")
+        tabs = tk.Frame(body, bg=C["raised"])
+        tabs.pack(fill="x", pady=(4, 0))
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(4, 4))
         grid = tk.Frame(body, bg=C["raised"])
         grid.pack()
         rows = model.rows()
-        cols = 3 if len(rows) <= 24 else 4
+        sites = list(model.electrodes)
         cells = []
 
+        def _button(parent, text, cmd, lit=False):
+            b = tk.Label(parent, text=text, padx=8, pady=3, cursor="hand2",
+                         bg=C["accent"] if lit else C["surface"],
+                         fg=C["text"], font=(_MONO, _fs(9)),
+                         highlightthickness=1,
+                         highlightbackground=C["border_hi"])
+            b.pack(side="left", padx=(0, 4))
+            b.bind("<Button-1>", lambda e: cmd())
+            return b
+
         def paint():
-            for cell, r in zip(cells, rows):
-                cell.configure(bg=C["accent"] if r["on"] else C["surface"],
-                               fg=C["text"] if r["on"] else C["text_dim"])
-            n = sum(r["on"] for r in rows)
-            count.configure(text=f"{n}/{len(rows)} shown")
+            if view == "leads":
+                states = [(model.shown(r), r["on"]) for r in rows]
+                for cell, (shown, on) in zip(cells, states):
+                    cell.configure(
+                        bg=C["accent"] if shown else C["surface"],
+                        fg=(C["text"] if shown else C["text_sec"] if on
+                            else C["text_dim"]))
+                n = sum(s for s, _ in states)
+                count.configure(text=f"{n}/{len(rows)} shown")
+            else:
+                for cell, site in zip(cells, sites):
+                    on = site not in model.unwired
+                    cell.configure(bg=C["accent"] if on else C["surface"],
+                                   fg=C["text"] if on else C["text_dim"])
+                count.configure(text=f"{len(sites) - len(model.unwired)}/"
+                                     f"{len(sites)} wired")
             _edited()
 
         def tap(i):
-            model.toggle_row(i)
+            if view == "leads":
+                model.toggle_row(i)
+            else:
+                site = sites[i]
+                model.set_wired([site], site in model.unwired)
             paint()
 
         def only(side):
-            model.show_only(side)
+            if view == "leads":
+                model.show_only(side)
+            else:
+                keep = [x for x in sites if side == "all"
+                        or (side != "none" and site_side(x) == side)]
+                model.set_wired(sites, False)
+                model.set_wired(keep, True)
             paint()
 
+        def switch(v):
+            _close_popup()
+            _leads_box(v)
+
+        _button(tabs, "Leads", lambda: switch("leads"), lit=view == "leads")
+        _button(tabs, "Electrodes", lambda: switch("electrodes"),
+                lit=view == "electrodes")
         for label, side in (("All", "all"), ("None", "none"),
                             ("Left", "left"), ("Midline", "mid"),
                             ("Right", "right")):
-            b = tk.Label(quick, text=label, bg=C["surface"], fg=C["text"],
-                         padx=8, pady=3, cursor="hand2",
-                         font=(_MONO, _fs(9)), highlightthickness=1,
-                         highlightbackground=C["border_hi"])
-            b.pack(side="left", padx=(0, 4))
-            b.bind("<Button-1>", lambda e, sd=side: only(sd))
+            _button(quick, label, lambda sd=side: only(sd))
         count = tk.Label(quick, bg=C["raised"], fg=C["text_sec"],
                          font=(_MONO, _fs(9)))
         count.pack(side="right", padx=(8, 0))
-        for i, r in enumerate(rows):
-            cell = tk.Label(grid, text=r["name"], width=11, pady=4,
+        if view == "leads":
+            texts = [r["name"] for r in rows]
+            cols, width = (3 if len(rows) <= 24 else 4), 11
+        else:
+            texts = [f"{model.elabel(x)} {x}" for x in sites]
+            cols, width = 4, 9
+        for i, text in enumerate(texts):
+            cell = tk.Label(grid, text=text, width=width, pady=3,
                             cursor="hand2", font=(_MONO, _fs(9)))
             cell.grid(row=i // cols, column=i % cols, padx=2, pady=2)
             cell.bind("<Button-1>", lambda e, k=i: tap(k))
@@ -2060,7 +2122,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _TAP_PX = 6
 
     def _meas_rows(y0, y1):
-        rows = [r for r in model.rows() if r["on"]]
+        rows = model.visible_rows()
         H = canvas.winfo_height()
         if not rows or H <= 2:
             return []
@@ -2150,7 +2212,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _row_at_y(y):
         """The visible row under a canvas y-coordinate, or None."""
-        rows = [r for r in model.rows() if r["on"]]
+        rows = model.visible_rows()
         H = canvas.winfo_height()
         if not rows or H <= 2:
             return None
@@ -2222,7 +2284,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         rows = model.rows()
         r = _row_at_y(evt.y)
         i = next((k for k, row in enumerate(rows) if row is r), None)
-        vis = [k for k, row in enumerate(rows) if row["on"]]
+        vis = [k for k, row in enumerate(rows) if model.shown(row)]
         hidden = [k for k, row in enumerate(rows) if not row["on"]]
 
         win, body = _popup(model.row_label(r) if r else "New channel")
@@ -3236,7 +3298,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         canvas.delete("trace")
         W = canvas.winfo_width()
         H = canvas.winfo_height()
-        rows = [r for r in model.rows() if r["on"]]
+        rows = model.visible_rows()
         n = len(rows)
         if not (W > 2 and H > 2 and n > 0):
             _sweep_reset()
