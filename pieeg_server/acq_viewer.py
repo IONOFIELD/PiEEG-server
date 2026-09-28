@@ -233,6 +233,20 @@ CONTACT_WINDOW = 8
 # handling, none with BIO seated; the DC levels took ~2 s to settle after
 # BIO went back on). So REF shows no verdict for this long after GND reads off.
 REF_SETTLE_AFTER_GND_S = 3.0
+# Live contact ESTIMATE for a board with no lead-off comparators and no test
+# current (the IronBCI-32): each input's mains pickup against the median of
+# the board's wired inputs. A lifted or high-impedance lead picks up far more
+# mains than its neighbours. Relative only: it can't see every lead being
+# equally poor, and it is not impedance. Unmeasured on a person yet.
+SIGNAL_CONTACT_S = 2.0          # signal judged per estimate
+SIGNAL_CONTACT_EVERY_S = 1.0    # one estimate this often
+SIGNAL_CONTACT_HOLD = 3         # estimates a colour must last before it shows
+SIGNAL_CONTACT_AMBER = 3.0      # x the board's median mains pickup
+SIGNAL_CONTACT_RED = 10.0
+SIGNAL_CONTACT_MIN_UV = 3.0     # mains pickup below this is always fine
+SIGNAL_CONTACT_REF_MIN_UV = 1.0  # median floor (on battery it is ~1 µV)
+SIGNAL_CONTACT_FLAT_UV = 0.05   # an input this still isn't reading at all
+SIGNAL_CONTACT_RAIL = 0.95      # of full scale: railed
 
 # ── dashboard (Geist) palette, adapted for the Tk scope ──────────────────────
 # Mirrors the dashboard's design tokens (dashboard/src/index.css): near-black
@@ -561,11 +575,82 @@ class ContactTracker:
         return self._verdict(self._gnd)
 
 
+def mains_pickup(block, fs, line):
+    """Amplitude (µV) of the `line` Hz mains in each column of block (N x
+    channels µV), Hann-windowed so electrode drift doesn't leak into it."""
+    x = np.asarray(block, dtype=np.float64)
+    n = x.shape[0]
+    w = np.hanning(n)
+    t = np.arange(n) / fs
+    ph = np.exp(-2j * np.pi * line * t) * w
+    x = x - x.mean(axis=0)
+    return 2.0 * np.abs(ph @ x) / w.sum()
+
+
+def grade_signal_contact(block, fs, line, full_scale_uv, wired):
+    """One contact estimate per column of block: "green", "amber", "red", or
+    None for an input that isn't wired (wired: bool per column). Red = flat
+    (reads nothing), railed, or >= SIGNAL_CONTACT_RED x the median mains
+    pickup of the wired, working inputs; amber >= SIGNAL_CONTACT_AMBER x."""
+    x = np.asarray(block, dtype=np.float64)
+    amp = mains_pickup(x, fs, line)
+    flat = x.std(axis=0) < SIGNAL_CONTACT_FLAT_UV
+    railed = np.max(np.abs(x), axis=0) >= SIGNAL_CONTACT_RAIL * full_scale_uv
+    ok = [i for i in range(x.shape[1]) if wired[i] and not flat[i]
+          and not railed[i]]
+    ref = max(float(np.median(amp[ok])) if ok else 0.0,
+              SIGNAL_CONTACT_REF_MIN_UV)
+    out = []
+    for i in range(x.shape[1]):
+        if not wired[i]:
+            out.append(None)
+        elif flat[i] or railed[i]:
+            out.append("red")
+        elif amp[i] < SIGNAL_CONTACT_MIN_UV:
+            out.append("green")
+        else:
+            r = amp[i] / ref
+            out.append("red" if r >= SIGNAL_CONTACT_RED else
+                       "amber" if r >= SIGNAL_CONTACT_AMBER else "green")
+    return out
+
+
+class SignalContact:
+    """Debounced grade_signal_contact() per input: a colour shows once it has
+    lasted SIGNAL_CONTACT_HOLD estimates (the mildest of them), so a moment
+    of artifact doesn't flash a lead red."""
+
+    _RANK = {"green": 0, "amber": 1, "red": 2}
+
+    def __init__(self, num_inputs, hold=SIGNAL_CONTACT_HOLD):
+        self._hist = [deque(maxlen=hold) for _ in range(num_inputs)]
+
+    def update(self, grades):
+        for hist, g in zip(self._hist, grades):
+            if g is None:
+                hist.clear()
+            else:
+                hist.append(g)
+
+    def clear(self):
+        for hist in self._hist:
+            hist.clear()
+
+    def electrode(self, index):
+        if not 0 <= index < len(self._hist):
+            return None
+        hist = self._hist[index]
+        if len(hist) < hist.maxlen:
+            return None
+        return min(hist, key=self._RANK.__getitem__)
+
+
 class ViewerModel:
     """Holds rolling data + montage state; no Tk, so it is unit-testable."""
 
     def __init__(self, num_channels, fs, electrodes, store=None,
-                 input_labels=None, boards=None, extra_rows=None):
+                 input_labels=None, boards=None, extra_rows=None,
+                 signal_contact_inputs=0):
         self.nch = num_channels
         self.fs = fs
         self.electrodes = list(electrodes)
@@ -596,6 +681,10 @@ class ViewerModel:
         self.frozen = None
         self.filter = StreamingFilter(num_channels, fs)
         self.contact = ContactTracker(num_channels)
+        # The first signal_contact_inputs inputs (a board without lead-off
+        # detection) get the mains-pickup contact estimate instead.
+        self.signal_contact_n = int(signal_contact_inputs)
+        self.signal_contact = SignalContact(self.signal_contact_n)
         # Per-montage working copies (session edits live here; presets never
         # change). Each row: {"pair": (a,b), "name": "Fp1-C3", "on": True}.
         self.sessions: dict[str, list[dict]] = {}
@@ -773,7 +862,24 @@ class ViewerModel:
 
     def site_contact(self, site):
         """Contact verdict (green/amber/red/None) for a scalp site's electrode."""
-        return self.contact.electrode(self.site_index[site])
+        i = self.site_index[site]
+        if i < self.signal_contact_n:
+            return self.signal_contact.electrode(i)
+        return self.contact.electrode(i)
+
+    def update_signal_contact(self, full_scale_uv):
+        """One contact estimate for the signal_contact inputs from the last
+        SIGNAL_CONTACT_S of raw signal (see grade_signal_contact). Returns
+        False while there isn't that much signal yet."""
+        n = self.signal_contact_n
+        k = int(round(SIGNAL_CONTACT_S * self.fs))
+        if not n or self.filled < k:
+            return False
+        line = self.mains_line or self.cutoffs[2] or 60.0
+        wired = [self.electrodes[i] not in self.unwired for i in range(n)]
+        self.signal_contact.update(grade_signal_contact(
+            self.raw[-k:, :n], self.fs, line, full_scale_uv, wired))
+        return True
 
     def epair_name(self, pair):
         """'E1-E3' style name for a bipolar (upper, lower) site pair."""
@@ -1243,14 +1349,17 @@ def _compact_ohms(ohms):
 
 def average_impedance(result, inputs):
     """AVG IMP over 1-based `inputs` from an impedance result dict
-    (ImpedanceResult.to_dict()): (mean Ω, not_measured). The mean covers only
+    (ImpedanceResult.to_dict(), optionally with "first_input": the input
+    its first lead is on): (mean Ω, not_measured). The mean covers only
     leads that were measured (status "ok"); nothing is stood in for the
     others, which not_measured counts (off, railed, above the calibrated
     range, uncalibrated). REF and GND are never averaged in. mean is None
     when no lead was measured or the readings were withheld."""
     if not result:
         return None, 0
-    mine = [lead for i, lead in enumerate(result["leads"], start=1)
+    # a second board's check says where its leads sit on the combined screen
+    first = int(result.get("first_input") or 1)
+    mine = [lead for i, lead in enumerate(result["leads"], start=first)
             if i in set(inputs)]
     vals = [lead["ohms"] for lead in mine if lead.get("status") == "ok"]
     if result.get("problem") or not vals:
@@ -1319,8 +1428,15 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                impedance_control=None, stop_event=None,
                annotate_control=None, recordings_dir=None,
                calibrate_control=None, board_warning=None,
-               input_labels=None, boards=None, extra_rows=None):
+               input_labels=None, boards=None, extra_rows=None,
+               impedance_first_input=1, signal_contact_inputs=0):
     """Open the viewer window. Drains frame dicts from frame_queue.
+
+    impedance_first_input: the input (1-based) the impedance check's first
+    lead is on — with two boards the check runs on the second one only, and
+    only its inputs are held flat meanwhile. signal_contact_inputs: that many
+    leading inputs (a board with no lead-off detection, the IronBCI-32) get a
+    live contact ESTIMATE dot from their mains pickup (SignalContact).
 
     board_warning: text shown as a red banner on the chart for the whole
     session (the board came up wrong, e.g. dead inputs or an odd rate), and
@@ -1374,7 +1490,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     electrodes = electrodes or DEFAULT_ELECTRODES[:num_channels]
     model = ViewerModel(num_channels, fs, electrodes, store=MontageStore(),
                         input_labels=input_labels, boards=boards,
-                        extra_rows=extra_rows)
+                        extra_rows=extra_rows,
+                        signal_contact_inputs=signal_contact_inputs)
+    # inputs the impedance check drives: held flat while it runs
+    imp_col0 = max(0, int(impedance_first_input) - 1)
 
     C = GEIST                               # short alias for the palette
     root = tk.Tk()
@@ -2042,6 +2161,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     _BAND_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
     _imp = {"future": None, "result": None, "at": 0.0, "panel_until": 0.0,
             "panel_box": None}
+    # with two boards, which one the check runs on (the one holding the
+    # inputs from impedance_first_input on)
+    _imp_board = next((name.upper() for name, keys in model.boards
+                       if keys and model.site_index.get(keys[0]) == imp_col0),
+                      "") if imp_col0 else ""
 
     def _run_impedance():
         if impedance_control is None or _imp["future"] is not None:
@@ -2106,8 +2230,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _imp["panel_box"] = None
         if _imp["future"] is not None:
             tid = canvas.create_text(W / 2, H / 2, anchor="center",
-                                     text="MEASURING IMPEDANCE\n"
-                                          "keep hands off the electrodes",
+                                     text=(f"MEASURING {_imp_board} "
+                                           "IMPEDANCE\n"
+                                           "keep hands off its electrodes"
+                                           if _imp_board else
+                                           "MEASURING IMPEDANCE\n"
+                                           "keep hands off the electrodes"),
                                      justify="center", fill=C["text"],
                                      font=(_MONO, _fs(11), "bold"), tags="trace")
             x0, y0, x1, y1 = canvas.bbox(tid)
@@ -2122,9 +2250,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         lines = [(time.strftime("IMPEDANCE  %H:%M:%S",
                                 time.localtime(_imp["at"])), C["text_sec"])]
         withheld = bool(res.get("problem"))
+        first = int(res.get("first_input") or 1) - 1
         for site in model.electrodes:
-            i = model.site_index[site]
-            lead = res["leads"][i] if i < len(res["leads"]) else None
+            i = model.site_index[site] - first
+            lead = res["leads"][i] if 0 <= i < len(res["leads"]) else None
             if lead is None:
                 continue
             if withheld:
@@ -3016,7 +3145,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             # An impedance check is running: the channels carry its test
             # current, not EEG. Hold the last sample (a flat line, no filter
             # step) instead of scrolling 10 s of 31 Hz blocks across the view.
-            arr = np.repeat(model.raw[-1:], arr.shape[0], axis=0)
+            # With two boards only the checked board's inputs are held.
+            arr = np.array(arr, dtype=np.float64, copy=True)
+            arr[:, imp_col0:] = model.raw[-1, imp_col0:]
         model.push(arr)
         return arr.shape[0]
 
@@ -3320,11 +3451,31 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                            fill=C["axis"], font=(_MONO, _fs(8)), tags="deco")
         canvas.tag_raise("marks")           # notes stay over the lead boxes
 
+    _sig = {"next": 0.0}
+
+    def _poll_signal_contact():
+        # the estimate from each input's mains pickup (boards without lead-off
+        # detection); live signal only, and not while inputs are held
+        if not model.signal_contact_n:
+            return
+        now = time.monotonic()
+        if now < _sig["next"]:
+            return
+        _sig["next"] = now + SIGNAL_CONTACT_EVERY_S
+        if _rev["on"] or (_imp["future"] is not None and imp_col0 == 0):
+            model.signal_contact.clear()
+            return
+        try:
+            model.update_signal_contact(full_scale_uv)
+        except Exception:                   # noqa: BLE001 - display only
+            pass
+
     def _draw_dots():
         # contact dots flanking the electrode pair: left = upper electrode,
         # right = lower (green on / amber intermittent / red off). None until
         # the first lead-off readout. Redrawn only when a colour changes.
-        if contact_source is None:
+        # Inputs without lead-off detection show the mains-pickup estimate.
+        if contact_source is None and not model.signal_contact_n:
             return
         cols = tuple(_CONTACT_FG.get(model.site_contact(site))
                      for pair in _deco["dots"] for site, _, _ in pair)
@@ -3347,6 +3498,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return
         got = _drain_queue()
         _poll_contact()
+        _poll_signal_contact()
         _poll_mains()
         _poll_record()
         _poll_marks()
