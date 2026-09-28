@@ -711,8 +711,12 @@ def export_master(primary_journal, other_journals, out_path):
     os.replace(tmp, out_path)
     logger.info("Wrote master BDF+ %s (%d boards, %d signals, %d s)",
                 out_path, len(boards), len(signals), seconds)
+    start_unix_ns = (int(round(clock["unix_ns"] + (t0 - clock["monotonic_ns"])))
+                     if clock and clock.get("unix_ns") else None)
     return out_path, {"method": "every board on the Pi clock, " +
-                      timebase.METHOD, "seconds": seconds, "boards": report}
+                      timebase.METHOD, "seconds": seconds,
+                      "start_monotonic_ns": int(round(t0)),
+                      "start_unix_ns": start_unix_ns, "boards": report}
 
 
 def synced_path_for(bdf_path):
