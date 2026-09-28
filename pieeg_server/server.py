@@ -104,6 +104,10 @@ class PiEEGServer:
         self._spec_buffers: list = []   # populated lazily on first frame
         self._spec_frame: int = 0
         self._spec_cache: dict | None = None   # last computed band powers
+        # a second board recorded with this one (add_record_source), and its
+        # writers while a recording runs
+        self._extra_sources: list[dict] = []
+        self._extra_rec: list[dict] = []
 
     def spectrum_cache(self) -> dict | None:
         """Return the latest band-power snapshot, or None during warm-up."""
@@ -641,9 +645,45 @@ class PiEEGServer:
         self._record_start_time = time.time()
         self._journal_task = asyncio.create_task(self._journal.run())
         self._recorder_task = asyncio.create_task(self._recorder.run())
+        self._extra_rec = [self._start_extra(src, raw_dir, session)
+                           for src in self._extra_sources]
         logger.info("Recording started: journal=%s csv=%s",
                     self._journal.journal_path, output)
         await self._broadcast_record_status()
+
+    def _start_extra(self, src, raw_dir, session):
+        """Start a second board's journal + CSV (see add_record_source)."""
+        acq = src["acq"]
+        hw = acq._hw
+        if getattr(hw, "spike_threshold", -1) != -1:
+            hw.spike_threshold = -1         # recordings are raw
+        name = f"{session}_{src['tag']}"
+        kwargs = {}
+        if acq.pga_gain is not None:
+            kwargs = {"gain": acq.pga_gain, "vref_uv": acq.vref_uv}
+        if src.get("reference"):
+            kwargs["reference"] = src["reference"]
+        journal = JournalWriter(
+            acq, out_dir=raw_dir, session_name=name,
+            num_channels=acq.num_channels,
+            sample_rate=acq.raw_rate,
+            prefilter=None, channel_labels=src["labels"], **kwargs)
+        rec = Recorder(acq, output=raw_dir / f"{name}.csv",
+                       num_channels=acq.num_channels)
+        logger.info("Recording second board: journal=%s", journal.journal_path)
+        return {"tag": src["tag"], "journal": journal, "recorder": rec,
+                "tasks": [asyncio.create_task(journal.run()),
+                          asyncio.create_task(rec.run())]}
+
+    async def _stop_extra(self):
+        for x in self._extra_rec:
+            for t in x["tasks"]:
+                t.cancel()
+            for t in x["tasks"]:
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
 
     async def _stop_recording(self):
         """Stop the current recording."""
@@ -663,6 +703,7 @@ class PiEEGServer:
                 await task
             except asyncio.CancelledError:
                 pass
+        await self._stop_extra()
         frames = self._recorder.frames_written
         output = self._recorder._output
         filename = output.name
@@ -682,6 +723,7 @@ class PiEEGServer:
         self._recorder_task = None
         self._journal = None
         self._journal_task = None
+        self._extra_rec = []
         self._record_start_time = None
         stop_info = {
             "filename": filename,
@@ -767,6 +809,16 @@ class PiEEGServer:
                         summary=str(summary.resolve()),
                         **({"bdf_synced": str(synced.resolve())}
                            if synced else {}))
+            for x in self._extra_rec:
+                try:
+                    b2, _ = await loop.run_in_executor(
+                        None, edf_export.export_board,
+                        x["journal"].journal_path, journal_path, folder)
+                    logger.info("BDF+ exported (%s): %s", x["tag"], b2)
+                    info[f"bdf_{x['tag']}"] = str(b2.resolve())
+                except Exception as exc:  # noqa: BLE001 - journal is safe
+                    logger.warning("%s BDF export deferred (%s)", x["tag"],
+                                   exc)
         except Exception as exc:  # noqa: BLE001 - export must not block stop
             logger.warning("BDF export deferred (%s); journal is safe at %s",
                            exc, journal_path)
@@ -1353,6 +1405,15 @@ class PiEEGServer:
         self._clients -= stale
 
     # ── Spike config ───────────────────────────────────────────────────
+
+    def add_record_source(self, acquisition, tag, channel_labels,
+                          reference=None):
+        """A second board recorded alongside this server's own: its journal
+        and CSV start and stop with the recording, named <session>_<tag>, and
+        its own BDF+ is exported beside the session's on stop."""
+        self._extra_sources.append({"acq": acquisition, "tag": tag,
+                                    "labels": list(channel_labels),
+                                    "reference": reference})
 
     def _recording_active(self) -> bool:
         return bool(self._recorder_task and not self._recorder_task.done())

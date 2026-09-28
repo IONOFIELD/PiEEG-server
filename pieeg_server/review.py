@@ -52,6 +52,9 @@ def list_sessions(recordings_dir):
         return []
     out = []
     for journal in list(d.glob("*/raw/*.eegj")) + list(d.glob("*.eegj")):
+        if (journal.parent.name == "raw"
+                and journal.parent.parent.name != journal.stem):
+            continue                        # a second board's journal
         session, folder, raw, flat = _session_of(journal)
         try:
             meta = json.loads((raw / f"{session}.json").read_text())
@@ -275,6 +278,11 @@ def rebuild_exports(journal):
         finally:
             if tmp.exists():
                 tmp.unlink()
+        for other in sorted(raw.glob(f"{session}_*.eegj")):
+            try:                            # a second board: its notes too
+                edf_export.export_board(other, journal, folder)
+            except Exception as e:          # noqa: BLE001 - its journal is safe
+                logger.warning("%s not rebuilt: %s", other.stem, e)
         synced = None
         try:
             synced = edf_export.export_synced(journal, raw / f"{session}.json",

@@ -374,6 +374,11 @@ SCOPE_CHANGELOG = [
             "top in blue, then the PiEEG's EKG (E1-E2) in red and EMG 1-3 "
             "(E3-E4, E5-E6, E7-E8) in white; Choose leads > Electrodes has a "
             "section per board. (Recording both boards comes next.)"),
+    ("6.7", "Rec records both boards: <session>.bdf is the IronBCI-32's EEG "
+            "and <session>_pg.bdf the PiEEG's EKG/EMG (labelled ECG/EMG), "
+            "each raw at its own rate with its own summary. The session "
+            "keeps one notes file; each board's BDF+ gets the notes at its "
+            "own samples, by time. Files lists the session once."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -404,6 +409,14 @@ PG_ROWS = [("X1", "X2", "EKG"), ("X3", "X4", "EMG 1"),
 
 def _pg_keys(n: int) -> list[str]:
     return [f"X{i}" for i in range(1, n + 1)]
+
+
+def _pg_labels(n: int) -> list[str]:
+    """BDF+ labels for the PiEEG's inputs when it records polygraphy: the
+    signal type its default row uses them for, and the input number."""
+    kinds = {1: "ECG", 2: "ECG"}
+    return [f"{kinds.get(i, 'EMG' if i <= 8 else 'PG')} E{i}-REF"
+            for i in range(1, n + 1)]
 
 
 def _pg_leadoff(source, offset):
@@ -934,6 +947,12 @@ def main(argv=None):
         server._reference_text = ("as wired on the IronBCI-32 board "
                                   "(not the PiEEG's SRB1 REF)")
     server.enable_webhooks()
+    if acq2 is not None:
+        # recorded with the EEG, as <session>_pg: raw per input, labelled
+        # by what the default rows use them for (EKG on E1-E2, EMG after)
+        server.add_record_source(acq2, "pg", _pg_labels(pg_n),
+                                 reference="PiEEG inputs against its own "
+                                           "SRB1 REF (polygraphy)")
 
     dashboard = None
     if not args.no_dashboard:
