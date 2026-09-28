@@ -734,6 +734,12 @@ class ViewerModel:
         """
         return f"E{self.site_index[site] + 1}"
 
+    def input_text(self, site):
+        """"E1 F7" for an input on a 10-20 site, "E2" for one without (its
+        site IS its input number)."""
+        e = self.elabel(site)
+        return e if site == e else f"{e} {site}"
+
     def site_contact(self, site):
         """Contact verdict (green/amber/red/None) for a scalp site's electrode."""
         return self.contact.electrode(self.site_index[site])
@@ -1063,7 +1069,7 @@ def sweep_envelope(trace, head, ncol):
 
 
 def site_side(site):
-    """"left" / "mid" / "right" for a 10-20/10-10 site name (odd number =
+    """"left" / "mid" / "right" for a 10-20 site name (odd number =
     left, even = right, z = midline), else None (e.g. an unnamed E17)."""
     s = str(site)
     if s[-1:].lower() == "z":
@@ -1475,7 +1481,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     # Each electrode is shown as "E1  Fp1" — the chip input AND its scalp site —
     # so you select by the physical electrode you seated on the head.
-    elec_choices = [(f"{model.elabel(s)}  {s}", s) for s in model.electrodes]
+    elec_choices = [(model.input_text(s).replace(" ", "  "), s)
+                    for s in model.electrodes]
     elec_display = [d for d, _ in elec_choices]
     _disp_to_site = dict(elec_choices)
     _site_to_disp = {site: d for d, site in elec_choices}
@@ -1810,7 +1817,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             texts = [r["name"] for r in rows]
             cols, width = (3 if len(rows) <= 24 else 4), 11
         else:
-            texts = [f"{model.elabel(x)} {x}" for x in sites]
+            texts = [model.input_text(x) for x in sites]
             cols, width = 4, 9
         for i, text in enumerate(texts):
             cell = tk.Label(grid, text=text, width=width, pady=3,
@@ -2074,7 +2081,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 # lead's calibrated range, "off" or "no cal".
                 value = lead["text"]
                 fg = _BAND_FG.get(lead["band"], C["text_dim"])
-            lines.append((f"{model.elabel(site):<3} {site:<5}{value:>9}", fg))
+            shown_site = "" if site == model.elabel(site) else site
+            lines.append((f"{model.elabel(site):<3} {shown_site:<5}{value:>9}",
+                          fg))
         verdict = {"green": "ok", "red": "OFF", None: "?"}
         lines.append((f"REF {verdict.get(res.get('ref'), '?'):<4}"
                       f"GND {verdict.get(res.get('gnd'), '?')}",
@@ -3213,11 +3222,13 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                                     tags="deco")
             # 5) lead labels centred where the trace crosses, on a small
             #    chip so they stay readable: the CHIP-INPUT pair (E1-E3) on
-            #    top — which physical electrode to reseat — and the scalp
-            #    SITE pair (Fp1-C3) dimmed under it. Mono, per the Geist
+            #    top in grey — which physical electrode to reseat — and the
+            #    channel's SITE pair (Fp1-C3) in white under it. Mono, per the Geist
             #    "numeric data is monospace" convention.
             e_name = model.epair_name(r["pair"])
             s_name = model.row_label(r)
+            if s_name == e_name:                # inputs without a site
+                s_name = ""
             chip = max(28.0, max(len(e_name), len(s_name)) * 6.0)
             # Short rows (16 leads on the 480 px panel) make the box narrow;
             # keep the chip and its left contact dot on the canvas.
@@ -3226,12 +3237,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             canvas.create_rectangle(cx - chip / 2, base - ch, cx + chip / 2,
                                     base + ch, fill=C["canvas_bg"],
                                     outline="", tags="deco")
-            e_text = canvas.create_text(cx, base - 5, text=e_name,
-                                        fill=C["text"],
-                                        font=(_MONO, _fs(8), "bold"),
-                                        tags="deco")
-            canvas.create_text(cx, base + 6, text=s_name, fill=C["text_sec"],
-                               font=(_MONO, _fs(8)), tags="deco")
+            # the channel's 10-20 name in white, its E-numbers in grey (a
+            # row of site-less inputs has only the E-numbers: those in white)
+            e_text = canvas.create_text(
+                cx, base - 5, text=e_name,
+                fill=C["text_sec"] if s_name else C["text"],
+                font=(_MONO, _fs(8), "" if s_name else "bold"), tags="deco")
+            canvas.create_text(cx, base + 6, text=s_name, fill=C["text"],
+                               font=(_MONO, _fs(8), "bold"), tags="deco")
             tx0, _, tx1, _ = canvas.bbox(e_text)
             _deco["dots"].append(((r["pair"][0], tx0 - 7, base),
                                   (r["pair"][1], tx1 + 7, base)))
