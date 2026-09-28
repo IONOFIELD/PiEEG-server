@@ -355,6 +355,11 @@ SCOPE_CHANGELOG = [
     ("6.2", "Montage > Choose leads… picks which leads are on screen: tap "
             "each one, or All / None / Left / Midline / Right. Save keeps "
             "the choice with the montage. Recordings always keep every input."),
+    ("6.3", "Choose leads has an Electrodes view: each input as \"E1 F7\"; "
+            "switch off the ones not wired for this study and every lead "
+            "using them leaves the screen, in every montage (each launch "
+            "starts with the whole board). IronBCI-32 sites use the classic "
+            "10-20 names like the PiEEG: T3/T4/T5/T6 (not T7/T8/P7/P8)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -362,14 +367,15 @@ SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 # PiEEG-8/16: the harness order, first 8 = the 8-channel hookup.
 _ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
-# IronBCI-32: its own input -> site map (10-10 names), from the board's
-# electrode location drawing (pieeg-club/ironbci-32 images/Electrode_Location
-# .png). REF and BIAS are the ear clips.
+# IronBCI-32: its own input -> site map, from the board's electrode location
+# drawing (pieeg-club/ironbci-32 images/Electrode_Location.png), in classic
+# 10-20 names like the PiEEG (the drawing's T7/T8/P7/P8 are T3/T4/T5/T6).
+# REF and BIAS are the ear clips.
 _IRONBCI32_ELECTRODES = [
-    "F7", "FT7", "T7", "TP7", "P7", "O1", "P3", "CP3",          # 1-8
+    "F7", "FT7", "T3", "TP7", "T5", "O1", "P3", "CP3",          # 1-8
     "C3", "FC3", "F3", "Fp1", "Fz", "FCz", "Cz", "CPz",         # 9-16
     "Pz", "Oz", "O2", "P4", "CP4", "C4", "FC4", "F4",           # 17-24
-    "Fp2", "F8", "FT8", "T8", "TP8", "P8", "Fpz", "POz",        # 25-32
+    "Fp2", "F8", "FT8", "T4", "TP8", "T6", "Fpz", "POz",        # 25-32
 ]
 
 
