@@ -215,7 +215,6 @@ PX_PER_MM = 4.0           # fallback pixels per mm when the screen size is unkno
 TIMEBASE_CHOICES = [10, 15, 20, 30, 60]
 DEFAULT_TIMEBASE = 30
 REDRAW_MS = 66            # ~15 fps; gentle on a Pi 4
-SWEEP_CHUNK = 8           # trace columns per persistent canvas line
 RATE_WINDOW_S = 10.0      # the "sps" readout counts frames over this long
 # Preferred window size. Smaller screens (the Pi's 7" 800x480 DSI panel) get
 # the window maximised to fit instead.
@@ -1005,21 +1004,6 @@ def trace_y(vals, base, sens, px_per_mm, half):
     return base + np.clip(np.asarray(vals) / sens * px_per_mm, -half, half)
 
 
-def sweep_chunks(first, last, ncol, size):
-    """Column ranges (a, b), inclusive, walking forward from `first` to
-    `last` on a sweep of `ncol` columns (wrapping past the right edge), cut
-    into pieces of at most `size` columns and never across the wrap."""
-    out = []
-    c = first
-    while True:
-        end = last if last >= c else ncol - 1
-        b = min(end, c + size - 1)
-        out.append((c, b))
-        if b == last:
-            return out
-        c = (b + 1) % ncol
-
-
 def sweep_envelope(trace, head, ncol):
     """Sweep-display a rolling window as `ncol` fixed pixel columns.
 
@@ -1049,6 +1033,121 @@ def sweep_envelope(trace, head, ncol):
     vals[1::2] = np.where(lo_first, hi, lo)
     cursor_col = int(np.searchsorted(starts, head % win, side="right") - 1)
     return vals, cursor_col
+
+
+def column_envelope(seg, local_starts):
+    """Min/max of each pixel column of a sweep segment, in time order.
+
+    seg: (m, rows) samples in sweep order; local_starts: each column's first
+    index into seg (ascending, starting at 0). Returns (first, second), each
+    (rows, ncols): the column's extreme that came first, then the other —
+    the same ordering as sweep_envelope, so a column joins its neighbours on
+    the right side."""
+    lo = np.minimum.reduceat(seg, local_starts, axis=0)
+    hi = np.maximum.reduceat(seg, local_starts, axis=0)
+    m = seg.shape[0]
+    col = np.repeat(np.arange(len(local_starts)),
+                    np.diff(np.append(local_starts, m)))
+    idx = np.arange(m)[:, None]
+    big = m + 1
+    i_lo = np.minimum.reduceat(np.where(seg == lo[col], idx, big),
+                               local_starts, axis=0)
+    i_hi = np.minimum.reduceat(np.where(seg == hi[col], idx, big),
+                               local_starts, axis=0)
+    lo_first = i_lo <= i_hi
+    first = np.where(lo_first, lo, hi).T
+    second = np.where(lo_first, hi, lo).T
+    return first, second
+
+
+def _rgb(colour):
+    """'#3d8bff' -> (0x3d, 0x8b, 0xff)."""
+    c = colour.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) for i in (0, 2, 4))
+
+
+class SweepRaster:
+    """The trace layer as pixels. Rows are painted with numpy into an RGB
+    image and handed to Tk only where they changed (a few columns at the
+    sweep head per frame), as one small PPM strip. Drawing the traces as
+    canvas line items instead left Xwayland — which turns every item into
+    pixels, on one core — at 90%+ with an IronBCI-32 on screen, and the
+    picture fell seconds behind; as a strip it does a tiny image upload."""
+
+    def __init__(self, width, height, bg):
+        self.w, self.h = int(width), int(height)
+        self.bg = np.array(_rgb(bg), np.uint8)
+        self.img = np.empty((self.h, self.w, 3), np.uint8)
+        self.img[:] = self.bg
+        self.end_y = None          # (rows, ncol): last y each column drew
+        self.dirty = []            # pixel [x0, x1) spans to hand to Tk
+        self._y = np.arange(self.h)[:, None]
+
+    def clear(self, rows=0, ncol=1):
+        self.img[:] = self.bg
+        self.end_y = np.full((rows, ncol), np.nan)
+        self.dirty = [(0, self.w)]
+
+    def _px(self, c0, c1, ncol):
+        """Pixel columns of sweep columns c0..c1 (inclusive, no wrap) and,
+        for each, which of those sweep columns it shows."""
+        cols = np.arange(c0, c1 + 1)
+        x0 = cols * self.w // ncol
+        x1 = np.maximum(x0 + 1, (cols + 1) * self.w // ncol)
+        n = x1 - x0
+        px = np.repeat(x0, n) + (np.arange(n.sum())
+                                 - np.repeat(np.cumsum(n) - n, n))
+        return px, np.repeat(np.arange(len(cols)), n)
+
+    def erase(self, c0, c1, ncol):
+        """Blank sweep columns c0..c1 (inclusive, no wrap)."""
+        if c1 < c0:
+            return
+        px, _ = self._px(c0, c1, ncol)
+        self.img[:, px] = self.bg
+        self.dirty.append((int(px[0]), int(px[-1]) + 1))
+
+    def draw(self, c0, c1, ncol, first, second, colours):
+        """Paint sweep columns c0..c1 (inclusive, no wrap). first/second:
+        (rows, ncols) y pixels of each column's extremes in time order. Each
+        column is a vertical span from where the previous column ended
+        through both extremes, so the trace is continuous."""
+        rows = first.shape[0]
+        prev = (self.end_y[:, c0 - 1] if c0 > 0 and self.end_y is not None
+                else np.full(rows, np.nan))
+        start = np.concatenate([prev[:, None], second[:, :-1]], axis=1)
+        start = np.where(np.isnan(start), first, start)
+        lo = np.rint(np.minimum(np.minimum(start, first), second))
+        hi = np.rint(np.maximum(np.maximum(start, first), second))
+        lo = np.clip(lo, 0, self.h - 1).astype(np.int32)
+        hi = np.clip(hi, 0, self.h - 1).astype(np.int32)
+        px, owner = self._px(c0, c1, ncol)
+        strip = np.empty((self.h, len(px), 3), np.uint8)
+        strip[:] = self.bg
+        for r in range(rows):
+            m = (self._y >= lo[r, owner]) & (self._y <= hi[r, owner])
+            strip[m] = _rgb(colours[r])
+        self.img[:, px] = strip
+        if self.end_y is not None:
+            self.end_y[:, c0:c1 + 1] = second
+        self.dirty.append((int(px[0]), int(px[-1]) + 1))
+
+    def take_dirty(self):
+        """The changed pixel spans, merged, and forget them."""
+        spans = sorted(self.dirty)
+        self.dirty = []
+        out = []
+        for a, b in spans:
+            if out and a <= out[-1][1]:
+                out[-1] = (out[-1][0], max(out[-1][1], b))
+            else:
+                out.append((a, b))
+        return out
+
+    def ppm(self, x0, x1):
+        """Binary PPM of pixel columns [x0, x1) for Tk's photo put."""
+        strip = np.ascontiguousarray(self.img[:, x0:x1])
+        return f"P6 {x1 - x0} {self.h} 255 ".encode() + strip.tobytes()
 
 
 def _compact_ohms(ohms):
@@ -2766,121 +2865,95 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         _meas["box"], _meas["rows"] = None, []
 
     # ---- sweep trace layer ------------------------------------------------ #
-    # Behind the sweep nothing changes, so trace lines are persistent canvas
-    # items (tag "sweep") drawn SWEEP_CHUNK columns at a time: each frame
-    # redraws only the chunk being written and deletes the chunks the erase
-    # gap reaches. Anything that changes the whole picture (size, rows,
-    # sensitivity, filters, hold/resume) triggers one full redraw.
-    _sw = {"sig": None, "chunks": deque(), "open": None}
+    # The traces are pixels (SweepRaster) under the canvas items: each frame
+    # paints only the columns the sweep reached since the last one, blanks
+    # the erase gap ahead of it, and hands Tk just that strip. Anything that
+    # changes the whole picture (size, rows, sensitivity, filters,
+    # hold/resume, a review page) triggers one full repaint.
+    _sw = {"sig": None, "abs": None, "raster": None, "photo": None}
 
     def _sweep_reset():
-        canvas.delete("sweep", "sweep_gap")
-        _sw["sig"], _sw["open"] = None, None
-        _sw["chunks"].clear()
+        _sw["sig"], _sw["abs"] = None, None
+
+    def _raster(W, H):
+        r = _sw["raster"]
+        if r is None or r.w != W or r.h != H:
+            r = _sw["raster"] = SweepRaster(W, H, C["canvas_bg"])
+            _sw["photo"] = tk.PhotoImage(width=W, height=H)
+            canvas.delete("sweep")
+            canvas.tag_lower(canvas.create_image(
+                0, 0, image=_sw["photo"], anchor="nw", tags="sweep"))
+            _sweep_reset()
+        return r
+
+    def _flush(r):
+        spans = r.take_dirty()
+        if sum(b - a for a, b in spans) > r.w // 2:
+            spans = [(0, r.w)]              # one upload beats many
+        photo = _sw["photo"]
+        for a, b in spans:
+            photo.tk.call(photo.name, "put", r.ppm(a, b), "-format", "ppm",
+                          "-to", a, 0)
+
+    def _wrap(c0, c1, ncol):
+        """Sweep columns c0 -> c1 walking forward, split at the wrap."""
+        return [(c0, c1)] if c0 <= c1 else [(c0, ncol - 1), (0, c1)]
+
+    def _paint(r, rows, spans, ncol, vfilt, head, sens, half, row_h):
+        win = vfilt.shape[0]
+        starts = (np.arange(ncol) * win) // ncol
+        ia = [model.site_index[a] for a, _ in (x["pair"] for x in rows)]
+        ib = [model.site_index[b] for _, b in (x["pair"] for x in rows)]
+        bases = (np.arange(len(rows)) * row_h + row_h / 2.0)[:, None]
+        colours = [row_colour(x["name"]) for x in rows]
+        for c0, c1 in spans:
+            p0 = starts[c0]
+            p1 = starts[c1 + 1] if c1 + 1 < ncol else win
+            f = vfilt[(np.arange(p0, p1) - head) % win]
+            first, second = column_envelope(f[:, ia] - f[:, ib],
+                                            starts[c0:c1 + 1] - p0)
+            r.draw(c0, c1, ncol,
+                   trace_y(first, bases, sens, _px_mm["y"], half),
+                   trace_y(second, bases, sens, _px_mm["y"], half), colours)
 
     def _sweep_draw(rows, W, row_h, half, sens):
+        H = canvas.winfo_height()
+        r = _raster(W, H)
         ncol = max(1, min(W, model.win))
+        win = model.win
         vfilt, head, _ = model.view()
-        colours = [row_colour(r["name"]) for r in rows]
-        sig = (W, row_h, sens, tuple(r["pair"] for r in rows), model.cutoffs,
-               id(model.frozen), model.win, _rev["on"] and _rev["gen"],
-               tuple(colours))
+        sig = (W, H, row_h, sens, tuple(x["pair"] for x in rows),
+               tuple(row_colour(x["name"]) for x in rows), model.cutoffs,
+               id(model.frozen), win, _rev["on"] and _rev["gen"])
         if _rev["on"]:
             if sig != _sw["sig"]:
-                _sweep_reset()
                 _sw["sig"] = sig
-                _review_draw(rows, W, row_h, half, sens, ncol, vfilt, head)
+                r.clear(len(rows), ncol)
+                # whole columns only: a column part-past the recording's end
+                # would take in the zeros that pad the held window
+                used = model.frozen["filled"] * ncol // win
+                if used >= 2:
+                    _paint(r, rows, [(0, used - 1)], ncol, vfilt, head, sens,
+                           half, row_h)
+                _flush(r)
             return
-        if sig != _sw["sig"]:
-            _sweep_reset()
-            _sw["sig"] = sig
-        xs = np.repeat((np.arange(ncol) + 0.5) * W / ncol, 2)
-        ys = []
-        cur = 0
         total = model.total if model.frozen is None else model.frozen["total"]
-        cur_abs = total * ncol // model.win     # sweep column, counting laps
-        for k, r in enumerate(rows):
-            vals, cur = sweep_envelope(model.derivation(r["pair"], vfilt),
-                                       head, ncol)
-            base = k * row_h + row_h / 2.0
-            ys.append(trace_y(vals, base, sens, _px_mm["y"], half))
+        starts = (np.arange(ncol) * win) // ncol
+        cur = int(np.searchsorted(starts, head % win, side="right") - 1)
+        cur_abs = (total // win) * ncol + cur   # sweep column, counting laps
         gap = max(2, ncol // 100)                 # erase gap, ~0.1 s
-
-        def draw(a, b):
-            # columns a..b inclusive, joined to column a-1 when it exists
-            a0 = a - 1 if a > 0 else a
-            ids = []
-            if b > a0:
-                for y, colour in zip(ys, colours):
-                    co = np.empty(2 * (b - a0 + 1) * 2)
-                    co[0::2] = xs[2 * a0:2 * (b + 1)]
-                    co[1::2] = y[2 * a0:2 * (b + 1)]
-                    lid = canvas.create_line(*co.tolist(), fill=colour,
-                                             width=1, tags="sweep")
-                    canvas.tag_lower(lid)
-                    ids.append(lid)
-            # lap-aware column of the chunk's right end, for erasing
-            return (a, b, ids, cur_abs - (cur - b) % ncol)
-
-        chunks = _sw["chunks"]
-        if _sw["open"] is None:                    # full redraw
-            first = (cur + gap + 1) % ncol
-            for a, b in sweep_chunks(first, cur, ncol, SWEEP_CHUNK):
-                chunks.append(draw(a, b))
-        else:                                      # extend the open chunk
-            a = _sw["open"]
-            old = chunks.pop()
-            canvas.delete(*old[2]) if old[2] else None
-            for a, b in sweep_chunks(a, cur, ncol, SWEEP_CHUNK):
-                chunks.append(draw(a, b))
-        _sw["open"] = chunks[-1][0] if chunks else None
-        # erase ahead of the sweep: drop every chunk drawn a lap ago that the
-        # gap has reached — however far the sweep jumped since the last frame
-        while len(chunks) > 1 and chunks[0][3] <= cur_abs + gap - ncol:
-            ids = chunks.popleft()[2]
-            if ids:
-                canvas.delete(*ids)
-        # Chunks go whole, so a lap-old chunk can still reach into the gap.
-        # Blank the gap columns (cur+1 .. cur+gap) with background above the
-        # traces and below the grid/labels, so the sweep head always shows
-        # the same gap.
-        H = canvas.winfo_height()
-        spans = [(cur + 1, min(cur + gap, ncol - 1))]
-        if cur + gap >= ncol:
-            spans.append((0, cur + gap - ncol))
-        rects = canvas.find_withtag("sweep_gap")
-        if len(rects) != 2:
-            canvas.delete("sweep_gap")
-            rects = [canvas.create_rectangle(0, 0, 0, 0, fill=C["canvas_bg"],
-                                             outline="", tags="sweep_gap")
-                     for _ in range(2)]
-        for rid, span in zip(rects, spans + [None]):
-            if span is None or span[0] > span[1]:
-                canvas.coords(rid, 0, 0, 0, 0)
-            else:
-                canvas.coords(rid, span[0] * W / ncol, 0,
-                              (span[1] + 1) * W / ncol, H)
-        if chunks:
-            for rid in rects:
-                canvas.tag_raise(rid, "sweep")
-
-    def _review_draw(rows, W, row_h, half, sens, ncol, vfilt, head):
-        # whole columns only: a column part-past the recording's end would
-        # take in the zeros that pad the held window
-        used = model.frozen["filled"] * ncol // model.win
-        if used < 2:
-            return
-        xs = np.repeat((np.arange(used) + 0.5) * W / ncol, 2)
-        for k, r in enumerate(rows):
-            vals, _ = sweep_envelope(model.derivation(r["pair"], vfilt),
-                                     head, ncol)
-            y = trace_y(vals[:2 * used], k * row_h + row_h / 2.0, sens,
-                        _px_mm["y"], half)
-            co = np.empty(2 * xs.size)
-            co[0::2], co[1::2] = xs, y
-            canvas.tag_lower(canvas.create_line(*co.tolist(),
-                                                fill=row_colour(r["name"]),
-                                                width=1, tags="sweep"))
+        if (sig != _sw["sig"] or _sw["abs"] is None
+                or cur_abs - _sw["abs"] >= ncol - gap - 1):
+            _sw["sig"] = sig                      # full repaint
+            r.clear(len(rows), ncol)
+            spans = _wrap((cur + gap + 1) % ncol, cur, ncol)
+        else:                                     # from the last (partial) one
+            spans = _wrap(_sw["abs"] % ncol, cur, ncol)
+        _paint(r, rows, spans, ncol, vfilt, head, sens, half, row_h)
+        _sw["abs"] = cur_abs
+        for c0, c1 in _wrap((cur + 1) % ncol, (cur + gap) % ncol, ncol):
+            r.erase(c0, c1, ncol)
+        _flush(r)
 
     # ---- static chart layer ------------------------------------------------ #
     # Row lines, label boxes, labels and the calibration marker only change
