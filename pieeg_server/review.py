@@ -278,20 +278,27 @@ def rebuild_exports(journal):
         finally:
             if tmp.exists():
                 tmp.unlink()
-        for other in sorted(raw.glob(f"{session}_*.eegj")):
+        others = sorted(raw.glob(f"{session}_*.eegj"))
+        for other in others:
             try:                            # a second board: its notes too
                 edf_export.export_board(other, journal, folder)
             except Exception as e:          # noqa: BLE001 - its journal is safe
                 logger.warning("%s not rebuilt: %s", other.stem, e)
-        synced = None
+        synced, extra = None, None
         try:
-            synced = edf_export.export_synced(journal, raw / f"{session}.json",
-                                              bdf)
+            if others:                      # every board on one clock
+                synced, rep = edf_export.export_master(
+                    journal, others, folder / f"{session}_synced.bdf")
+                extra = {"master": rep}
+            else:
+                synced = edf_export.export_synced(
+                    journal, raw / f"{session}.json", bdf)
         except Exception as e:              # noqa: BLE001 - raw BDF+ is done
             logger.warning("synced copy of %s not rebuilt: %s", session, e)
         if not flat:
             edf_export.write_summary(journal, bdf, folder / f"{session}.json",
-                                     raw / f"{session}.json", synced)
+                                     raw / f"{session}.json", synced,
+                                     extra=extra)
         for edf in (raw / f"{session}.edf", folder / f"{session}.edf"):
             if edf.exists():
                 edf.unlink()

@@ -161,6 +161,19 @@ def _write_annotations(writer, annotations, fs, n_samples):
         writer.writeAnnotation(frame / fs, -1, str(a.get("text", ""))[:40])
 
 
+def sample_clock(t1, flags, meta):
+    """Each row's time (int64 ns, CLOCK_MONOTONIC, 0 = unknown): the stamps
+    as recorded for chip data-ready edges, a clock fitted to them for USB
+    arrival stamps (timebase.arrival_times)."""
+    if meta.get("timing_source") == "usb_arrival":
+        from . import timebase
+        fit = timebase.arrival_times(t1, flags)
+        if fit is None:
+            return np.zeros(len(t1), np.int64)
+        return np.rint(fit).astype(np.int64)
+    return t1
+
+
 def raw_timebase(counts, t1, flags, clock=None):
     """The file layout for a RAW export: the journal's samples untouched,
     stated at the rate measured from their data-ready edge times (each
@@ -258,7 +271,8 @@ def prepare_export(journal_path, counts, meta, synced=False,
     tb = None
     if timing is not None and not synced:
         t1, _, flags = timing
-        tb = raw_timebase(counts, t1, flags, meta.get("clock"))
+        tb = raw_timebase(counts, sample_clock(t1, flags, meta), flags,
+                          meta.get("clock"))
         for first, length in _runs_of(flags & 1):
             annotations.append({"frame": first, "type": "held",
                                 "text": _held_text(length)})
@@ -526,7 +540,8 @@ def journal_clock(journal_path):
     timing = read_timing(journal_path, rows=rows)
     if timing is not None:
         t1, _, flags = timing
-        tb = raw_timebase(np.zeros((rows, 1), np.int32), t1, flags,
+        tb = raw_timebase(np.zeros((rows, 1), np.int32),
+                          sample_clock(t1, flags, meta), flags,
                           meta.get("clock"))
         if tb is not None and tb["start_unix_ns"]:
             return tb["start_unix_ns"] / 1e9, float(tb["rate_hz"]), rows
@@ -574,6 +589,132 @@ def export_board(other_journal, primary_journal, folder):
     return bdf, summary
 
 
+MASTER_RATES = (250, 256, 500, 512, 1000, 1024, 2000)
+
+
+def _grid_rate(measured):
+    """The exact rate a board's samples are put on in the master file: the
+    standard rate nearest what it measured (512.28 -> 512, 998.9 -> 1000)."""
+    return min(MASTER_RATES, key=lambda r: abs(measured / r - 1))
+
+
+def export_master(primary_journal, other_journals, out_path):
+    """One BDF+ with every board on the Pi's clock (<session>_synced.bdf).
+
+    Each board's samples get their true times on CLOCK_MONOTONIC (chip
+    data-ready edges, or the clock fitted to USB arrival stamps), and are
+    resampled (32-tap Kaiser sinc) onto an exact grid at their standard rate
+    (e.g. EEG 512 Hz, EKG/EMG 1000 Hz), all grids starting at the same
+    instant: the latest first sample of any board. BDF+ holds each signal
+    at its own rate. The session's notes go in at their times. The boards'
+    own raw files are unchanged; this one is built from them and can be
+    rebuilt. Returns (out Path, report dict)."""
+    from .align import resample_at
+    from . import timebase
+    pyedflib = _require_pyedflib()
+    boards = []
+    for j in [Path(primary_journal), *map(Path, other_journals)]:
+        counts, meta = read_journal(j)
+        timing = read_timing(j, rows=counts.shape[0])
+        if timing is None:
+            raise ValueError(f"{j.name}: no .timing file, can't place it")
+        t1, _, flags = timing
+        t = sample_clock(t1, flags, meta).astype(np.float64)
+        known = np.flatnonzero(t > 0)
+        if len(known) < 16:
+            raise ValueError(f"{j.name}: too few sample times")
+        # rows with no time (none expected) go on the line between neighbours
+        t = np.interp(np.arange(len(t)), known, t[known])
+        rate = (len(t) - 1) / ((t[-1] - t[0]) / 1e9)
+        boards.append({"journal": j, "counts": counts, "meta": meta,
+                       "t": t, "measured": rate, "grid": _grid_rate(rate)})
+    t0 = max(b["t"][0] for b in boards)
+    t_end = min(b["t"][-1] for b in boards)
+    seconds = int(np.ceil((t_end - t0) / 1e9))
+    clock = boards[0]["meta"].get("clock")
+    start = _start_datetime(boards[0]["meta"])
+    if clock and clock.get("unix_ns") and clock.get("monotonic_ns"):
+        start = datetime.fromtimestamp(
+            (clock["unix_ns"] + (t0 - clock["monotonic_ns"])) / 1e9,
+            timezone.utc).astimezone()
+    signals, report = [], []
+    for b in boards:
+        m = seconds * b["grid"]
+        grid = t0 + np.arange(m) * 1e9 / b["grid"]
+        u = np.interp(grid, b["t"], np.arange(len(b["t"])))
+        y = resample_at(b["counts"].astype(np.float64), u)
+        past = grid > b["t"][-1]             # END FILL: after its last sample
+        if past.any():
+            y[past] = y[np.argmax(past) - 1] if np.argmax(past) else y[0]
+        y = np.clip(np.rint(y), _BDF_DIG_MIN, _BDF_DIG_MAX).astype(np.int32)
+        meta = b["meta"]
+        labels = _channel_labels(meta, int(meta["channel_count"]))
+        lsb = float(meta["lsb_uv"])
+        for ci in range(y.shape[1]):
+            signals.append({"label": str(labels[ci])[:16], "rate": b["grid"],
+                            "lsb": lsb, "data": y[:, ci]})
+        report.append({
+            "file": b["journal"].stem, "channels": int(y.shape[1]),
+            "measured_rate_hz": round(float(b["measured"]), 4),
+            "grid_rate_hz": b["grid"],
+            "sample_times": ("USB arrival stamps, clock fitted to their "
+                             "earliest arrivals (includes the fixed USB "
+                             "latency, ~1 ms)"
+                             if meta.get("timing_source") == "usb_arrival"
+                             else "chip data-ready edges"),
+            "starts_after_master_start_ms": round((b["t"][0] - t0) / 1e6, 3),
+            "end_fill_samples": int(past.sum())})
+    notes = []
+    p = boards[0]
+    for a in read_annotations(p["journal"]):
+        f = min(max(int(a["frame"]), 0), len(p["t"]) - 1)
+        onset = (p["t"][f] - t0) / 1e9
+        if 0 <= onset < seconds:
+            notes.append((onset, str(a.get("text", ""))[:40]))
+    fill = (t_end - t0) / 1e9
+    if fill < seconds:                      # whole seconds: the rest is held
+        notes.append((fill, "END FILL (held)"))
+    out_path = Path(out_path)
+    tmp = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
+    writer = pyedflib.EdfWriter(str(tmp), len(signals),
+                                file_type=pyedflib.FILETYPE_BDFPLUS)
+    try:
+        writer.setStartdatetime(start)
+        headers = [{"label": sg["label"], "dimension": "uV",
+                    "sample_frequency": sg["rate"],
+                    "physical_min": _BDF_DIG_MIN * sg["lsb"],
+                    "physical_max": _BDF_DIG_MAX * sg["lsb"],
+                    "digital_min": _BDF_DIG_MIN, "digital_max": _BDF_DIG_MAX,
+                    "transducer": "",
+                    "prefilter": ("raw; " + timebase.METHOD
+                                  + " on the Pi clock")[:80]}
+                   for sg in signals]
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore",
+                                    message="Physical (minimum|maximum)")
+            writer.setSignalHeaders(headers)
+            per = {}
+            for onset, _ in notes:
+                per[int(onset)] = per.get(int(onset), 0) + 1
+            if per and max(per.values()) > 1:
+                writer.set_number_of_annotation_signals(
+                    min(64, max(per.values())))
+            from pyedflib._extensions._pyedflib import set_starttime_subsecond
+            if start.microsecond:
+                set_starttime_subsecond(writer.handle, start.microsecond * 10)
+            writer.writeSamples([np.ascontiguousarray(sg["data"])
+                                 for sg in signals], digital=True)
+        for onset, text in notes:
+            writer.writeAnnotation(onset, -1, text)
+    finally:
+        writer.close()
+    os.replace(tmp, out_path)
+    logger.info("Wrote master BDF+ %s (%d boards, %d signals, %d s)",
+                out_path, len(boards), len(signals), seconds)
+    return out_path, {"method": "every board on the Pi clock, " +
+                      timebase.METHOD, "seconds": seconds, "boards": report}
+
+
 def synced_path_for(bdf_path):
     """<session>_synced.bdf beside the recording's <session>.bdf."""
     bdf_path = Path(bdf_path)
@@ -590,6 +731,8 @@ def can_sync(journal_path) -> bool:
         rows = journal_path.stat().st_size // (4 * nch)
     except (OSError, ValueError, KeyError):
         return False
+    if meta.get("timing_source") == "usb_arrival":
+        return False            # one board on one clock: nothing to align
     timing = read_timing(journal_path, rows=rows)
     return timing is not None and int((timing[0] > 0).sum()) >= MIN_SYNC_ROWS
 

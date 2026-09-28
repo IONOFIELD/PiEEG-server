@@ -25,7 +25,8 @@ MONTAGES (bipolar, sized to the board: 8 inputs, or 16 on a PiEEG-16)
     PiEEG-16 adds ch9..ch16 = F3 F4 P3 P4 F7 F8 T5 T6 (classic 10-20 names).
     Each montage row is a DIFFERENCE between two sites (e.g. Fp1-C3), which is
     what "bipolar" means. Four presets ship in code and are READ-ONLY:
-    Adaptive (the default: the double banana at the board's size), Double
+    Adaptive (the default: the double banana at the board's size; Adaptive
+    (reduced) cuts a 32-channel board's EEG to 16 leads), Double
     banana, Transverse, Circumferential, each drawn from every site the board
     has (MONTAGE_PRESETS / _16 / _32). Right-click a lead to edit
     YOUR copy of the current montage (rename / hide / reorder; Custom rows can
@@ -146,6 +147,9 @@ MONTAGE_PRESETS_32: dict[str, list[tuple[str, str]]] = {
 # PiEEG-8, the 16-site one on a PiEEG-16, the 32-site one on an IronBCI-32.
 # The default montage.
 ADAPTIVE_MONTAGE = "Adaptive"
+# The same with the EEG cut to 16 leads on a 32-channel board: the 16-site
+# double banana (no midline chain). Offered only when the board has more.
+ADAPTIVE_REDUCED = "Adaptive (reduced)"
 
 
 def presets_for(electrodes):
@@ -175,7 +179,8 @@ STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
 # "Custom" montage you fill channel by channel (right-click → Add). Selecting a
 # preset always snaps straight back to it.
-MONTAGE_NAMES = [ADAPTIVE_MONTAGE] + list(MONTAGE_PRESETS) + [CUSTOM_MONTAGE]
+MONTAGE_NAMES = ([ADAPTIVE_MONTAGE, ADAPTIVE_REDUCED] + list(MONTAGE_PRESETS)
+                 + [CUSTOM_MONTAGE])
 
 # ── filter menu choices (label, value). None = filter stage off ──────────────
 # HFF = low-pass cutoff (Hz); LFF = high-pass cutoff (Hz).
@@ -609,10 +614,21 @@ class ViewerModel:
         self.load_montage(DEFAULT_MONTAGE)
 
     # ---- montage handling ------------------------------------------------- #
+    def montage_names(self):
+        """The montages this board offers (Adaptive (reduced) only where it
+        cuts something: on a 32-channel board)."""
+        return [n for n in MONTAGE_NAMES if n != ADAPTIVE_REDUCED
+                or self.presets is MONTAGE_PRESETS_32]
+
     def _fresh_rows(self, name):
         rows = []
-        for a, b in self.presets[
-                "Double banana" if name == ADAPTIVE_MONTAGE else name]:
+        if name == ADAPTIVE_REDUCED:
+            eeg = (MONTAGE_PRESETS_16 if self.presets is MONTAGE_PRESETS_32
+                   else self.presets)["Double banana"]
+        else:
+            eeg = self.presets["Double banana" if name == ADAPTIVE_MONTAGE
+                               else name]
+        for a, b in eeg:
             # Only keep rows whose two sites are actually available inputs.
             if a in self.site_index and b in self.site_index:
                 rows.append({"pair": (a, b), "name": f"{a}-{b}", "on": True})
@@ -1485,9 +1501,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Montage: the list, then Save / Reset. The face grows a "*"
     # ("Transverse*") while the montage has edits Save hasn't kept.
     montage_var = tk.StringVar(value=DEFAULT_MONTAGE)
-    mont_mb, mont_menu = _dropdown(bar, 13)
+    # wide enough for "Adaptive (reduced)*" where it is offered (32-channel
+    # boards, whose bar has no calibration / impedance buttons)
+    mont_mb, mont_menu = _dropdown(
+        bar, 19 if ADAPTIVE_REDUCED in model.montage_names() else 13)
     mont_mb.configure(textvariable=montage_var)
-    for _name in MONTAGE_NAMES:
+    for _name in model.montage_names():
         mont_menu.add_command(label=_name,
                               command=lambda n=_name: _switch_montage(n))
     mont_menu.add_separator()

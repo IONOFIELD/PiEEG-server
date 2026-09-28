@@ -48,6 +48,12 @@ RELAY_MAX_SECONDS = 30 * 60  # 30-minute hard cap, server-side
 
 logger = logging.getLogger("pieeg.server")
 
+def _timing_source(acq):
+    """What a recording's .timing holds for this acquisition's frames."""
+    return "usb_arrival" if getattr(acq, "_serial", False) else \
+        "data_ready_edge"
+
+
 # The broadcast loop waits this long after a frame so the frames behind it
 # are filtered and sent as one batch.
 STREAM_BATCH_S = 0.025
@@ -638,6 +644,7 @@ class PiEEGServer:
             sample_rate=getattr(self._acq, "raw_rate", None) or self._sample_rate(),
             prefilter=None,
             channel_labels=self._channel_labels,
+            timing_source=_timing_source(self._acq),
             **journal_kwargs,
         )
         self._last_session = session
@@ -667,7 +674,8 @@ class PiEEGServer:
             acq, out_dir=raw_dir, session_name=name,
             num_channels=acq.num_channels,
             sample_rate=acq.raw_rate,
-            prefilter=None, channel_labels=src["labels"], **kwargs)
+            prefilter=None, channel_labels=src["labels"],
+            timing_source=_timing_source(acq), **kwargs)
         rec = Recorder(acq, output=raw_dir / f"{name}.csv",
                        num_channels=acq.num_channels)
         logger.info("Recording second board: journal=%s", journal.journal_path)
@@ -819,6 +827,23 @@ class PiEEGServer:
                 except Exception as exc:  # noqa: BLE001 - journal is safe
                     logger.warning("%s BDF export deferred (%s)", x["tag"],
                                    exc)
+            if self._extra_rec:
+                # every board on the Pi clock in one file, built from the raw
+                # journals (which it never changes)
+                try:
+                    master, rep = await loop.run_in_executor(
+                        None, edf_export.export_master, journal_path,
+                        [x["journal"].journal_path for x in self._extra_rec],
+                        folder / f"{session}_synced.bdf")
+                    await loop.run_in_executor(
+                        None, lambda: edf_export.write_summary(
+                            journal_path, bdf_path,
+                            folder / f"{session}.json", sidecar_path,
+                            master, extra={"master": rep}))
+                    info["bdf_synced"] = str(master.resolve())
+                    logger.info("master BDF+ (all boards synced): %s", master)
+                except Exception as exc:  # noqa: BLE001 - raw files are done
+                    logger.warning("master BDF+ not built (%s)", exc)
         except Exception as exc:  # noqa: BLE001 - export must not block stop
             logger.warning("BDF export deferred (%s); journal is safe at %s",
                            exc, journal_path)

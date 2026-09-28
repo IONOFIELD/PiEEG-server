@@ -140,7 +140,8 @@ class JournalWriter:
 
     def __init__(self, acquisition, out_dir, session_name=None,
                  num_channels=None, sample_rate=250, channel_labels=None,
-                 gain=GAIN, vref_uv=VREF_UV, prefilter=None, reference=None):
+                 gain=GAIN, vref_uv=VREF_UV, prefilter=None, reference=None,
+                 timing_source="data_ready_edge"):
         self._acq = acquisition
         # Recordings are raw: the chip's own samples (subscribe_raw; with
         # oversampling that is the chip rate, before any decimation filter).
@@ -164,6 +165,10 @@ class JournalWriter:
         # How the inputs are referenced, for boards other than the PiEEG
         # (None = the PiEEG's shared SRB1 REF; the summary says so).
         self._reference = reference
+        # what the .timing t1 column is: the chip's data-ready edge
+        # (PiEEG), or the USB read that delivered the frame (IronBCI-32:
+        # late by the latency + read gap; exports fit a clock to it)
+        self._timing_source = timing_source
 
         if session_name is None:
             session_name = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
@@ -221,6 +226,7 @@ class JournalWriter:
             # one TIMING record per journal row (see TIMING)
             "timing_file": self.timing_path.name,
             "timing_format": TIMING_FORMAT,
+            "timing_source": self._timing_source,
             # wall clock <-> CLOCK_MONOTONIC (the .timing edge times) at the
             # start, so an export can put each sample on the wall clock
             **({"clock": self._clock0} if getattr(self, "_clock0", None)

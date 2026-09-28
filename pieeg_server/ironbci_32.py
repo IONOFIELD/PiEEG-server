@@ -255,7 +255,9 @@ class IronBCI32Hardware:
         self._num_channels = num_channels
 
         self._port: "serial.Serial | None" = None
-        self._buffer: deque[list[float]] = deque(maxlen=buffer_limit)
+        # (channels µV, arrival ns, held): arrival = CLOCK_MONOTONIC of the
+        # USB read that completed the frame (0 for a held stand-in)
+        self._buffer: deque[tuple] = deque(maxlen=buffer_limit)
         self._stop_event = threading.Event()
         self._reader_thread: threading.Thread | None = None
         self._connected = False
@@ -618,7 +620,7 @@ class IronBCI32Hardware:
             held = min(int(round(gap_s * self._sample_rate)),
                        int(MAX_HOLD_S * self._sample_rate))
             if held and self._last_sample is not None:
-                self._buffer.extend([self._last_sample] * held)
+                self._buffer.extend([(self._last_sample, 0, True)] * held)
                 self._lost_frames += held
             self._counter_prev = None       # a fresh start, not a gap
             self._port = port
@@ -642,7 +644,7 @@ class IronBCI32Hardware:
         if (self._measured_rate is not None
                 and self._sample_rate not in STANDARD_RATES):
             problems.append(f"odd rate {self._measured_rate:.1f} SPS")
-        rows = list(self._buffer)
+        rows = [b[0] for b in self._buffer]
         if len(rows) >= 50:
             dead = [ch + 1 for ch in range(self._num_channels)
                     if all(r[ch] == 0.0 for r in rows)]
@@ -732,10 +734,20 @@ class IronBCI32Hardware:
 
     def read_sample(self) -> list[float] | None:
         """Pop the oldest buffered sample, or None if no data yet."""
+        item = self.read_sample_timed()
+        return None if item is None else item[0]
+
+    def read_sample_timed(self):
+        """Pop the oldest buffered sample as (channels µV, arrival ns, held),
+        or None. arrival is the CLOCK_MONOTONIC time of the USB read that
+        completed the frame — after the true sample time by the USB latency
+        and up to one read gap; a clock fit over many frames recovers the
+        board's sample clock (timebase.arrival_times). 0 for held frames."""
         try:
             return self._buffer.popleft()
         except IndexError:
             return None
+
 
     # --- Internal reader ---------------------------------------------------
 
@@ -773,6 +785,7 @@ class IronBCI32Hardware:
                 # over in ~80 ms clumps at 250 SPS.
                 waiting = getattr(port, "in_waiting", READ_CHUNK)
                 chunk = self._read_bytes(min(READ_CHUNK, max(1, waiting)))
+                t_read = time.monotonic_ns()
             except Exception as e:
                 # Unplugged or reset: without this the loop spun on the dead
                 # port (thousands of errors a second) and never recovered.
@@ -879,9 +892,9 @@ class IronBCI32Hardware:
                     )
                 gap = self._count_gap(counter)
                 if gap and self._last_sample is not None:
-                    self._buffer.extend([self._last_sample] * gap)
+                    self._buffer.extend([(self._last_sample, 0, True)] * gap)
                 self._frames_decoded += 1
-                self._buffer.append(channels)
+                self._buffer.append((channels, t_read, False))
                 self._last_sample = channels
                 t = time.monotonic()
                 slots = self._frames_decoded + self._lost_frames
