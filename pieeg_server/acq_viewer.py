@@ -802,6 +802,16 @@ class ViewerModel:
         if 0 <= i < len(r):
             r[i]["on"] = not r[i]["on"]
 
+    def show_only(self, side):
+        """Show the current montage's leads on one side of the head and hide
+        the rest: "all", "none", or "left" / "mid" / "right" (a lead is on a
+        side when both of its electrodes are; see site_side)."""
+        for r in self.rows():
+            if side in ("all", "none"):
+                r["on"] = side == "all"
+            else:
+                r["on"] = row_side(r["pair"]) == side
+
     def move_row(self, src, dst):
         r = self.rows()
         if 0 <= src < len(r) and 0 <= dst < len(r) and src != dst:
@@ -1033,6 +1043,24 @@ def sweep_envelope(trace, head, ncol):
     vals[1::2] = np.where(lo_first, hi, lo)
     cursor_col = int(np.searchsorted(starts, head % win, side="right") - 1)
     return vals, cursor_col
+
+
+def site_side(site):
+    """"left" / "mid" / "right" for a 10-20/10-10 site name (odd number =
+    left, even = right, z = midline), else None (e.g. an unnamed E17)."""
+    s = str(site)
+    if s[-1:].lower() == "z":
+        return "mid"
+    if s[-1:].isdigit() and not s.startswith("E"):
+        return "left" if int(s[-1]) % 2 else "right"
+    return None
+
+
+def row_side(pair):
+    """The side a lead lies on: both electrodes' side, else None (a lead
+    crossing the midline, like Fp1-Fp2)."""
+    a, b = (site_side(x) for x in pair)
+    return a if a == b else None
 
 
 def column_envelope(seg, local_starts):
@@ -1422,6 +1450,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         mont_menu.add_command(label=_name,
                               command=lambda n=_name: _switch_montage(n))
     mont_menu.add_separator()
+    mont_menu.add_command(label="Choose leads…", command=lambda: _leads_box())
     mont_menu.add_command(label="Save montage (leads + filters)",
                           command=lambda: _save_montage())
     mont_menu.add_command(label="Reset to factory",
@@ -1678,6 +1707,64 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     canvas.bind("<Button-3>", lambda e: _channel_box(e))
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
+
+    def _leads_box():
+        # Pick which of the montage's leads are on screen, many at a time:
+        # one tap-toggle per lead, plus quick sets by side of the head.
+        # Edits the current montage's rows (the "*" until Save), like Hide
+        # in the channel box. Recordings always keep every input.
+        win, body = _popup(f"Leads · {model.current}")
+        quick = tk.Frame(body, bg=C["raised"])
+        quick.pack(fill="x", pady=(4, 4))
+        grid = tk.Frame(body, bg=C["raised"])
+        grid.pack()
+        rows = model.rows()
+        cols = 3 if len(rows) <= 24 else 4
+        cells = []
+
+        def paint():
+            for cell, r in zip(cells, rows):
+                cell.configure(bg=C["accent"] if r["on"] else C["surface"],
+                               fg=C["text"] if r["on"] else C["text_dim"])
+            n = sum(r["on"] for r in rows)
+            count.configure(text=f"{n}/{len(rows)} shown")
+            _edited()
+
+        def tap(i):
+            model.toggle_row(i)
+            paint()
+
+        def only(side):
+            model.show_only(side)
+            paint()
+
+        for label, side in (("All", "all"), ("None", "none"),
+                            ("Left", "left"), ("Midline", "mid"),
+                            ("Right", "right")):
+            b = tk.Label(quick, text=label, bg=C["surface"], fg=C["text"],
+                         padx=8, pady=3, cursor="hand2",
+                         font=(_MONO, _fs(9)), highlightthickness=1,
+                         highlightbackground=C["border_hi"])
+            b.pack(side="left", padx=(0, 4))
+            b.bind("<Button-1>", lambda e, sd=side: only(sd))
+        count = tk.Label(quick, bg=C["raised"], fg=C["text_sec"],
+                         font=(_MONO, _fs(9)))
+        count.pack(side="right", padx=(8, 0))
+        for i, r in enumerate(rows):
+            cell = tk.Label(grid, text=r["name"], width=11, pady=4,
+                            cursor="hand2", font=(_MONO, _fs(9)))
+            cell.grid(row=i // cols, column=i % cols, padx=2, pady=2)
+            cell.bind("<Button-1>", lambda e, k=i: tap(k))
+            cells.append(cell)
+        paint()
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        at = type("At", (), {})()
+        at.x_root = canvas.winfo_rootx() + max(0, (canvas.winfo_width()
+                                                   - w) // 2)
+        at.y_root = canvas.winfo_rooty() + max(0, (canvas.winfo_height()
+                                                   - h) // 2)
+        _show_popup(win, at)
 
     # ---- control callbacks ------------------------------------------------ #
     def _refresh_montage_label():

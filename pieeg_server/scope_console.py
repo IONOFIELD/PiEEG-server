@@ -352,6 +352,9 @@ SCOPE_CHANGELOG = [
             "and only the strip the sweep just wrote is sent to the screen, "
             "instead of thousands of line pieces. With an IronBCI-32 the "
             "display server went from ~90% of a core (seconds of lag) to ~5%."),
+    ("6.2", "Montage > Choose leads… picks which leads are on screen: tap "
+            "each one, or All / None / Left / Midline / Right. Save keeps "
+            "the choice with the montage. Recordings always keep every input."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

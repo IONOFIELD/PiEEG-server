@@ -86,3 +86,25 @@ def test_ironbci32_recording_labels_are_its_sites():
     from pieeg_server.journal import referential_labels
     labels = referential_labels(_electrodes("ironbci32", 32))
     assert labels[0] == "EEG F7-REF" and labels[-1] == "EEG POz-REF"
+
+
+def test_sides_of_the_head():
+    assert [av.site_side(x) for x in ("Fp1", "T8", "Cz", "Fpz", "POz",
+                                      "E17")] == ["left", "right", "mid",
+                                                  "mid", "mid", None]
+    assert av.row_side(("Fp1", "F7")) == "left"
+    assert av.row_side(("Fz", "Cz")) == "mid"
+    assert av.row_side(("Fp1", "Fp2")) is None
+
+
+def test_show_only_one_side_on_the_ironbci(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    m.show_only("left")
+    shown = [r["pair"] for r in m.rows() if r["on"]]
+    assert len(shown) == 8 and all(av.row_side(p) == "left" for p in shown)
+    assert m.dirty()
+    m.show_only("mid")
+    assert [r["pair"] for r in m.rows() if r["on"]] == [("Fz", "Cz"),
+                                                          ("Cz", "Pz")]
+    m.show_only("all")
+    assert all(r["on"] for r in m.rows())
