@@ -393,6 +393,13 @@ SCOPE_CHANGELOG = [
             "median of the wired inputs — amber 3x, red 10x, or an input "
             "that is flat or railed. An estimate, not kΩ: it can't show "
             "every lead being equally poor, so check with a meter at hookup."),
+    ("7.0", "IronBCI-32 impedance in kΩ: with test leads from the Pi's GPIOs "
+            "(10 MΩ + 10 nF onto each electrode's row; `python -m "
+            "pieeg_server.ironbci_impedance setup`), the Ω box checks every "
+            "tested IronBCI electrode and REF at once, each at its own "
+            "frequency (~5 s), then the PiEEG. Readings come from a 0/10k/47k "
+            "calibration per input; before it they show as ≈ estimates. "
+            "Between checks the test leads are high impedance."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -1084,17 +1091,48 @@ def main(argv=None):
                 logger.warning("calibration note not saved: %s", e)
         return {"on": on, "note": note}
 
-    # Ω checks the board that can inject its test current: the PiEEG, which
-    # is the second board beside an IronBCI-32 (no current source there; its
-    # leads get the live contact estimate instead). Its result says where
-    # its leads sit on the combined screen (first_input, 1-based).
+    # Ω checks every board that can: a PiEEG with its own lead-off current,
+    # and an IronBCI-32 through the Pi's test leads (ironbci_impedance) once
+    # they are set up. One board after the other; the results are combined
+    # onto the screen's inputs (first_input, 1-based).
+    from . import ironbci_impedance
+    eeg_plan = ironbci_impedance.load_plan() if serial else None
+    eeg_check = (eeg_plan is not None
+                 and ironbci_impedance.unsupported_reason(eeg_plan) is None)
+    if eeg_check:
+        try:
+            ironbci_impedance.park(eeg_plan)    # idle test leads: high-Z
+        except Exception as e:              # noqa: BLE001 - check will say
+            logger.warning("IronBCI test-lead pins not parked: %s", e)
+        logger.info("IronBCI-32 impedance: %d test lead(s)%s",
+                    len(eeg_plan.leads), " + REF" if eeg_plan.ref else "")
+    pg_check = acq2 is not None and unsupported_reason(acq2) is None
+    board_names = (BOARD_NAMES.get(args.device, args.device),
+                   BOARD_NAMES.get(f"pieeg{pg_n}", "PiEEG"))
     imp_acq, imp_first = acq, 1
-    if acq2 is not None:
+    if acq2 is not None and not eeg_check:
         imp_acq, imp_first = acq2, acq.num_channels + 1
+    can_check = eeg_check or (unsupported_reason(imp_acq) is None)
 
     async def _impedance():
-        res = await server.run_impedance_check(imp_acq)
-        return dict(res, first_input=imp_first)
+        if not eeg_check:
+            res = await server.run_impedance_check(imp_acq)
+            return dict(res, first_input=imp_first)
+        parts = []
+        for name, first, board_acq, check in (
+                (board_names[0], 1, acq,
+                 ironbci_impedance.IronBCIImpedanceCheck(acq, eeg_plan)),
+                *(((board_names[1], acq.num_channels + 1, acq2, None),)
+                  if pg_check else ())):
+            try:
+                res = await server.run_impedance_check(board_acq, check=check)
+            except Exception as e:          # noqa: BLE001 - per board
+                logger.warning("%s impedance check failed: %s", name, e)
+                res = str(e)
+            parts.append((name, first, res))
+        if not any(isinstance(r, dict) for _, _, r in parts):
+            raise RuntimeError("; ".join(f"{n}: {r}" for n, _, r in parts))
+        return ironbci_impedance.combine(parts)
 
     def _impedance_unless_cal():
         if _cal["on"]:
@@ -1196,7 +1234,7 @@ def main(argv=None):
             lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)),
         # Ω: the electrode impedance check (PiEEG-8 only; works on --mock too,
         # which simulates it). With two boards, on the PiEEG.
-        impedance=None if unsupported_reason(imp_acq) else _impedance_unless_cal,
+        impedance=_impedance_unless_cal if can_check else None,
         # EC / EO marks in the running recording (same no-mock rule as Rec)
         annotate=None if args.mock else (
             lambda text, unix_t, kind=None: asyncio.run_coroutine_threadsafe(

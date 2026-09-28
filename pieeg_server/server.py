@@ -873,12 +873,15 @@ class PiEEGServer:
             logger.warning("Could not compute CSV integrity for %s: %s", path, exc)
             return 0, None
 
-    async def run_impedance_check(self, acquisition=None) -> dict:
+    async def run_impedance_check(self, acquisition=None, check=None) -> dict:
         """Measure electrode impedance on the live stream (a few seconds).
 
         acquisition: the board to check; default the streamed one. With two
         boards the second (a PiEEG beside an IronBCI-32) is checked on its
         own and the stream, which carries only the first, keeps going.
+        check: the check to run on it (an object with async run() returning
+        a result dict, e.g. an IronBCIImpedanceCheck); default the PiEEG's
+        ImpedanceCheck.
 
         The check injects a 31.25 Hz test current, which would land in every
         client's data and in a recording. So it refuses while recording, and
@@ -902,14 +905,18 @@ class PiEEGServer:
             if streamed:
                 await self._broadcast_json({"status": "impedance",
                                             "active": True})
-            result = (await ImpedanceCheck(acq).run()).to_dict()
+            if check is None:
+                result = (await ImpedanceCheck(acq).run()).to_dict()
+            else:
+                result = await check.run()
             done["results"] = result
             # Raw carrier/noise (µV) per lead as well, so any check can be
             # re-examined against the calibration later.
             logger.info("impedance check: %s%s", " ".join(
                 f"{r['name']}={r['text'].replace(' ', '')}"
                 f"[{r['carrier_uv']:.3f}/{r['noise_uv']:.3f}µV]"
-                for r in result["leads"]),
+                for r in result["leads"] + [result.get("ref_lead")]
+                if r and "carrier_uv" in r),
                 f" ({result['problem']})" if result["problem"] else "")
             return result
         except Exception as e:
