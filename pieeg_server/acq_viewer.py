@@ -559,11 +559,20 @@ class ContactTracker:
 class ViewerModel:
     """Holds rolling data + montage state; no Tk, so it is unit-testable."""
 
-    def __init__(self, num_channels, fs, electrodes, store=None):
+    def __init__(self, num_channels, fs, electrodes, store=None,
+                 input_labels=None, boards=None, extra_rows=None):
         self.nch = num_channels
         self.fs = fs
         self.electrodes = list(electrodes)
         self.site_index = {name: i for i, name in enumerate(self.electrodes)}
+        # Two boards on one screen: the second board's inputs have their own
+        # E-numbers (input_labels: key -> "E1"), the Electrodes view shows a
+        # section per board (boards: [(name, [keys])]), and every montage
+        # gets the second board's rows after its own (extra_rows: [(a, b,
+        # label)], e.g. the EKG and EMG leads).
+        self.input_labels = dict(input_labels or {})
+        self.boards = [(n, list(k)) for n, k in (boards or [])]
+        self.extra_rows = [tuple(r) for r in (extra_rows or [])]
         # Electrodes switched off for this session (Choose leads >
         # Electrodes): the ones not wired for this study. Every lead that
         # uses one is off the screen in every montage. Not saved: each
@@ -594,7 +603,8 @@ class ViewerModel:
         # Saved row edits are kept apart per preset set, so an 8-channel
         # montage saved on a PiEEG-8 never replaces the 16-channel one (its
         # rows would all still be valid sites). Filters are shared by name.
-        self.rows_prefix = _ROWS_PREFIX[id(self.presets)]
+        self.rows_prefix = _ROWS_PREFIX[id(self.presets)] + (
+            "+pg/" if self.extra_rows else "")
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
 
@@ -606,6 +616,11 @@ class ViewerModel:
             # Only keep rows whose two sites are actually available inputs.
             if a in self.site_index and b in self.site_index:
                 rows.append({"pair": (a, b), "name": f"{a}-{b}", "on": True})
+        for a, b, label in self.extra_rows:
+            if a in self.site_index and b in self.site_index:
+                row = {"pair": (a, b), "name": f"{a}-{b}", "on": True}
+                self.set_row_label(row, label)
+                rows.append(row)
         return rows
 
     def _factory_rows(self, name):
@@ -732,13 +747,13 @@ class ViewerModel:
         The E-number is just the site's position in the input list + 1, so it
         always tracks DEFAULT_ELECTRODES / whatever electrode map was passed in.
         """
-        return f"E{self.site_index[site] + 1}"
+        return self.input_labels.get(site) or f"E{self.site_index[site] + 1}"
 
     def input_text(self, site):
         """"E1 F7" for an input on a 10-20 site, "E2" for one without (its
         site IS its input number)."""
         e = self.elabel(site)
-        return e if site == e else f"{e} {site}"
+        return e if site == e or site in self.input_labels else f"{e} {site}"
 
     def site_contact(self, site):
         """Contact verdict (green/amber/red/None) for a scalp site's electrode."""
@@ -1074,7 +1089,7 @@ def site_side(site):
     s = str(site)
     if s[-1:].lower() == "z":
         return "mid"
-    if s[-1:].isdigit() and not s.startswith("E"):
+    if s[-1:].isdigit() and not s.startswith(("E", "X")):
         return "left" if int(s[-1]) % 2 else "right"
     return None
 
@@ -1287,7 +1302,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                record_control=None, full_scale_uv=VREF_UV / 24,
                impedance_control=None, stop_event=None,
                annotate_control=None, recordings_dir=None,
-               calibrate_control=None, board_warning=None):
+               calibrate_control=None, board_warning=None,
+               input_labels=None, boards=None, extra_rows=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     board_warning: text shown as a red banner on the chart for the whole
@@ -1340,7 +1356,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     from tkinter import ttk
 
     electrodes = electrodes or DEFAULT_ELECTRODES[:num_channels]
-    model = ViewerModel(num_channels, fs, electrodes, store=MontageStore())
+    model = ViewerModel(num_channels, fs, electrodes, store=MontageStore(),
+                        input_labels=input_labels, boards=boards,
+                        extra_rows=extra_rows)
 
     C = GEIST                               # short alias for the palette
     root = tk.Tk()
@@ -1814,17 +1832,33 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                          font=(_MONO, _fs(9)))
         count.pack(side="right", padx=(8, 0))
         if view == "leads":
-            texts = [r["name"] for r in rows]
+            texts = [model.row_label(r) for r in rows]
             cols, width = (3 if len(rows) <= 24 else 4), 11
+            groups = [(None, list(range(len(rows))))]
         else:
             texts = [model.input_text(x) for x in sites]
-            cols, width = 4, 9
-        for i, text in enumerate(texts):
-            cell = tk.Label(grid, text=text, width=width, pady=3,
-                            cursor="hand2", font=(_MONO, _fs(9)))
-            cell.grid(row=i // cols, column=i % cols, padx=2, pady=2)
-            cell.bind("<Button-1>", lambda e, k=i: tap(k))
-            cells.append(cell)
+            cols, width = (4, 9) if not model.boards else (8, 7)
+            # one section per board when two are connected
+            groups = ([(name, [model.site_index[k] for k in keys])
+                       for name, keys in model.boards]
+                      if model.boards else [(None, list(range(len(sites))))])
+        cells[:] = [None] * len(texts)
+        grid_row = 0
+        for name, members in groups:
+            if name:
+                tk.Label(grid, text=name, bg=C["raised"], fg=C["text_sec"],
+                         font=(_MONO, _fs(9), "bold"), anchor="w").grid(
+                    row=grid_row, column=0, columnspan=cols, sticky="w",
+                    pady=(4, 0))
+                grid_row += 1
+            for j, i in enumerate(members):
+                cell = tk.Label(grid, text=texts[i], width=width, pady=3,
+                                cursor="hand2", font=(_MONO, _fs(9)))
+                cell.grid(row=grid_row + j // cols, column=j % cols, padx=2,
+                          pady=2)
+                cell.bind("<Button-1>", lambda e, k=i: tap(k))
+                cells[i] = cell
+            grid_row += (len(members) + cols - 1) // cols
         paint()
         win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()
@@ -3001,6 +3035,10 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return                          # nor on the calibration signal
         n = min(_rail_n, model.win)
         recent = model.raw[-n:] if model.filled >= n else None
+        if model.boards:
+            # two boards: the lead-off readout is the second board's, its
+            # REF/GND verdicts from the signal would mix both boards' inputs
+            recent = None
         try:
             model.contact.update(contact_source(), recent, full_scale_uv, fs)
         except Exception:                   # noqa: BLE001 - display only
@@ -3063,7 +3101,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ia = [model.site_index[a] for a, _ in (x["pair"] for x in rows)]
         ib = [model.site_index[b] for _, b in (x["pair"] for x in rows)]
         bases = (np.arange(len(rows)) * row_h + row_h / 2.0)[:, None]
-        colours = [row_colour(x["name"]) for x in rows]
+        colours = [row_colour(model.row_label(x)) for x in rows]
         for c0, c1 in spans:
             p0 = starts[c0]
             p1 = starts[c1 + 1] if c1 + 1 < ncol else win
@@ -3081,7 +3119,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         win = model.win
         vfilt, head, _ = model.view()
         sig = (W, H, row_h, sens, tuple(x["pair"] for x in rows),
-               tuple(row_colour(x["name"]) for x in rows), model.cutoffs,
+               tuple(row_colour(model.row_label(x)) for x in rows),
+               model.cutoffs,
                id(model.frozen), win, _rev["on"] and _rev["gen"])
         if _rev["on"]:
             if sig != _sw["sig"]:

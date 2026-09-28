@@ -138,3 +138,41 @@ def test_input_text_like_the_pieeg(tmp_path):
     assert m.input_text("F7") == "E1 F7" and m.input_text("E2") == "E2"
     m8 = _model(8, tmp_path / "s8.json")
     assert m8.input_text("Fp1") == "E1 Fp1"
+
+
+def _dual(path):
+    pg = [f"X{i}" for i in range(1, 9)]
+    return av.ViewerModel(
+        40, 512, _electrodes("ironbci32", 32) + pg,
+        store=av.MontageStore(path),
+        input_labels={k: f"E{i}" for i, k in enumerate(pg, start=1)},
+        boards=[("IronBCI-32", _electrodes("ironbci32", 32)),
+                ("PiEEG-8", pg)],
+        extra_rows=[("X1", "X2", "EKG"), ("X3", "X4", "EMG 1"),
+                    ("X5", "X6", "EMG 2"), ("X7", "X8", "EMG 3")])
+
+
+def test_two_boards_eeg_on_top_then_ekg_then_emg(tmp_path):
+    m = _dual(tmp_path / "s.json")
+    labels = [m.row_label(r) for r in m.rows()]
+    assert labels[:18] == [f"{a}-{b}" for a, b in
+                           av.MONTAGE_PRESETS_32["Double banana"]]
+    assert labels[18:] == ["EKG", "EMG 1", "EMG 2", "EMG 3"]
+    assert [av.row_colour(x) for x in labels[17:20]] == [
+        av.GEIST["trace_eeg"], av.GEIST["trace_ekg"], av.GEIST["trace_emg"]]
+    # the PiEEG's inputs keep their own E-numbers
+    assert m.elabel("X1") == "E1" and m.input_text("X8") == "E8"
+    assert m.epair_name(("X1", "X2")) == "E1-E2"
+    assert m.elabel("F7") == "E1"               # the IronBCI's E1
+    assert av.site_side("X3") is None           # not a scalp site
+    m.load_montage("Transverse")
+    assert [m.row_label(r) for r in m.rows()][-4:] == ["EKG", "EMG 1",
+                                                       "EMG 2", "EMG 3"]
+    assert m.rows_prefix == "32ch/+pg/"
+
+
+def test_unwiring_a_pieeg_input_hides_its_row_only(tmp_path):
+    m = _dual(tmp_path / "s.json")
+    m.set_wired(["X5"], False)
+    labels = [m.row_label(r) for r in m.visible_rows()]
+    assert "EMG 2" not in labels and "EKG" in labels and len(labels) == 21
