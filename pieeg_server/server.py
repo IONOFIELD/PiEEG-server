@@ -39,7 +39,7 @@ from . import edf_export
 from .webhooks import WebhookStore
 from .osc_vrchat import VRChatOSCBridge, OSCConfig
 from .lsl import LSLBridge, LSLConfig  # LSLBridge defers pylsl import to run()
-from .spectral import make_ring_buffers, compute_band_powers
+from .spectral import SpectralRing, compute_band_powers
 from . import profiles
 from . import __version__
 from . import _native
@@ -47,6 +47,10 @@ from . import _native
 RELAY_MAX_SECONDS = 30 * 60  # 30-minute hard cap, server-side
 
 logger = logging.getLogger("pieeg.server")
+
+# The broadcast loop waits this long after a frame so the frames behind it
+# are filtered and sent as one batch.
+STREAM_BATCH_S = 0.025
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 1616  # PiEEG → 1616
@@ -873,7 +877,17 @@ class PiEEGServer:
         _leadoff_frame = 0
 
         while True:
-            frame = await queue.get()
+            # Everything waiting is one batch: filtered and fed to the band
+            # powers as a block (the per-sample path was the largest share
+            # of this loop's CPU with 32 channels); each frame still goes to
+            # the clients on its own, in order.
+            batch = [await queue.get()]
+            # let a batch collect: each filter call has a fixed cost that a
+            # 2-3 frame batch can't pay back (clients see <= this much delay;
+            # the Scope's own view and recordings don't pass through here)
+            await asyncio.sleep(STREAM_BATCH_S)
+            while not queue.empty():
+                batch.append(queue.get_nowait())
             if self._impedance_active:
                 # Test current on every channel: not EEG. Nothing goes out
                 # (clients were told the check started), and it stays out of
@@ -884,30 +898,28 @@ class PiEEGServer:
             # subscribe to the acquisition directly and stay raw.
             hampel = self._acq.hampel
             if hampel.enabled:
-                frame = frame.copy()
-                frame["channels"] = hampel.apply(frame["channels"])
+                batch = [dict(f, channels=hampel.apply(f["channels"]))
+                         for f in batch]
 
             if self._filter or self._notch_filter:
-                frame = frame.copy()
-                channels = frame["channels"]
+                block = [f["channels"] for f in batch]
                 if self._filter:
-                    channels = self._filter.apply_sample(channels)
+                    block = self._filter.apply_block(block)
                 if self._notch_filter:
-                    channels = self._notch_filter.apply_sample(channels)
-                frame["channels"] = channels
+                    block = self._notch_filter.apply_block(block)
+                batch = [dict(f, channels=c) for f, c in zip(batch, block)]
 
             # Feed spectral ring buffers (always, regardless of WS clients)
-            channels = frame["channels"]
-            if not self._spec_buffers:
-                self._spec_buffers = make_ring_buffers(len(channels))
-            for i, v in enumerate(channels):
-                if i < len(self._spec_buffers):
-                    self._spec_buffers[i].append(v)
+            nch = len(batch[0]["channels"])
+            if not self._spec_buffers or len(self._spec_buffers) != nch:
+                self._spec_buffers = SpectralRing(nch)
+            self._spec_buffers.extend([f["channels"] for f in batch
+                                       if len(f["channels"]) == nch])
 
             # Recompute band powers at ~4 Hz using the actual hardware sample rate
             sr = self._sample_rate()
             spec_stride = max(sr // 4, 1)
-            self._spec_frame += 1
+            self._spec_frame += len(batch)
             if self._spec_frame >= spec_stride:
                 self._spec_frame = 0
                 powers = compute_band_powers(self._spec_buffers, sample_rate=sr)
@@ -919,38 +931,37 @@ class PiEEGServer:
 
             if not self._clients:
                 continue
+            for frame in batch:
+                await self._send_frame(frame)
+                _leadoff_frame += 1
+                if _leadoff_frame >= _leadoff_stride:
+                    _leadoff_frame = 0
+                    await self._broadcast_leadoff()
+                _hampel_frame += 1
+                if _hampel_frame >= 250:
+                    _hampel_frame = 0
+                    count = self._acq.hampel.replaced_count
+                    if count != _hampel_last_count:
+                        _hampel_last_count = count
+                        hpayload = json.dumps(
+                            {"hampel_config": self._get_hampel_config()})
+                        for ws in list(self._clients):
+                            try:
+                                await ws.send(hpayload)
+                            except websockets.ConnectionClosed:
+                                pass
 
-            payload = json.dumps(frame)
-
-            # Broadcast to all connected clients (snapshot to avoid mutation during iteration)
-            stale = set()
-            for ws in list(self._clients):
-                try:
-                    await ws.send(payload)
-                except websockets.ConnectionClosed:
-                    stale.add(ws)
-
-            self._clients -= stale
-
-            # Emit lead-off status at ~4 Hz (electrode contact readout)
-            _leadoff_frame += 1
-            if _leadoff_frame >= _leadoff_stride:
-                _leadoff_frame = 0
-                await self._broadcast_leadoff()
-
-            # Emit Hampel replaced_count at ~1 Hz (every 250 frames)
-            _hampel_frame += 1
-            if _hampel_frame >= 250:
-                _hampel_frame = 0
-                count = self._acq.hampel.replaced_count
-                if count != _hampel_last_count:
-                    _hampel_last_count = count
-                    hpayload = json.dumps({"hampel_config": self._get_hampel_config()})
-                    for ws in list(self._clients):
-                        try:
-                            await ws.send(hpayload)
-                        except websockets.ConnectionClosed:
-                            pass
+    async def _send_frame(self, frame):
+        """One frame to every connected client."""
+        payload = json.dumps(frame)
+        # snapshot to avoid mutation during iteration
+        stale = set()
+        for ws in list(self._clients):
+            try:
+                await ws.send(payload)
+            except websockets.ConnectionClosed:
+                stale.add(ws)
+        self._clients -= stale
 
     # ── Webhook WebSocket handlers ─────────────────────────────
 

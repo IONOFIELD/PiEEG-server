@@ -365,6 +365,10 @@ SCOPE_CHANGELOG = [
             "(all 19 + Fpz, Oz) carry the site; the other 11 go by their "
             "number alone (\"E2\"). Lead labels show the channel name in "
             "white and its E-numbers in grey."),
+    ("6.5", "Leaner server, room for a second board: samples reach the "
+            "server in batches, the USB serial is read a few ms at a time, "
+            "the live-stream filters and band powers run on blocks. With an "
+            "IronBCI-32 the server went from ~47% to ~25% of a core."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
