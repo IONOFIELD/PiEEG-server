@@ -348,6 +348,10 @@ SCOPE_CHANGELOG = [
             "recording put on the clock (a PiEEG-16's two chips lined up). "
             "Review shows 1000 SPS recordings at 250. Every note is kept in "
             "the BDF+ even when many fall close together."),
+    ("6.1", "Much faster trace drawing: the traces are painted as an image "
+            "and only the strip the sweep just wrote is sent to the screen, "
+            "instead of thousands of line pieces. With an IronBCI-32 the "
+            "display server went from ~90% of a core (seconds of lag) to ~5%."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
