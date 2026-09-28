@@ -226,7 +226,8 @@ def raw_timebase(counts, t1, flags, clock=None):
     }
 
 
-def prepare_export(journal_path, counts, meta, synced=False):
+def prepare_export(journal_path, counts, meta, synced=False,
+                   annotations=None):
     """What an export writes, from the journal as recorded: (counts,
     annotations, per-channel prefilter texts, time base or None).
 
@@ -248,7 +249,10 @@ def prepare_export(journal_path, counts, meta, synced=False):
     nch = int(meta["channel_count"])
     base = meta.get("prefilter") or "raw, no filter"
     prefilters = [base] * nch
-    annotations = list(read_annotations(journal_path))
+    # a second board's file takes the session's notes, already placed on
+    # its own samples (board_notes); otherwise the journal's own notes file
+    annotations = ([dict(a) for a in annotations] if annotations is not None
+                   else list(read_annotations(journal_path)))
     timing = read_timing(journal_path, rows=counts.shape[0])
     from . import timebase
     tb = None
@@ -470,7 +474,7 @@ _FORMATS = {"bdf": ".bdf", "edf": ".edf"}
 
 
 def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf",
-                   synced=False):
+                   synced=False, annotations=None):
     """Export a journal to BDF+ (default) or EDF+. Returns the output Path.
 
     Parameters
@@ -496,7 +500,7 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf",
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts, annotations, prefilters, tb = prepare_export(
-        journal_path, counts, meta, synced=synced)
+        journal_path, counts, meta, synced=synced, annotations=annotations)
     if tb is not None:
         logger.info("time base: %s", tb["report"])
     if fmt == "bdf":
@@ -509,6 +513,65 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf",
                 counts.shape[0], counts.shape[0] / int(meta["sample_rate"]),
                 len(annotations))
     return out_path
+
+
+def journal_clock(journal_path):
+    """(wall-clock time of the first sample in s, samples per second) for a
+    journal: from its data-ready edge times when it has them (the rate as
+    measured, the start to the µs), else its sidecar's start and rate."""
+    journal_path = Path(journal_path)
+    meta = json.loads(journal_path.with_suffix(".json").read_text())
+    nch = int(meta["channel_count"])
+    rows = journal_path.stat().st_size // (4 * nch)
+    timing = read_timing(journal_path, rows=rows)
+    if timing is not None:
+        t1, _, flags = timing
+        tb = raw_timebase(np.zeros((rows, 1), np.int32), t1, flags,
+                          meta.get("clock"))
+        if tb is not None and tb["start_unix_ns"]:
+            return tb["start_unix_ns"] / 1e9, float(tb["rate_hz"]), rows
+    return (float(meta.get("start_unix") or 0.0), float(meta["sample_rate"]),
+            rows)
+
+
+def board_notes(primary_journal, other_journal):
+    """The session's notes (kept with the primary board's journal) placed on
+    another board's samples by time: a note at primary sample f, i.e. at
+    start + f / rate, goes to the other board's sample nearest that time."""
+    p0, prate, _ = journal_clock(primary_journal)
+    o0, orate, orows = journal_clock(other_journal)
+    out = []
+    for a in read_annotations(primary_journal):
+        t = p0 + int(a["frame"]) / prate
+        f = int(round((t - o0) * orate))
+        out.append(dict(a, frame=min(max(f, 0), max(orows - 1, 0))))
+    return out
+
+
+def export_board(other_journal, primary_journal, folder):
+    """A second board's own raw BDF+ and summary JSON in the session folder
+    (<name>.bdf, <name>.json, name = the journal's stem, e.g.
+    <session>_pg), carrying the session's notes at its own samples. Written
+    aside and renamed into place. Returns (bdf Path, summary Path)."""
+    other_journal, folder = Path(other_journal), Path(folder)
+    notes = board_notes(primary_journal, other_journal)
+    bdf = folder / f"{other_journal.stem}.bdf"
+    tmp = folder / f"{other_journal.stem}.tmp.bdf"
+    try:
+        export_journal(other_journal, None, tmp, "bdf", annotations=notes)
+        os.replace(tmp, bdf)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    summary = write_summary(
+        other_journal, bdf, folder / f"{other_journal.stem}.json",
+        annotations=notes,
+        extra={"primary_board_file": os.path.relpath(
+            folder / f"{Path(primary_journal).stem}.bdf", folder),
+            "notes": "the session's notes, placed on this board's samples "
+                     "by time (the notes file is kept with the primary "
+                     "board's recording)"})
+    return bdf, summary
 
 
 def synced_path_for(bdf_path):
@@ -552,7 +615,7 @@ def export_synced(journal_path, sidecar_path, bdf_path):
 
 
 def write_summary(journal_path, edf_path, out_path, sidecar_path=None,
-                  synced_path=None):
+                  synced_path=None, annotations=None, extra=None):
     """Write the recording's summary JSON beside its BDF+ (or EDF+).
 
     One readable file per recording: when and how it was recorded, each
@@ -567,7 +630,8 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None,
     journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
                                         Path(out_path))
     counts, meta = read_journal(journal_path, sidecar_path)
-    counts, annotations, _, tb = prepare_export(journal_path, counts, meta)
+    counts, annotations, _, tb = prepare_export(journal_path, counts, meta,
+                                                annotations=annotations)
     nch = int(meta["channel_count"])
     fs = tb["rate_hz"] if tb is not None else int(meta["sample_rate"])
     labels = _channel_labels(meta, nch)
@@ -624,6 +688,7 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None,
             "synced_note": "the same recording on the clock: every channel "
                            f"{timebase.METHOD}, at its true sample times"}
            if synced_path else {}),
+        **(extra or {}),
         "raw": {"journal": rel(journal_path),
                 "sidecar": rel(Path(sidecar_path) if sidecar_path
                                else journal_path.with_suffix(".json")),
