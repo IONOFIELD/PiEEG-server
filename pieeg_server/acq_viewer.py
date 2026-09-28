@@ -2497,21 +2497,23 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _enter_review(sx):
         try:
-            uv, meta = review_store.load(sx["journal"])
+            # a raw oversampled recording (k x the display rate) is shown
+            # decimated; notes are kept in recorded samples on disk
+            uv, meta, k = review_store.load_for_display(sx["journal"],
+                                                        model.fs)
         except Exception as e:              # noqa: BLE001 - report, don't crash
             _hint(f"can't open {sx['session']}: {e}", seconds=8, fg=C["red"])
             return
-        if uv.shape[1] != model.nch or float(meta["sample_rate"]) != model.fs:
-            _hint(f"{sx['session']}: {uv.shape[1]} ch at "
-                  f"{meta['sample_rate']} SPS — the Scope shows {model.nch} "
-                  f"at {model.fs:g}", seconds=8, fg=C["red"])
+        if uv.shape[1] != model.nch:
+            _hint(f"{sx['session']}: {uv.shape[1]} ch — the Scope shows "
+                  f"{model.nch}", seconds=8, fg=C["red"])
             return
         if uv.shape[0] < 2:
             _hint(f"{sx['session']} has no samples", fg=C["yellow"])
             return
         _meas["box"], _meas["rows"] = None, []
-        _rev.update(on=True, info=sx, uv=uv, meta=meta, start=0,
-                    notes=review_store.notes(sx["journal"]))
+        _rev.update(on=True, info=sx, uv=uv, meta=meta, start=0, k=k,
+                    notes=review_store.notes_for_display(sx["journal"], k))
         _rev_refilter()
         _rev_page()
         _mode_face()
@@ -2629,8 +2631,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         def put(short, text, kind):
             _close_popup()
             try:
-                review_store.add_note(journal, frame, text, kind,
-                                      _rev["meta"])
+                review_store.add_note(journal, frame * _rev["k"], text,
+                                      kind, _rev["meta"])
             except Exception as e:          # noqa: BLE001
                 _hint(f"{text} not saved: {e}", seconds=8, fg=C["red"])
                 return
@@ -2672,7 +2674,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     def _rev_notes_changed(journal):
         if _rev["on"] and _rev["info"]["journal"] == journal:
-            _rev["notes"] = review_store.notes(journal)
+            _rev["notes"] = review_store.notes_for_display(journal, _rev["k"])
             _rev_notes_menu()
             _overlay["marks"] = None
         _schedule_export(journal)

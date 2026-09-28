@@ -41,7 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .journal import read_journal, read_timing
+from .journal import HELD, read_journal, read_timing
 
 logger = logging.getLogger("pieeg.edf_export")
 
@@ -136,6 +136,24 @@ def save_annotations(journal_path, annotations):
     return path
 
 
+def _annotation_slots(writer, annotations, fs, tb):
+    """Give the file enough annotation signals for its busiest data record.
+    EDFlib stores the notes in a fixed slot per record (about two short
+    notes each), and silently drops the rest: four notes inside one 5 s
+    record lost two. One signal per note in the busiest record (max 64).
+    Call before the samples are written."""
+    if not annotations:
+        return
+    rec_s = tb["record_duration_s"] if tb is not None else 1.0
+    per = {}
+    for a in annotations:
+        r = int(int(a["frame"]) / fs // rec_s)
+        per[r] = per.get(r, 0) + 1
+    need = min(64, max(per.values()))
+    if need > 1:
+        writer.set_number_of_annotation_signals(need)
+
+
 def _write_annotations(writer, annotations, fs, n_samples):
     # EDF+/BDF+ time is sample index / fs, so place each mark by its sample.
     for a in sorted(annotations, key=lambda a: a["frame"]):
@@ -143,19 +161,89 @@ def _write_annotations(writer, annotations, fs, n_samples):
         writer.writeAnnotation(frame / fs, -1, str(a.get("text", ""))[:40])
 
 
-def prepare_export(journal_path, counts, meta):
+def raw_timebase(counts, t1, flags, clock=None):
+    """The file layout for a RAW export: the journal's samples untouched,
+    stated at the rate measured from their data-ready edge times (each
+    uninterrupted run's rows over its span, so a pause doesn't skew it) and
+    starting at the first sample's wall-clock time. Returns a time-base dict
+    like timebase.build's, or None when the rows have no edge times (the
+    IronBCI-32's USB frames, older recordings). Pauses are only noted: the
+    raw file carries no time gaps."""
+    from . import timebase
+    n = len(t1)
+    ok = t1 > 0
+    if n < 2 or ok.sum() < 2:
+        return None
+    t = t1.astype(np.int64)
+    idx = np.flatnonzero(ok)
+    dt = np.diff(t[idx]) / np.diff(idx)          # ns per row between edges
+    period0 = float(np.median(dt))
+    # runs: split where more than 1.5 periods pass between neighbouring rows
+    breaks = np.flatnonzero(np.diff(t[idx]) > 1.5 * period0 * np.diff(idx))
+    rows, span = 0, 0
+    pauses = []
+    for a, b in zip(np.r_[0, breaks + 1], np.r_[breaks, len(idx) - 1]):
+        rows += idx[b] - idx[a]
+        span += t[idx[b]] - t[idx[a]]
+    for k in breaks:
+        gap_ns = t[idx[k + 1]] - t[idx[k]] - period0 * (idx[k + 1] - idx[k])
+        pauses.append({"row": int(idx[k + 1]),
+                       "ms": round(float(gap_ns) / 1e6, 1)})
+    true_rate = 1e9 * rows / span if span > 0 else 1e9 / period0
+    n_rec, dur = timebase.record_layout(true_rate)
+    rate = n_rec / dur
+    pad = (-n) % n_rec
+    counts_out = counts
+    held = (flags & HELD).astype(bool)
+    if pad:
+        counts_out = np.concatenate([counts, np.repeat(counts[-1:], pad, 0)])
+        held = np.concatenate([held, np.ones(pad, bool)])
+    start_ns = None
+    if clock and clock.get("unix_ns") and clock.get("monotonic_ns"):
+        start_ns = int(round(clock["unix_ns"] + (t[idx[0]] - idx[0] * period0
+                                                 - clock["monotonic_ns"])))
+    return {
+        "counts": counts_out, "held": held, "pad": int(pad),
+        "frame_of": np.arange(n, dtype=np.int64),
+        "rate_hz": rate, "samples_per_record": n_rec,
+        "record_duration_s": dur, "start_unix_ns": start_ns,
+        "pauses": pauses,
+        "report": {
+            "method": "raw: the samples exactly as recorded, not resampled",
+            "sample_rate_hz": round(float(rate), 6),
+            "measured_rate_hz": round(float(true_rate), 6),
+            "rate_error_ppm_vs_measured": round(
+                float((rate / true_rate - 1) * 1e6), 4),
+            "samples_per_record": n_rec, "record_duration_s": dur,
+            "pauses_not_in_file": pauses,
+            "held_samples": int((flags & HELD).astype(bool).sum()),
+            "end_padding_samples": int(pad),
+            "sample_time": ("row i is at start + i / sample_rate; the chip's "
+                            "true edge times (±0.5 ms clock wander, and a "
+                            "PiEEG-16's chip 2 offset) are in the raw .timing "
+                            "file and applied in the _synced copy"),
+        },
+    }
+
+
+def prepare_export(journal_path, counts, meta, synced=False):
     """What an export writes, from the journal as recorded: (counts,
     annotations, per-channel prefilter texts, time base or None).
 
-    With the journal's .timing file (recorded since Scope v5.4) the file is
-    put on the clock (timebase.py): every channel resampled from its chip's
-    measured sample times onto one even grid at the measured rate (a
-    PiEEG-16's two chips land on the same times), the first sample's
-    wall-clock time as the start, pauses held; notes go to the exported row
-    at their time, and every held stretch is noted: lost samples ("HELD"),
-    pauses ("GAP") and the end fill ("END FILL").
+    RAW (the default, the recording's own BDF+): the journal's samples
+    untouched, at the rate measured from their edge times and starting at the
+    first sample's wall-clock time (raw_timebase); held rows, pauses and the
+    end fill are notes, nothing is resampled.
 
-    Without it (older recordings), the journal as is at the nominal rate.
+    synced=True (the <session>_synced copy): put on the clock (timebase.py):
+    every channel resampled from its chip's measured sample times onto one
+    even grid at the measured rate (a PiEEG-16's two chips land on the same
+    times), pauses held; notes go to the exported row at their time, and
+    every held stretch is noted: lost samples ("HELD"), pauses ("GAP") and
+    the end fill ("END FILL").
+
+    Without the .timing file (older recordings), the journal as is at the
+    nominal rate.
     """
     nch = int(meta["channel_count"])
     base = meta.get("prefilter") or "raw, no filter"
@@ -164,6 +252,23 @@ def prepare_export(journal_path, counts, meta):
     timing = read_timing(journal_path, rows=counts.shape[0])
     from . import timebase
     tb = None
+    if timing is not None and not synced:
+        t1, _, flags = timing
+        tb = raw_timebase(counts, t1, flags, meta.get("clock"))
+        for first, length in _runs_of(flags & 1):
+            annotations.append({"frame": first, "type": "held",
+                                "text": _held_text(length)})
+        if tb is None:
+            return counts, annotations, prefilters, None
+        for p in tb["pauses"]:
+            annotations.append({"frame": p["row"], "type": "gap",
+                                "text": f"GAP {p['ms']} ms no data "
+                                        f"(not in file)"})
+        if tb["pad"]:
+            annotations.append({"frame": counts.shape[0], "type": "pad",
+                                "text": f"END FILL {tb['pad']} samples "
+                                        f"(held)"})
+        return tb["counts"], annotations, prefilters, tb
     if timing is not None:
         t1, off2, flags = timing
         tb = timebase.build(counts, t1, off2, flags,
@@ -287,6 +392,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None,
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Physical (minimum|maximum)")
             writer.setSignalHeaders(headers)
+            _annotation_slots(writer, annotations, fs, tb)
             _set_record_layout(writer, tb, start)
             # digital=True => write the integers straight through, no scaling.
             digital = [np.ascontiguousarray(counts[:, ci].astype(np.int32))
@@ -347,6 +453,7 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None,
                               or meta.get("prefilter") or "")[:80],
             })
         writer.setSignalHeaders(channel_info)
+        _annotation_slots(writer, annotations, fs, tb)
         _set_record_layout(writer, tb, start)
         # writeSamples wants one array per channel (physical uV values).
         writer.writeSamples([np.ascontiguousarray(uv[:, ci]) for ci in range(nch)])
@@ -362,7 +469,8 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None,
 _FORMATS = {"bdf": ".bdf", "edf": ".edf"}
 
 
-def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
+def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf",
+                   synced=False):
     """Export a journal to BDF+ (default) or EDF+. Returns the output Path.
 
     Parameters
@@ -388,7 +496,7 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     counts, annotations, prefilters, tb = prepare_export(
-        journal_path, counts, meta)
+        journal_path, counts, meta, synced=synced)
     if tb is not None:
         logger.info("time base: %s", tb["report"])
     if fmt == "bdf":
@@ -403,7 +511,48 @@ def export_journal(journal_path, sidecar_path=None, out_path=None, fmt="bdf"):
     return out_path
 
 
-def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
+def synced_path_for(bdf_path):
+    """<session>_synced.bdf beside the recording's <session>.bdf."""
+    bdf_path = Path(bdf_path)
+    return bdf_path.with_name(f"{bdf_path.stem}_synced{bdf_path.suffix}")
+
+
+def can_sync(journal_path) -> bool:
+    """True when the journal has the edge times a synced copy is built from
+    (PiEEG recordings since v5.4; not the IronBCI-32's USB frames)."""
+    journal_path = Path(journal_path)
+    try:
+        meta = json.loads(journal_path.with_suffix(".json").read_text())
+        nch = int(meta["channel_count"])
+        rows = journal_path.stat().st_size // (4 * nch)
+    except (OSError, ValueError, KeyError):
+        return False
+    timing = read_timing(journal_path, rows=rows)
+    return timing is not None and int((timing[0] > 0).sum()) >= MIN_SYNC_ROWS
+
+
+MIN_SYNC_ROWS = 16
+
+
+def export_synced(journal_path, sidecar_path, bdf_path):
+    """Build <session>_synced.bdf (the recording on the clock, see
+    prepare_export) beside the raw BDF+, written aside then renamed into
+    place. Returns its Path, or None when the journal has no edge times."""
+    if not can_sync(journal_path):
+        return None
+    out = synced_path_for(bdf_path)
+    tmp = out.with_name(out.stem + ".tmp" + out.suffix)
+    try:
+        export_journal(journal_path, sidecar_path, tmp, "bdf", synced=True)
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    return out
+
+
+def write_summary(journal_path, edf_path, out_path, sidecar_path=None,
+                  synced_path=None):
     """Write the recording's summary JSON beside its BDF+ (or EDF+).
 
     One readable file per recording: when and how it was recorded, each
@@ -414,6 +563,7 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
     own min..max, so a drifting or railed lead gets a coarse step. Returns
     the output Path.
     """
+    from . import timebase
     journal_path, edf_path, out_path = (Path(journal_path), Path(edf_path),
                                         Path(out_path))
     counts, meta = read_journal(journal_path, sidecar_path)
@@ -470,6 +620,10 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None):
                          "type": a.get("type", "note")}
                         for a in sorted(annotations,
                                         key=lambda a: a["frame"])],
+        **({"synced_file": rel(synced_path),
+            "synced_note": "the same recording on the clock: every channel "
+                           f"{timebase.METHOD}, at its true sample times"}
+           if synced_path else {}),
         "raw": {"journal": rel(journal_path),
                 "sidecar": rel(Path(sidecar_path) if sidecar_path
                                else journal_path.with_suffix(".json")),

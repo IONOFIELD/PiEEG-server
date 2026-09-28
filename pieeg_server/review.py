@@ -155,6 +155,45 @@ def notes(journal):
                   key=lambda a: int(a["frame"]))
 
 
+def display_factor(meta, display_fs) -> int:
+    """How many recorded samples make one displayed sample: 1 when the
+    recording runs at the display rate, k when it is the chip's raw k-times
+    oversampled rate (a raw PiEEG-8 recording is 1000 SPS on a 250 SPS
+    Scope). Raises ValueError for anything else."""
+    fs = float(meta["sample_rate"])
+    k = fs / float(display_fs)
+    if k >= 1 and abs(k - round(k)) < 1e-9:
+        return int(round(k))
+    raise ValueError(f"recorded at {fs:g} SPS; the Scope shows {display_fs:g}")
+
+
+def load_for_display(journal, display_fs):
+    """(uv, meta, k): the recording at the display rate. A raw recording at
+    k x the display rate goes through the same anti-alias FIR the live view
+    uses, applied forwards (zero phase: displayed sample i is recorded sample
+    i*k, so notes line up), then every k-th sample. The recording itself is
+    never changed. meta stays the recording's own (its sample_rate)."""
+    uv, meta = load(journal)
+    k = display_factor(meta, display_fs)
+    if k == 1:
+        return uv, meta, 1
+    from scipy.ndimage import convolve1d
+    from .decimate import design
+    taps = design(k, float(meta["sample_rate"]))
+    shown = convolve1d(uv, taps[::-1], axis=0, mode="nearest")[::k]
+    return shown, meta, k
+
+
+def notes_for_display(journal, k):
+    """The notes with "frame" in displayed samples (recorded frame // k)."""
+    out = []
+    for a in notes(journal):
+        a = dict(a)
+        a["frame"] = int(a["frame"]) // k
+        out.append(a)
+    return out
+
+
 def cal_breaks(uv, annotations, fs):
     """Samples where the input switched to or from the calibration signal.
 
@@ -236,9 +275,15 @@ def rebuild_exports(journal):
         finally:
             if tmp.exists():
                 tmp.unlink()
+        synced = None
+        try:
+            synced = edf_export.export_synced(journal, raw / f"{session}.json",
+                                              bdf)
+        except Exception as e:              # noqa: BLE001 - raw BDF+ is done
+            logger.warning("synced copy of %s not rebuilt: %s", session, e)
         if not flat:
             edf_export.write_summary(journal, bdf, folder / f"{session}.json",
-                                     raw / f"{session}.json")
+                                     raw / f"{session}.json", synced)
         for edf in (raw / f"{session}.edf", folder / f"{session}.edf"):
             if edf.exists():
                 edf.unlink()

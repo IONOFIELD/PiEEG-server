@@ -340,6 +340,14 @@ SCOPE_CHANGELOG = [
     ("5.9", "Recordings stay raw: the spike filters set from the dashboard "
             "now act on the live stream only (hardware spike rejection is "
             "switched off when a recording starts)."),
+    ("6.0", "Recordings are raw. A PiEEG-8 records the chip's own 1000 SPS "
+            "samples (no anti-alias filter; the Scope still shows 250), and "
+            "the recording's BDF+ holds the samples exactly as recorded, at "
+            "the rate measured from the chip and starting at the first "
+            "sample's time. <session>_synced.bdf beside it is the same "
+            "recording put on the clock (a PiEEG-16's two chips lined up). "
+            "Review shows 1000 SPS recordings at 250. Every note is kept in "
+            "the BDF+ even when many fall close together."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

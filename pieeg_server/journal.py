@@ -142,8 +142,11 @@ class JournalWriter:
                  num_channels=None, sample_rate=250, channel_labels=None,
                  gain=GAIN, vref_uv=VREF_UV, prefilter=None, reference=None):
         self._acq = acquisition
+        # Recordings are raw: the chip's own samples (subscribe_raw; with
+        # oversampling that is the chip rate, before any decimation filter).
         # Large buffer: tolerate an occasional fsync stall without dropping.
-        self._queue = acquisition.subscribe(maxsize=8192)
+        subscribe = getattr(acquisition, "subscribe_raw", acquisition.subscribe)
+        self._queue = subscribe(maxsize=8192)
 
         self._nch = int(num_channels or acquisition.num_channels)
         self._fs = int(sample_rate)
