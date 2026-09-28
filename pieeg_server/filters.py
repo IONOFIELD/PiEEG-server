@@ -59,17 +59,34 @@ class _SosBank:
         self._coef = [(b0, b1, b2, a1, a2)
                       for b0, b1, b2, _a0, a1, a2 in self._sos.tolist()]
         self._n = num_channels
-        # z[section][channel] = [z0, z1]; set by _prime() on the first sample
+        # The state lives in the form its path last used: z[section][channel]
+        # = [z0, z1] lists for apply_sample, a (sections, 2, channels) array
+        # for apply_block. Converting on every call cost more than the
+        # filtering on small blocks; now only a switch of path converts.
         self._z = None
+        self._zi = None
         self._zi_unit = signal.sosfilt_zi(self._sos).tolist()
 
     def _prime(self, first):
         self._z = [[[z0 * float(x), z1 * float(x)] for x in first[:self._n]]
                    for z0, z1 in self._zi_unit]
 
+    def _state_lists(self, first):
+        if self._zi is not None:
+            self._z = self._zi.transpose(0, 2, 1).tolist()
+            self._zi = None
+        elif self._z is None:
+            self._prime(first)
+
+    def _state_array(self, first):
+        if self._z is None and self._zi is None:
+            self._prime(first)
+        if self._z is not None:
+            self._zi = np.array(self._z).transpose(0, 2, 1).copy()
+            self._z = None
+
     def apply_sample(self, channels) -> list[float]:
-        if self._z is None:
-            self._prime(channels)
+        self._state_lists(channels)
         out = [float(v) for v in channels[:self._n]]  # zip() semantics, as before
         for (b0, b1, b2, a1, a2), zs in zip(self._coef, self._z):
             for i, x in enumerate(out):
@@ -83,13 +100,10 @@ class _SosBank:
     def apply_block(self, block) -> list[list[float]]:
         if not block:
             return []
-        if self._z is None:
-            self._prime(block[0])
-        x = np.asarray(block, dtype=np.float64)
+        self._state_array(block[0])
+        x = np.asarray(block, dtype=np.float64)[:, :self._n]
         # sosfilt's zi layout for (samples x channels), axis=0: (sections, 2, ch)
-        zi = np.array(self._z).transpose(0, 2, 1)
-        y, zf = signal.sosfilt(self._sos, x, axis=0, zi=zi)
-        self._z = zf.transpose(0, 2, 1).tolist()
+        y, self._zi = signal.sosfilt(self._sos, x, axis=0, zi=self._zi)
         return y.tolist()
 
 

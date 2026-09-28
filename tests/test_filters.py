@@ -417,3 +417,21 @@ def test_server_filters_do_not_ring_on_an_electrode_offset():
     notch = MultichannelNotchFilter(num_channels=1, freq=60.0, fs=fs)
     out = notch.apply_block([[offset + s] for s in sig])
     assert np.abs(np.asarray(out)[:, 0] - offset).max() < 25.0
+
+
+def test_switching_between_sample_and_block_paths_is_seamless():
+    import numpy as np
+    from pieeg_server.filters import _PyMultichannelFilter as MF
+    rng = np.random.default_rng(9)
+    x = (rng.normal(0, 20, (600, 8)) + 5000).tolist()
+    ref = MF(num_channels=8).apply_block(x)
+    mixed, f = [], MF(num_channels=8)
+    k = 0
+    for size in (1, 1, 7, 1, 50, 3, 1, 200, 1, 1000):
+        chunk = x[k:k + size]
+        if not chunk:
+            break
+        mixed += ([f.apply_sample(chunk[0])] if size == 1
+                  else f.apply_block(chunk))
+        k += size
+    assert np.allclose(mixed, ref[:len(mixed)], atol=1e-9)

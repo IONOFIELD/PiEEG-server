@@ -48,6 +48,44 @@ def make_ring_buffers(n_channels: int) -> list[deque]:
     return [deque(maxlen=FFT_SIZE) for _ in range(n_channels)]
 
 
+class SpectralRing:
+    """The last FFT_SIZE samples of every channel as one (FFT_SIZE, nch)
+    array: one row write per sample (a deque per channel meant nch appends
+    per sample and nch array conversions per update — with 32 channels a
+    large share of the server's CPU). len() is the channel count, like the
+    list of per-channel deques it stands in for."""
+
+    def __init__(self, n_channels: int, size: int = FFT_SIZE):
+        self.data = np.zeros((size, n_channels))
+        self.size = size
+        self.filled = 0
+        self._i = 0
+
+    def __len__(self):
+        return self.data.shape[1]
+
+    def append(self, row):
+        self.data[self._i] = row
+        self._i = (self._i + 1) % self.size
+        self.filled = min(self.size, self.filled + 1)
+
+    def extend(self, rows):
+        """Append several samples (a list of rows) in one write."""
+        rows = np.asarray(rows, dtype=np.float64)
+        if rows.ndim != 2 or rows.shape[0] == 0:
+            return
+        rows = rows[-self.size:]
+        m = rows.shape[0]
+        idx = (self._i + np.arange(m)) % self.size
+        self.data[idx] = rows
+        self._i = (self._i + m) % self.size
+        self.filled = min(self.size, self.filled + m)
+
+    def ordered(self) -> np.ndarray:
+        """Oldest sample first."""
+        return np.roll(self.data, -self._i, axis=0)
+
+
 # ── Core computation ──────────────────────────────────────────────────────
 
 def compute_band_powers(
@@ -84,6 +122,9 @@ def compute_band_powers(
     if not targets:
         return None
 
+    if isinstance(buffers, SpectralRing):
+        return _band_powers_ring(buffers, targets, sample_rate)
+
     # Wait until all target buffers are full
     if any(len(buffers[c]) < FFT_SIZE for c in targets):
         return None
@@ -103,6 +144,23 @@ def compute_band_powers(
             mask = (freqs >= lo) & (freqs < hi)
             result[band].append(float(np.mean(raw[mask]) if mask.any() else 0.0))
 
+    return result
+
+
+def _band_powers_ring(ring, targets, sample_rate):
+    """compute_band_powers for a SpectralRing: every channel in one FFT."""
+    if ring.filled < FFT_SIZE:
+        return None
+    hanning, freqs = _get_window(sample_rate)
+    norm_factor = float(sample_rate) * float(np.sum(hanning ** 2))
+    x = ring.ordered()[:, targets]
+    raw = np.abs(np.fft.rfft(x * hanning[:, None], axis=0)) ** 2 / norm_factor
+    raw[1:-1] *= 2
+    result: dict[str, list[float]] = {}
+    for band, (lo, hi) in BANDS.items():
+        mask = (freqs >= lo) & (freqs < hi)
+        result[band] = ([float(v) for v in raw[mask].mean(axis=0)]
+                        if mask.any() else [0.0] * len(targets))
     return result
 
 

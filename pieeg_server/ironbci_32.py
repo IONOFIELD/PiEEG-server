@@ -94,6 +94,7 @@ RATE_SNAP_TOL = 0.02          # ±2 %
 RATE_PROBE_S = 2.0            # counting window
 RATE_SKIP_S = 0.3             # ignore the first frames (stale USB backlog)
 READ_CHUNK = 2048
+READ_GAP_S = 0.003            # pause between reads once caught up
 
 # --- Frame counter ----------------------------------------------------------
 # The byte after 0xA0 counts frames. Its step is learned from the first
@@ -895,6 +896,12 @@ class IronBCI32Hardware:
             # briefly to avoid busy-looping on the timeout.
             if not chunk:
                 time.sleep(0.001)
+            elif caught_up:
+                # Let a few ms of frames collect: reading every USB packet
+                # as it lands (~850 reads/s) was a third of the process's
+                # CPU. 3 ms is ~1.5 frames at 512 SPS; the display and
+                # recordings don't notice.
+                time.sleep(READ_GAP_S)
 
     # Backwards-compat helper kept for older tests; no longer used by _read_loop.
     def _sync_to_start_byte(self) -> bool:

@@ -41,6 +41,12 @@ READER_PROCESS = os.environ.get("PIEEG_READER_PROCESS", "1") != "0"
 _SETTLE_FRAMES = 25
 
 
+# Frame hand-off batching (AcquisitionLoop._post): the longest a frame waits
+# for its batch, and the most frames in one.
+BATCH_S = 0.005
+BATCH_MAX = 64
+
+
 class AcquisitionLoop:
     """Runs the SPI read loop in a background thread, feeds async queues."""
 
@@ -59,6 +65,13 @@ class AcquisitionLoop:
         # Recordings: the chip's own samples (see subscribe_raw)
         self._raw_subscribers: list[asyncio.Queue] = []
         self._last_raw = None
+        # Frames go to the event loop in batches (see _post): one wake-up per
+        # batch instead of one per sample. Only inside _run, so code (and
+        # tests) calling the loop's internals directly hand frames over one
+        # at a time as before.
+        self._batching = False
+        self._pending: list = []
+        self._pending_t0 = 0.0
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._sample_count = 0
@@ -223,6 +236,14 @@ class AcquisitionLoop:
         self.realtime = True
 
     def _run(self):
+        self._batching = True
+        try:
+            self._run_source()
+        finally:
+            self._flush()
+            self._batching = False
+
+    def _run_source(self):
         if self._mock:
             self._run_mock()
         elif self._ble:
@@ -254,7 +275,7 @@ class AcquisitionLoop:
                 "n": self._sample_count,
                 "channels": sample,
             }
-            self._loop.call_soon_threadsafe(self._enqueue, frame)
+            self._post(self._enqueue, frame)
             time.sleep(interval)
 
     def _run_hardware(self):
@@ -305,7 +326,7 @@ class AcquisitionLoop:
             }
 
             # Non-blocking put into the asyncio queue from this thread
-            self._loop.call_soon_threadsafe(self._enqueue, frame)
+            self._post(self._enqueue, frame)
 
     def _run_hardware_interrupt(self):
         """Interrupt-driven acquisition: one frame per DRDY falling edge.
@@ -475,7 +496,7 @@ class AcquisitionLoop:
             frame["held"] = True
         self._last_raw = (sample, t, ts_ns)
         if self._raw_subscribers:
-            self._loop.call_soon_threadsafe(self._enqueue_raw, frame)
+            self._post(self._enqueue_raw, frame)
 
     def _emit(self, sample, t, ts_ns=None, t2_ns=None, held=False):
         self._sample_count += 1
@@ -494,7 +515,7 @@ class AcquisitionLoop:
             frame["held"] = True
         # the next hold repeats this sample one period after this row
         self._last_emitted = (sample, t, ts_ns)
-        self._loop.call_soon_threadsafe(self._enqueue, frame)
+        self._post(self._enqueue, frame)
 
     def _finish_streaming(self):
         # Clean stop: halt streaming, then restore the DRDY level handle.
@@ -519,8 +540,10 @@ class AcquisitionLoop:
                 if pending is not None:
                     ts_ns, pending = pending, None
                 else:
-                    ts_ns = self._hw.wait_drdy_event(timeout=0.5)
+                    ts_ns = self._hw.wait_drdy_event(
+                        timeout=BATCH_S if self._pending else 0.5)
                     if ts_ns is None:
+                        self._flush()
                         continue           # no edge yet — re-check the stop flag
                 self._account_edge(ts_ns)
 
@@ -608,8 +631,10 @@ class AcquisitionLoop:
         exited = False
         try:
             while not self._stop_event.is_set():
-                ready, _, _ = select.select([data_r], [], [], 0.2)
+                ready, _, _ = select.select(
+                    [data_r], [], [], BATCH_S if self._pending else 0.2)
                 if not ready:
+                    self._flush()
                     if proc.poll() is not None:
                         exited = True
                         break
@@ -735,6 +760,33 @@ class AcquisitionLoop:
                if hasattr(self._hw, "serial_stats") else {}),
         }
 
+    def _post(self, fn, frame):
+        """Hand `fn(frame)` to the event loop. Inside a run the frames are
+        batched: call_soon_threadsafe writes to the loop's wake-up pipe, and
+        once per sample (x2 with the raw feed, x boards) that was a large
+        share of the process's CPU. A batch goes at the latest BATCH_S after
+        its first frame, in order."""
+        if not self._batching:
+            self._loop.call_soon_threadsafe(fn, frame)
+            return
+        if not self._pending:
+            self._pending_t0 = time.monotonic()
+        self._pending.append((fn, frame))
+        if (len(self._pending) >= BATCH_MAX
+                or time.monotonic() - self._pending_t0 >= BATCH_S):
+            self._flush()
+
+    def _flush(self):
+        """Send the frames waiting in _post, if any."""
+        if self._pending:
+            items, self._pending = self._pending, []
+            self._loop.call_soon_threadsafe(self._run_batch, items)
+
+    @staticmethod
+    def _run_batch(items):
+        for fn, frame in items:
+            fn(frame)
+
     def _enqueue(self, frame: dict):
         """Hand a frame to the subscribers, and to the raw feed too when
         these frames are the chip's own samples (no oversampling)."""
@@ -799,7 +851,7 @@ class AcquisitionLoop:
                 "n": self._sample_count,
                 "channels": sample,
             }
-            self._loop.call_soon_threadsafe(self._enqueue, frame)
+            self._post(self._enqueue, frame)
 
             next_t += interval
             delay = next_t - time.monotonic()
@@ -840,10 +892,11 @@ class AcquisitionLoop:
         while not self._stop_event.is_set():
             sample = self._hw.read_sample()
             if sample is None:
+                self._flush()               # caught up: send what we have
                 time.sleep(idle_sleep)
                 continue
             self._sample_count += 1
-            self._loop.call_soon_threadsafe(self._enqueue, {
+            self._post(self._enqueue, {
                 "t": round(time.time(), 6),
                 "n": self._sample_count,
                 "channels": sample,
