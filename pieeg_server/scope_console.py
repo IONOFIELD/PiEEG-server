@@ -369,6 +369,11 @@ SCOPE_CHANGELOG = [
             "server in batches, the USB serial is read a few ms at a time, "
             "the live-stream filters and band powers run on blocks. With an "
             "IronBCI-32 the server went from ~47% to ~25% of a core."),
+    ("6.6", "Two boards on one screen: with an IronBCI-32 on USB and a PiEEG "
+            "on the GPIO pins, the Scope runs both. The 32-channel EEG is on "
+            "top in blue, then the PiEEG's EKG (E1-E2) in red and EMG 1-3 "
+            "(E3-E4, E5-E6, E7-E8) in white; Choose leads > Electrodes has a "
+            "section per board. (Recording both boards comes next.)"),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -388,6 +393,31 @@ _IRONBCI32_ELECTRODES = [
     "Pz", "Oz", "O2", "P4", "E21", "C4", "E23", "F4",           # bank 3
     "Fp2", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
 ]
+
+
+# A PiEEG next to an IronBCI-32 records polygraphy: its inputs are keyed
+# X1..Xn (their own E1..En on screen) and its default rows are the EKG on
+# E1-E2 and body EMG on E3-E4, E5-E6, E7-E8, after the EEG rows.
+PG_ROWS = [("X1", "X2", "EKG"), ("X3", "X4", "EMG 1"),
+           ("X5", "X6", "EMG 2"), ("X7", "X8", "EMG 3")]
+
+
+def _pg_keys(n: int) -> list[str]:
+    return [f"X{i}" for i in range(1, n + 1)]
+
+
+def _pg_leadoff(source, offset):
+    """The PiEEG's lead-off readout renumbered to its place after the EEG
+    board's inputs on the combined screen."""
+    if source is None:
+        return None
+
+    def combined():
+        status = source()
+        if not status:
+            return status
+        return [dict(c, ch=int(c.get("ch", 0)) + offset) for c in status]
+    return combined
 
 
 def _electrodes(device: str, num_ch: int) -> list[str]:
@@ -574,13 +604,27 @@ class _ViewerLink:
         if calibrate is not None:
             self._requests["calibrate"] = ("calibrate_result", calibrate)
         self._frames = collections.deque(maxlen=self.MAX_BACKLOG)
+        # Two boards: the second board's newest sample is appended to every
+        # frame of the first (display only: it is held until the next one
+        # arrives, so 250 SPS rows keep pace with a 512 SPS sweep).
+        self._second = None
         self._outbox: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
     def push(self, frame):
         """Queue one acquisition frame for the viewer (any thread)."""
-        self._frames.append(frame["channels"])
+        if self._second is None:
+            self._frames.append(frame["channels"])
+        else:
+            self._frames.append(list(frame["channels"]) + self._second)
+
+    def use_second_board(self, num_channels):
+        self._second = [0.0] * num_channels
+
+    def push_second(self, frame):
+        """The second board's newest sample (any thread)."""
+        self._second = list(frame["channels"])
 
     def start(self):
         self._proc.start()
@@ -747,6 +791,11 @@ def main(argv=None):
                         help="do not start the web dashboard")
     parser.add_argument("--serial-port", default=None,
                         help="serial device for ironbci32 (e.g. /dev/ttyACM0)")
+    parser.add_argument("--pg-device", default="auto",
+                        choices=["auto", "none", "pieeg8", "pieeg16"],
+                        help="with an IronBCI-32 (EEG): a PiEEG shield on SPI "
+                             "for polygraphy (EKG/EMG) at the same time "
+                             "(default: auto = use one if it answers)")
     parser.add_argument("--mock", action="store_true",
                         help="mock server, no PiEEG hardware: all channels "
                              "carry the 2 Hz square calibration signal")
@@ -835,6 +884,34 @@ def main(argv=None):
     # CONFIG1); the nominal device rate only for hardware that can't say.
     fs = getattr(hw, "sample_rate", None) or fs
 
+    # ---- second board: a PiEEG for polygraphy beside an IronBCI-32 --------- #
+    hw2 = None
+    pg_n = 0
+    if serial and not args.mock and args.pg_device != "none":
+        from .detect import probe_pieeg
+        if args.pg_device == "auto":
+            pg_n = probe_pieeg(args.gpio_chip, args.profile) or 0
+        else:
+            pg_n = 16 if args.pg_device == "pieeg16" else 8
+        if pg_n:
+            from .hardware import PiEEGHardware
+            hw2 = PiEEGHardware(gpio_chip=args.gpio_chip, num_channels=pg_n,
+                                profile=args.profile)
+            try:
+                hw2.open()
+            except (Exception, SystemExit) as e:  # noqa: BLE001
+                logger.warning("PiEEG beside the IronBCI-32 didn't open "
+                               "(%s); EEG only", e)
+                try:
+                    hw2.close()
+                except Exception:           # noqa: BLE001 - best-effort
+                    pass
+                hw2, pg_n = None, 0
+    if hw2 is not None:
+        board = f"{board} + {BOARD_NAMES.get(f'pieeg{pg_n}', 'PiEEG')}"
+        logger.info("two boards: %s (EEG) and PiEEG-%d on SPI (polygraphy)",
+                    BOARD_NAMES.get(args.device, args.device), pg_n)
+
     # ---- acquisition (thread) + event loop (bg thread) --------------------- #
     loop = asyncio.new_event_loop()          # created here, RUN in the bg thread
     # PiEEG over SPI waits on the DRDY interrupt instead of busy-polling it
@@ -843,6 +920,8 @@ def main(argv=None):
     # (243 of 250 SPS) while the Scope recorded, versus ~0 with the interrupt.
     acq = AcquisitionLoop(hw, loop, mock=args.mock, ble=ble, serial=serial,
                           interrupt=not (args.mock or ble or serial))
+    acq2 = (AcquisitionLoop(hw2, loop, interrupt=True)
+            if hw2 is not None else None)
 
     # ---- server (plain ws://) + optional dashboard ------------------------- #
     # Recordings carry the same input -> site map the viewer shows.
@@ -874,6 +953,15 @@ def main(argv=None):
             if link is not None:
                 link.push(frame)
 
+    sub_q2 = acq2.subscribe(maxsize=2048) if acq2 is not None else None
+
+    async def _bridge2():
+        while True:
+            frame = await sub_q2.get()
+            link = link_ref.get("link")
+            if link is not None:
+                link.push_second(frame)
+
     ready = threading.Event()
     boot_error: dict = {}
     tasks: dict = {}
@@ -881,6 +969,8 @@ def main(argv=None):
     async def _boot():
         tasks["server"] = asyncio.create_task(server.run())
         tasks["bridge"] = asyncio.create_task(_bridge())
+        if sub_q2 is not None:
+            tasks["bridge2"] = asyncio.create_task(_bridge2())
         # websockets.serve binds synchronously at the top of server.run(); give
         # it a moment, then confirm the task didn't die (e.g. port in use).
         await asyncio.sleep(0.6)
@@ -971,7 +1061,7 @@ def main(argv=None):
     async def _shutdown():
         # Runs ON the loop: cancel the server (its `async with serve()` closes
         # the socket) and the bridge, then unsubscribe the viewer.
-        for name in ("server", "bridge"):
+        for name in ("server", "bridge", "bridge2"):
             t = tasks.get(name)
             if t and not t.done():
                 t.cancel()
@@ -980,6 +1070,8 @@ def main(argv=None):
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
         acq.unsubscribe(sub_q)
+        if acq2 is not None:
+            acq2.unsubscribe(sub_q2)
 
     def _run_loop():
         asyncio.set_event_loop(loop)
@@ -994,6 +1086,8 @@ def main(argv=None):
         loop.call_soon_threadsafe(loop.stop)
         bg.join(timeout=5)
         hw.close()
+        if hw2 is not None:
+            hw2.close()
 
     bg = threading.Thread(target=_run_loop, name="pieeg-scope-loop", daemon=True)
     bg.start()
@@ -1025,9 +1119,19 @@ def main(argv=None):
              f"   ·   {mode.upper()}{'  · MOCK' if args.mock else ''}")
 
     # ---- viewer (its own process; closing its window is the shutdown) ------ #
+    view = dict(num_channels=acq.num_channels, electrodes=electrodes)
+    leadoff = _contact_source(hw)
+    if acq2 is not None:
+        pg = _pg_keys(pg_n)
+        view = dict(
+            num_channels=acq.num_channels + pg_n, electrodes=electrodes + pg,
+            input_labels={k: f"E{i}" for i, k in enumerate(pg, start=1)},
+            boards=[(BOARD_NAMES.get(args.device, args.device), electrodes),
+                    (BOARD_NAMES.get(f"pieeg{pg_n}", "PiEEG"), pg)],
+            extra_rows=PG_ROWS)
+        leadoff = _pg_leadoff(_contact_source(hw2), acq.num_channels)
     link = _ViewerLink(
-        dict(num_channels=acq.num_channels, fs=fs, electrodes=electrodes,
-             title=title,
+        dict(view, fs=fs, title=title,
              connect_popup={"ip": ip, "port": args.port, "mode": mode,
                             "targets": targets, "version": SCOPE_VERSION,
                             "changelog": SCOPE_CHANGELOG},
@@ -1035,7 +1139,7 @@ def main(argv=None):
              recordings_dir=str(args.recordings_dir),
              board_warning=getattr(hw, "board_warning", None),
              auto_close_ms=(int(args.seconds * 1000) if args.seconds else None)),
-        leadoff=_contact_source(hw),
+        leadoff=leadoff,
         record_status=_record_status,
         # No Rec button on mock launches: synthetic data must never land in
         # recordings/ looking like a real session.
@@ -1052,8 +1156,12 @@ def main(argv=None):
             lambda on: asyncio.run_coroutine_threadsafe(_calibrate(on), loop)))
     try:
         link_ref["link"] = link
+        if acq2 is not None:
+            link.use_second_board(pg_n)
         link.start()
         acq.start()
+        if acq2 is not None:
+            acq2.start()
         if dashboard is not None:
             try:
                 dashboard.start()
@@ -1095,6 +1203,10 @@ def main(argv=None):
         acq.stop()                              # joins the acquisition thread
         if acq._interrupt:
             logger.info("acquisition stats: %s", acq.capture_stats())
+        if acq2 is not None:
+            acq2.stop()
+            logger.info("second board acquisition stats: %s",
+                        acq2.capture_stats())
         # Close the server + bridge ON the loop, THEN stop the loop, so the
         # websockets server never tries to close on a dead loop.
         fut = asyncio.run_coroutine_threadsafe(_shutdown(), loop)
@@ -1110,6 +1222,12 @@ def main(argv=None):
         # in THIS one process, so once main() returns there is no server thread,
         # task, or child left holding the bus or port 1616 — a re-launch needs
         # no manual kill.
+        if hw2 is not None:
+            try:
+                hw2.close()
+                logger.info("PiEEG (second board) closed, SPI released.")
+            except Exception as e:              # noqa: BLE001 - best-effort
+                logger.warning("hw2.close() raised: %s", e)
         try:
             hw.close()
             logger.info("SPI bus released (hw.close()).")
