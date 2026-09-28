@@ -69,7 +69,13 @@ def test_ironbci32_sites_follow_its_electrode_map():
     assert len(sites) == len(set(sites)) == 32
     # spot checks against the board's electrode location drawing
     assert (sites[0], sites[11], sites[14], sites[24], sites[31]) == (
-        "F7", "Fp1", "Cz", "Fp2", "POz")
+        "F7", "Fp1", "Cz", "Fp2", "E32")
+    tenty = [x for x in sites if not x.startswith("E")]
+    assert len(tenty) == 21                 # all 19 + Fpz, Oz
+    assert {"T3", "T4", "T5", "T6"} <= set(tenty)
+    # the rest go by their input number
+    assert all(x == f"E{i + 1}" for i, x in enumerate(sites)
+               if x.startswith("E"))
 
 
 def test_ironbci32_gets_the_full_acns_presets(tmp_path):
@@ -85,11 +91,11 @@ def test_ironbci32_gets_the_full_acns_presets(tmp_path):
 def test_ironbci32_recording_labels_are_its_sites():
     from pieeg_server.journal import referential_labels
     labels = referential_labels(_electrodes("ironbci32", 32))
-    assert labels[0] == "EEG F7-REF" and labels[-1] == "EEG POz-REF"
+    assert labels[0] == "EEG F7-REF" and labels[-1] == "EEG E32-REF"
 
 
 def test_sides_of_the_head():
-    assert [av.site_side(x) for x in ("Fp1", "T8", "Cz", "Fpz", "POz",
+    assert [av.site_side(x) for x in ("Fp1", "T4", "Cz", "Fpz", "Oz",
                                       "E17")] == ["left", "right", "mid",
                                                   "mid", "mid", None]
     assert av.row_side(("Fp1", "F7")) == "left"
@@ -125,3 +131,10 @@ def test_unwired_electrodes_leave_every_montage(tmp_path):
     assert {p for r in m.visible_rows() for p in r["pair"]} <= wired
     m.set_wired(m.electrodes, True)
     assert len(m.visible_rows()) == len(m.rows())
+
+
+def test_input_text_like_the_pieeg(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    assert m.input_text("F7") == "E1 F7" and m.input_text("E2") == "E2"
+    m8 = _model(8, tmp_path / "s8.json")
+    assert m8.input_text("Fp1") == "E1 Fp1"

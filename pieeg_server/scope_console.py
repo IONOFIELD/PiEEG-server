@@ -327,10 +327,10 @@ SCOPE_CHANGELOG = [
             "of in ~80 ms clumps, frames lost on the USB link are found by the "
             "board's counter and held on the time grid (counted in the "
             "recording summary), and 32-channel CSVs name all 32 columns."),
-    ("5.7", "IronBCI-32 inputs carry the board's own sites (1 = F7, 12 = Fp1, "
-            "15 = Cz … 32 = POz, 10-10 names) on screen and in recordings. "
-            "Its montages are the full 18-row ACNS chains with the midline "
-            "(Fz-Cz, Cz-Pz); the other 10-10 sites can be added as rows."),
+    ("5.7", "IronBCI-32 inputs carry the board's own 10-20 sites (1 = F7, "
+            "12 = Fp1, 15 = Cz …) on screen and in recordings. Its montages "
+            "are the full 18-row ACNS chains with the midline (Fz-Cz, "
+            "Cz-Pz)."),
     ("5.8", "Traces are coloured by type: EEG blue, EKG/ECG rows red, EMG "
             "rows white (from the row name). Sensitivity starts at 20 µV/mm. "
             "An IronBCI-32 that comes up wrong (odd rate, dead inputs) gets a "
@@ -359,7 +359,12 @@ SCOPE_CHANGELOG = [
             "switch off the ones not wired for this study and every lead "
             "using them leaves the screen, in every montage (each launch "
             "starts with the whole board). IronBCI-32 sites use the classic "
-            "10-20 names like the PiEEG: T3/T4/T5/T6 (not T7/T8/P7/P8)."),
+            "10-20 names like the PiEEG (T3/T4/T5/T6)."),
+    ("6.4", "IronBCI-32 inputs are labelled like the PiEEG: E-number plus "
+            "its 10-20 site (\"E1 F7\"). The 21 inputs on 10-20 positions "
+            "(all 19 + Fpz, Oz) carry the site; the other 11 go by their "
+            "number alone (\"E2\"). Lead labels show the channel name in "
+            "white and its E-numbers in grey."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -367,15 +372,17 @@ SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 # PiEEG-8/16: the harness order, first 8 = the 8-channel hookup.
 _ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
-# IronBCI-32: its own input -> site map, from the board's electrode location
-# drawing (pieeg-club/ironbci-32 images/Electrode_Location.png), in classic
-# 10-20 names like the PiEEG (the drawing's T7/T8/P7/P8 are T3/T4/T5/T6).
-# REF and BIAS are the ear clips.
+# IronBCI-32: input -> 10-20 site, like the PiEEG's list, from the board's
+# electrode location drawing (pieeg-club/ironbci-32 images/Electrode_Location
+# .png). Four banks of 8, one ADC each; bank 1 also has the REF and BIAS pins
+# (ear clips). 21 inputs sit on 10-20 positions (all 19 + Fpz, Oz); the other
+# 11 lie between them, have no 10-20 site and go by their input number. Edit
+# this list if your cap is wired differently.
 _IRONBCI32_ELECTRODES = [
-    "F7", "FT7", "T3", "TP7", "T5", "O1", "P3", "CP3",          # 1-8
-    "C3", "FC3", "F3", "Fp1", "Fz", "FCz", "Cz", "CPz",         # 9-16
-    "Pz", "Oz", "O2", "P4", "CP4", "C4", "FC4", "F4",           # 17-24
-    "Fp2", "F8", "FT8", "T4", "TP8", "T6", "Fpz", "POz",        # 25-32
+    "F7", "E2", "T3", "E4", "T5", "O1", "P3", "E8",             # bank 1
+    "C3", "E10", "F3", "Fp1", "Fz", "E14", "Cz", "E16",         # bank 2
+    "Pz", "Oz", "O2", "P4", "E21", "C4", "E23", "F4",           # bank 3
+    "Fp2", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
 ]
 
 
