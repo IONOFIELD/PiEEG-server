@@ -1359,8 +1359,10 @@ def average_impedance(result, inputs):
         return None, 0
     # a second board's check says where its leads sit on the combined screen
     first = int(result.get("first_input") or 1)
+    # inputs with no test lead (an IronBCI-32 input not on the harness)
+    # weren't part of the check: not counted either way
     mine = [lead for i, lead in enumerate(result["leads"], start=first)
-            if i in set(inputs)]
+            if i in set(inputs) and lead.get("status") != "untested"]
     vals = [lead["ohms"] for lead in mine if lead.get("status") == "ok"]
     if result.get("problem") or not vals:
         return None, len(mine) - len(vals)
@@ -1718,8 +1720,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ibox.pack(side="left", padx=(0, 2), pady=1)
         # Average impedance of the visible montage's measured electrodes; a
         # tap runs the check. Fixed width for the longest reading
-        # ("Ω 99.9k·3"), so the row doesn't shift once values arrive.
-        imp_lbl = tk.Label(ibox, text="Ω —", width=8, bg=C["raised"],
+        # ("Ω 99.9k·32" on a 32-input board), so the row doesn't shift once
+        # values arrive.
+        imp_lbl = tk.Label(ibox, text="Ω —", width=10, bg=C["raised"],
                            fg=C["text_dim"], cursor="hand2",
                            font=(_MONO, _fs(10), "bold"))
         imp_lbl.pack(padx=2, pady=2)
@@ -2205,6 +2208,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                             panel_until=time.monotonic() + IMP_PANEL_S)
                 if res.get("problem"):
                     _hint(res["problem"], seconds=10, fg=C["red"])
+                elif res.get("notes"):
+                    _hint(res["notes"][0], seconds=10, fg=C["red"])
                 else:
                     # The AVG box only has room for a count, so say it once.
                     _, missing = average_impedance(res, model.montage_inputs())
@@ -2254,7 +2259,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         for site in model.electrodes:
             i = model.site_index[site] - first
             lead = res["leads"][i] if 0 <= i < len(res["leads"]) else None
-            if lead is None:
+            if lead is None or lead.get("status") == "untested":
                 continue
             if withheld:
                 value, fg = "—", C["text_dim"]
@@ -2263,16 +2268,26 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 # lead's calibrated range, "off" or "no cal".
                 value = lead["text"]
                 fg = _BAND_FG.get(lead["band"], C["text_dim"])
-            shown_site = "" if site == model.elabel(site) else site
+            # a second board's inputs have no site: their E-number alone
+            shown_site = ("" if site == model.elabel(site)
+                          or site in model.input_labels else site)
             lines.append((f"{model.elabel(site):<3} {shown_site:<5}{value:>9}",
                           fg))
-        verdict = {"green": "ok", "red": "OFF", None: "?"}
-        lines.append((f"REF {verdict.get(res.get('ref'), '?'):<4}"
-                      f"GND {verdict.get(res.get('gnd'), '?')}",
-                      C["red"] if "red" in (res.get("ref"), res.get("gnd"))
-                      else C["text_sec"]))
-        if withheld:
-            words, row = res["problem"].split(), ""
+        if res.get("extra_lines") is not None:
+            # several boards: a REF (and GND) line per board
+            for e in res["extra_lines"]:
+                lines.append((e["text"],
+                              _BAND_FG.get(e.get("band"), C["text_sec"])))
+        else:
+            verdict = {"green": "ok", "red": "OFF", None: "?"}
+            lines.append((f"REF {verdict.get(res.get('ref'), '?'):<4}"
+                          f"GND {verdict.get(res.get('gnd'), '?')}",
+                          C["red"] if "red" in (res.get("ref"), res.get("gnd"))
+                          else C["text_sec"]))
+        problems = ([res["problem"]] if withheld else []) + list(
+            res.get("notes") or [])
+        for text in problems:
+            words, row = text.split(), ""
             for w in words:
                 if len(row) + len(w) + 1 > 26:
                     lines.append((row, C["red"]))

@@ -194,3 +194,13 @@ class TestSecondBoardResult:
             None, 0)
         assert acq_viewer.average_impedance(
             self.RESULT, list(range(1, 41))) == (5000.0, 6)
+
+
+def test_untested_inputs_are_not_counted_as_unmeasured():
+    """An IronBCI-32 check covers only the inputs with a test lead."""
+    res = {"problem": None, "first_input": 1, "leads": [
+        {"ohms": 4000.0, "status": "ok"}, {"ohms": None, "status": "untested"},
+        {"ohms": None, "status": "above", "limit_ohms": 47000.0},
+        {"ohms": None, "status": "untested"}]}
+    assert acq_viewer.average_impedance(res, [1, 2, 3, 4]) == (4000.0, 1)
+    assert acq_viewer.average_impedance(res, [2, 4]) == (None, 0)
