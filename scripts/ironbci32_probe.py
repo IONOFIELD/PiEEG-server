@@ -4,6 +4,7 @@ input alive? Run with the Scope CLOSED (it holds the port).
 
     .venv/bin/python scripts/ironbci32_probe.py            # finds the port
     .venv/bin/python scripts/ironbci32_probe.py --seconds 20 --port /dev/ttyACM0
+    .venv/bin/python scripts/ironbci32_probe.py --seconds 60 --label two-batteries
 
 Prints the wire facts (frame size, measured rate, counter step, lost
 frames) and one row per input: DC offset, RMS and peak-to-peak after the
@@ -49,6 +50,9 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--mains", type=float, default=60)
     ap.add_argument("--no-save", action="store_true")
+    ap.add_argument("--label", default="",
+                    help="tag for the saved JSON, e.g. the power setup "
+                         "(pi-powered / same-anker / two-batteries)")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="  %(message)s")
 
@@ -110,9 +114,11 @@ def main() -> int:
 
     if not args.no_save and os.path.isdir(os.path.dirname(SAVE_DIR)):
         os.makedirs(SAVE_DIR, exist_ok=True)
-        name = dt.datetime.now().strftime("probe_%Y%m%d_%H%M%S.json")
+        name = dt.datetime.now().strftime("probe_%Y%m%d_%H%M%S")
+        name += f"_{args.label}.json" if args.label else ".json"
         with open(os.path.join(SAVE_DIR, name), "w") as f:
             json.dump(dict(port=port, seconds=args.seconds, sample_rate=fs,
+                           label=args.label,
                            serial=stats, inputs=report), f, indent=1)
         print(f"\nsaved {os.path.join(SAVE_DIR, name)}")
     return 0
