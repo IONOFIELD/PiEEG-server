@@ -1632,6 +1632,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                               command=lambda n=_name: _switch_montage(n))
     mont_menu.add_separator()
     mont_menu.add_command(label="Choose leads…", command=lambda: _leads_box())
+    # Saline bath check of the chosen IronBCI-32 bundles (a board with no
+    # lead-off detection: model.signal_contact_n of its inputs)
+    saline_ok = model.signal_contact_n >= 8
+    if saline_ok:
+        mont_menu.add_command(label="Saline check…",
+                              command=lambda: _saline_start())
     mont_menu.add_command(label="Save montage (leads + filters)",
                           command=lambda: _save_montage())
     mont_menu.add_command(label="Reset to factory",
@@ -1736,7 +1742,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         word.pack(side="left")
         return word
 
-    if impedance_control is not None:
+    if impedance_control is not None or saline_ok:
         ibox = _chip(ewrap)
         ibox.pack(side="left", padx=(0, 2), pady=1)
         # Average impedance of the visible montage's measured electrodes; a
@@ -1747,7 +1753,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                            fg=C["text_dim"], cursor="hand2",
                            font=(_MONO, _fs(10), "bold"))
         imp_lbl.pack(padx=2, pady=2)
-        imp_lbl.bind("<Button-1>", lambda e: _run_impedance())
+        imp_lbl.bind("<Button-1>", lambda e: _omega(e))
     # "IP": re-open the connection popup after it was minimised or closed.
     if connect_popup:
         ttk.Button(ewrap, text="IP", width=2, style="IP.TButton",
@@ -2207,8 +2213,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 _hint("stop the recording before checking impedance",
                       seconds=6, fg=C["yellow"])
                 return
+        if _sal["check"] is not None:
+            _hint("wait for the saline check to finish", fg=C["yellow"])
+            return
+        # only the electrodes chosen on screen (Choose leads) are tested
+        chosen = [model.site_index[x] for x in model.electrodes
+                  if x not in model.unwired]
+        if not chosen:
+            _hint("no leads chosen: Montage > Choose leads", fg=C["yellow"])
+            return
         try:
-            _imp["future"] = impedance_control["run"]()
+            _imp["future"] = impedance_control["run"](chosen)
         except Exception as e:              # noqa: BLE001 - report, don't crash
             _hint(f"impedance check failed: {e}", seconds=8, fg=C["red"])
             return
@@ -2341,6 +2356,210 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if box and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]:
             _imp["panel_until"] = 0.0
 
+    # ---- Ω menu: impedance check / saline check --------------------------- #
+    def _omega(evt):
+        if not saline_ok:
+            _run_impedance()
+            return
+        menu = tk.Menu(root, tearoff=0, bg=C["surface"], fg=C["text"],
+                       activebackground=C["accent"], font=(_MONO, _fs(10)))
+        if impedance_control is not None:
+            menu.add_command(label="Impedance check",
+                             command=lambda: _run_impedance())
+        menu.add_command(label="Saline check…", command=lambda: _saline_start())
+        menu.tk_popup(evt.widget.winfo_rootx(),
+                      evt.widget.winfo_rooty() + evt.widget.winfo_height())
+
+    # ---- saline check (IronBCI-32 bundles in a saline bath) --------------- #
+    # Runs on the chosen leads (Choose leads) of each IronBCI bundle that has
+    # any, one bundle after another: baseline, a guided lift of each lead
+    # (it spots the lift and the return itself: no taps with wet hands),
+    # white (REF) and black (BIAS), then a final baseline. The guide sits
+    # over the traces; results are saved as JSON beside the recordings.
+    _sal = {"check": None, "c0": 0, "queue": [], "results": [], "total": 0,
+            "panel": False, "hits": {}}
+
+    def _saline_start():
+        if _sal["check"] is not None:
+            return
+        if _imp["future"] is not None:
+            _hint("wait for the impedance check to finish", fg=C["yellow"])
+            return
+        if record_control is not None:
+            try:
+                recording = record_control["status"]().get("recording")
+            except Exception:               # noqa: BLE001 - display only
+                recording = False
+            if recording:
+                _hint("stop the recording before the saline check",
+                      seconds=6, fg=C["yellow"])
+                return
+        queue_ = []
+        for b0 in range(0, model.signal_contact_n - 7, 8):
+            chosen = [j for j in range(8)
+                      if model.electrodes[b0 + j] not in model.unwired]
+            if chosen:
+                queue_.append((b0, chosen))
+        if not queue_:
+            _hint("no IronBCI leads chosen: Montage > Choose leads",
+                  fg=C["yellow"])
+            return
+        _sal.update(queue=queue_, results=[], total=len(queue_), panel=False)
+        _saline_next()
+
+    def _saline_next():
+        from .saline_check import SalineCheck
+        b0, chosen = _sal["queue"].pop(0)
+        _sal["c0"] = b0
+        _sal["check"] = SalineCheck(model.fs, full_scale_uv,
+                                    line=model.mains_line or 60.0,
+                                    bundle_first=b0 + 1, leads=chosen)
+
+    def _saline_feed(arr):
+        chk = _sal["check"]
+        if chk is None:
+            return
+        c0 = _sal["c0"]
+        chk.feed(arr[:, c0:c0 + 8])
+        if chk.phase != "done":
+            return
+        res = chk.result()
+        _sal["results"].append(res)
+        _sal["check"] = None
+        path = _saline_save(res)
+        if path:
+            _hint(f"saline check saved: saline-checks/{path.name}",
+                  seconds=5)
+        if _sal["queue"] and not chk.cancelled:
+            _saline_next()
+        else:
+            _sal["queue"] = []
+            _sal["panel"] = True
+
+    def _saline_save(res):
+        if recordings_dir is None:
+            return None
+        try:
+            folder = Path(recordings_dir) / "saline-checks"
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            path = folder / (f"saline_{stamp}_CH{res['first_channel']}-"
+                             f"{res['first_channel'] + 7}.json")
+            path.write_text(json.dumps(res, indent=1))
+            return path
+        except OSError as e:
+            _hint(f"saline result not saved: {e}", seconds=8, fg=C["red"])
+            return None
+
+    _SAL_MARK = {"ok": ("✓", "green"), "fail": ("✗", "red"),
+                 "skipped": ("–", "text_dim"), None: ("·", "text_dim")}
+
+    def _saline_box(items, W, y, anchor_x):
+        """Draw text items [(text, colour, size, bold, key)] centred at
+        anchor_x from y, in one bordered box; keyed items are tap targets."""
+        ids, _sal["hits"] = [], {}
+        for text, fg, size, bold, key in items:
+            tid = canvas.create_text(
+                anchor_x, y, anchor="n", text=text, fill=fg,
+                justify="center", width=max(200, W - 60),
+                font=(_MONO, _fs(size), "bold" if bold else "normal"),
+                tags="trace")
+            ids.append((tid, key))
+            y = canvas.bbox(tid)[3] + 4
+        boxes = [canvas.bbox(t) for t, _ in ids]
+        x0 = min(b[0] for b in boxes) - 16
+        x1 = max(b[2] for b in boxes) + 16
+        bg = canvas.create_rectangle(x0, boxes[0][1] - 10, x1,
+                                     boxes[-1][3] + 10, fill=C["surface"],
+                                     outline=C["accent"], tags="trace")
+        canvas.tag_lower(bg, ids[0][0])
+        for (tid, key), b in zip(ids, boxes):
+            if key:
+                _sal["hits"][key] = (b[0] - 8, b[1] - 4, b[2] + 8, b[3] + 4)
+                canvas.create_rectangle(*_sal["hits"][key],
+                                        outline=C["border_hi"], tags="trace")
+        _sal["hits"]["box"] = (x0, boxes[0][1] - 10, x1, boxes[-1][3] + 10)
+
+    def _draw_saline(W, H):
+        chk = _sal["check"]
+        if chk is not None:
+            st = chk.status()
+            n_done = _sal["total"] - len(_sal["queue"])
+            head = f"SALINE CHECK · {st['bundle']}"
+            if _sal["total"] > 1:
+                head += f"  ({n_done} of {_sal['total']})"
+            prog = "  ".join(f"{_SAL_MARK[r][0]}{c}"
+                             for c, r in st["progress"])
+            items = [(head, C["text_sec"], 9, True, None),
+                     (st["title"], C["text"], 14, True, None),
+                     (st["detail"], C["text_sec"], 10, False, None),
+                     (prog, C["text_dim"], 9, False, None)]
+            if st["can_skip"]:
+                items.append(("SKIP", C["text"], 10, True, "skip"))
+            items.append(("STOP", C["red"], 10, True, "stop"))
+            _saline_box(items, W, 44, W / 2)
+            return
+        if not _sal["panel"]:
+            _sal["hits"] = {}
+            return
+        items = []
+        for res in _sal["results"]:
+            ok = res["passed"]
+            common = res.get("common_uv_final") or res.get("common_uv_baseline")
+            items.append((f"{res['bundle']}  "
+                          f"{'PASS' if ok else 'CANCELLED' if res['cancelled'] else 'CHECK'}"
+                          + (f"  · shared {common:.1f} µV" if common is not None
+                             else ""),
+                          C["green"] if ok else C["red"], 10, True, None))
+            tested = [e for e in res["leads"]
+                      if e["mapping"] != "not selected"]
+            mapped = sum(e["mapping"] == "ok" for e in tested)
+            items.append((f"{mapped}/{len(tested)} leads mapped  ·  "
+                          f"REF {_SAL_MARK.get(res['ref']['mapping'], ('?',))[0]}"
+                          f"  BIAS {_SAL_MARK.get(res['bias']['mapping'], ('?',))[0]}",
+                          C["text_sec"], 9, False, None))
+            for e in res["leads"]:
+                if e["mapping"] == "not selected":
+                    continue
+                bad = e["mapping"] != "ok" or e.get("grade") not in ("pass", None)
+                if not bad:
+                    continue
+                why = (e["mapping_text"] if e["mapping"] != "ok"
+                       else "; ".join(e.get("notes") or []))
+                items.append((f"CH{e['channel']} {e['colour']}: {why}",
+                              C["red"] if (e["mapping"] != "ok"
+                                           or e.get("grade") == "fail")
+                              else C["yellow"], 9, False, None))
+            for role in ("ref", "bias"):
+                r = res[role]
+                if r["mapping"] != "ok":
+                    items.append((f"{r['colour']} ({role.upper()}): "
+                                  f"{r['mapping_text']}", C["red"], 9, False,
+                                  None))
+            for note in res.get("notes") or []:
+                items.append((note, C["yellow"], 9, False, None))
+        items.append(("CLOSE", C["text"], 10, True, "close"))
+        _saline_box(items, W, 44, W / 2)
+
+    def _saline_tap(evt):
+        """True when the tap was on the saline guide / results (handled)."""
+        for key, (x0, y0, x1, y1) in list(_sal["hits"].items()):
+            if key == "box" or not (x0 <= evt.x <= x1 and y0 <= evt.y <= y1):
+                continue
+            chk = _sal["check"]
+            if key == "skip" and chk is not None:
+                chk.skip()
+            elif key == "stop" and chk is not None:
+                _sal["queue"] = []
+                chk.cancel()
+            elif key == "close":
+                _sal["panel"] = False
+                _sal["hits"] = {}
+            return True
+        box = _sal["hits"].get("box")
+        return bool(box and box[0] <= evt.x <= box[2]
+                    and box[1] <= evt.y <= box[3])
+
     # ---- measure box: press and drag across a trace ----------------------- #
     # Pressing on the chart holds the display (acquisition, the stream and
     # recording carry on); the dragged box reports each overlapped row's
@@ -2366,6 +2585,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         return hit
 
     def _meas_press(evt):
+        if _saline_tap(evt):
+            return
         box = _imp["panel_box"]
         if (_imp["panel_until"] > time.monotonic() and box
                 and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]):
@@ -3186,6 +3407,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             arr = np.array(arr, dtype=np.float64, copy=True)
             arr[:, imp_col0:] = model.raw[-1, imp_col0:]
         model.push(arr)
+        _saline_feed(arr)
         return arr.shape[0]
 
     _CONTACT_FG = {"green": C["green"], "amber": C["yellow"], "red": C["red"]}
@@ -3621,6 +3843,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _draw_measure(W, H)
         if impedance_control is not None and W > 2 and H > 2:
             _draw_impedance(W, H)
+        if saline_ok and W > 2 and H > 2:
+            _draw_saline(W, H)
         pct = int(100 * model.filled / model.win)
         # While the 10 s window fills, show progress; after that, the rate
         # frames actually arrive at (should match the chip's CONFIG1 rate).
@@ -3915,7 +4139,7 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
             "toggle": lambda name=None: request("toggle_record", name)}
     if impedance:
         viewer_kwargs["impedance_control"] = {
-            "run": lambda: request("impedance")}
+            "run": lambda selected=None: request("impedance", selected)}
     if calibrate:
         viewer_kwargs["calibrate_control"] = {
             "set": lambda on: request("calibrate", on)}

@@ -53,6 +53,7 @@ RECORDINGS
 import argparse
 import asyncio
 import collections
+import dataclasses
 import errno
 import datetime
 import logging
@@ -414,6 +415,12 @@ SCOPE_CHANGELOG = [
             "starts as the date and the day's recording number (\"9-30-26 - "
             "01\", then 02 …); type over it for any other name. A name "
             "already used is refused, so two recordings never mix."),
+    ("7.4", "Saline check for the IronBCI-32 (Ω menu or Montage menu): with "
+            "the chosen leads in a saline bath it grades each electrode, then "
+            "walks you through lifting each lead by colour, spotting every "
+            "lift and return by itself, and proves white is REF and black is "
+            "BIAS. Every chosen bundle in turn; results are saved beside the "
+            "recordings. The impedance check now tests only the chosen leads."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -567,6 +574,32 @@ def _off_usb_problem(path: Path) -> str | None:
         return (f"{path} is not on the external USB drive — is the drive "
                 "plugged in and mounted?")
     return None
+
+
+class _PiEEGCheck:
+    """The PiEEG's impedance check limited to the chosen inputs (0-based on
+    that board; None = all), in the form run_impedance_check(check=) takes."""
+
+    def __init__(self, acq, only=None):
+        from .impedance import ImpedanceCheck
+        self._check = ImpedanceCheck(acq, only=only)
+
+    async def run(self):
+        return (await self._check.run()).to_dict()
+
+
+def _untested(result, selected):
+    """Mark the result's leads that weren't chosen (index into its "leads",
+    0-based) "untested": they got no test current, so they have no value
+    and don't count in AVG IMP or the panel."""
+    if selected is None or not isinstance(result, dict):
+        return result
+    leads = []
+    for i, lead in enumerate(result.get("leads") or []):
+        if lead is not None and i not in selected:
+            lead = dict(lead, status="untested", text="", ohms=None)
+        leads.append(lead)
+    return dict(result, leads=leads)
 
 
 def _contact_source(hw):
@@ -1142,16 +1175,42 @@ def main(argv=None):
         imp_acq, imp_first = acq2, acq.num_channels + 1
     can_check = eeg_check or (unsupported_reason(imp_acq) is None)
 
-    async def _impedance():
+    async def _impedance(selected=None):
+        # selected: the viewer's chosen electrodes (0-based across both
+        # boards' inputs); only those are tested. None = every input.
+        sel = None if selected is None else {int(i) for i in selected}
+
+        def board_sel(first, n):
+            return None if sel is None else {
+                i - (first - 1) for i in sel if first - 1 <= i < first - 1 + n}
+
         if not eeg_check:
-            res = await server.run_impedance_check(imp_acq)
-            return dict(res, first_input=imp_first)
+            only = board_sel(imp_first, imp_acq.num_channels)
+            if only is not None and not only:
+                raise RuntimeError("none of the chosen leads are on the "
+                                   "board being checked")
+            res = await server.run_impedance_check(
+                imp_acq, check=_PiEEGCheck(imp_acq, only))
+            return _untested(dict(res, first_input=imp_first), only)
+        eeg_only = board_sel(1, acq.num_channels)
+        plan = eeg_plan
+        if eeg_only is not None:
+            plan = dataclasses.replace(
+                eeg_plan, leads=[t for t in eeg_plan.leads
+                                 if t.input - 1 in eeg_only])
+        pg_only = (board_sel(acq.num_channels + 1, acq2.num_channels)
+                   if acq2 is not None else None)
+        boards = []
+        if plan.leads or plan.ref:
+            boards.append((board_names[0], 1, acq,
+                           ironbci_impedance.IronBCIImpedanceCheck(acq, plan)))
+        if pg_check and (pg_only is None or pg_only):
+            boards.append((board_names[1], acq.num_channels + 1, acq2,
+                           _PiEEGCheck(acq2, pg_only)))
+        if not boards:
+            raise RuntimeError("none of the chosen leads have a test lead")
         parts = []
-        for name, first, board_acq, check in (
-                (board_names[0], 1, acq,
-                 ironbci_impedance.IronBCIImpedanceCheck(acq, eeg_plan)),
-                *(((board_names[1], acq.num_channels + 1, acq2, None),)
-                  if pg_check else ())):
+        for name, first, board_acq, check in boards:
             try:
                 res = await server.run_impedance_check(board_acq, check=check)
             except Exception as e:          # noqa: BLE001 - per board
@@ -1160,12 +1219,12 @@ def main(argv=None):
             parts.append((name, first, res))
         if not any(isinstance(r, dict) for _, _, r in parts):
             raise RuntimeError("; ".join(f"{n}: {r}" for n, _, r in parts))
-        return ironbci_impedance.combine(parts)
+        return _untested(ironbci_impedance.combine(parts), sel)
 
-    def _impedance_unless_cal():
+    def _impedance_unless_cal(selected=None):
         if _cal["on"]:
             raise RuntimeError("turn calibration off first")
-        return asyncio.run_coroutine_threadsafe(_impedance(), loop)
+        return asyncio.run_coroutine_threadsafe(_impedance(selected), loop)
 
 
     async def _shutdown():
