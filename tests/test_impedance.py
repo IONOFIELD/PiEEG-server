@@ -512,6 +512,20 @@ class TestMockEndToEnd:
         assert r.leads[0].ohms is None and r.leads[7].ohms is None
         assert r.leads[3].ohms is not None
 
+    def test_only_the_chosen_leads_get_current(self):
+        # the leads chosen on screen (Choose leads): the rest aren't excited
+        written = []
+
+        def setup(hw):
+            hw.set_leadoff_pattern([1])            # E1 is off anyway
+            real = hw.configure_registers
+            hw.configure_registers = lambda m: (written.append(dict(m)), real(m))
+
+        _, _, r = _run_mock_check(setup, {"only": [0, 2, 3]})
+        passes = [m for m in written if m.get(LOFF) == 0x02]
+        assert passes and all(m[LOFF_SENSP] == 0x0C for m in passes)
+        assert r.leads[2].ohms is not None and r.leads[3].ohms is not None
+
     def test_nothing_connected_switches_nothing(self):
         written = []
 

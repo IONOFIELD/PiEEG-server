@@ -607,8 +607,11 @@ class ImpedanceCheck:
     """
 
     def __init__(self, acq, calibration=None, seconds=2.0, settle_seconds=0.5,
-                 ref_pass=False):
+                 ref_pass=False, only=None):
         self._acq = acq
+        # only: the inputs (0-based) to test, e.g. the leads chosen on screen;
+        # the rest get no test current. None = every input.
+        self._only = None if only is None else {int(i) for i in only}
         self._cal = calibration or load_calibration()
         self._seconds = seconds
         self._settle = settle_seconds
@@ -724,6 +727,8 @@ class ImpedanceCheck:
         finally:
             self._acq.unsubscribe(q)
         mask = excitation_mask(contact, self._acq.num_channels)
+        if self._only is not None:
+            mask &= sum(1 << i for i in self._only)
         if not mask:
             # Nothing connected (or GND out): no lead to excite.
             return analyze(np.zeros((n, self._acq.num_channels)), fs,

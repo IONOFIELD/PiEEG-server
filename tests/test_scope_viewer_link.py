@@ -179,25 +179,25 @@ def test_no_annotate_control_without_a_handler():
 def test_impedance_round_trip():
     calls = []
 
-    def impedance():
-        calls.append(1)
+    def impedance(selected=None):
+        calls.append(selected)
         fut = concurrent.futures.Future()
         fut.set_result({"leads": [], "problem": None})
         return fut
 
     def viewer(q, kwargs, seen):
         seen["has_record"] = "record_control" in kwargs
-        fut = kwargs["impedance_control"]["run"]()
+        fut = kwargs["impedance_control"]["run"]([0, 2])   # chosen leads
         _wait_for(fut.done)
         seen["result"] = fut.result()
 
     seen = _run_link(viewer, impedance=impedance)
-    assert calls == [1] and seen["has_record"] is False
+    assert calls == [[0, 2]] and seen["has_record"] is False
     assert seen["result"] == {"leads": [], "problem": None}
 
 
 def test_impedance_error_is_raised_in_the_viewer():
-    def impedance():
+    def impedance(selected=None):
         fut = concurrent.futures.Future()
         fut.set_exception(RuntimeError("stop the recording first"))
         return fut
