@@ -23,7 +23,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 
 import websockets
 from websockets.datastructures import Headers
@@ -60,6 +60,42 @@ STREAM_BATCH_S = 0.025
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 1616  # PiEEG → 1616
+
+
+# ---- session names ---------------------------------------------------------- #
+# A session's name is its folder in the recordings dir and the base name of
+# every file in it. The default is the date and the day's recording number,
+# "9-30-26 - 01"; the operator can type any other name.
+SESSION_NAME_MAX = 64
+_NAME_BAD = set('/\\:*?"<>|[]')
+
+
+def clean_session_name(text):
+    """A typed session name made safe as a folder / file base name (no path
+    separators, glob or control characters, no leading dots), or None when
+    nothing usable is left."""
+    if text is None:
+        return None
+    name = "".join(" " if c.isspace() else c for c in str(text)
+                   if c not in _NAME_BAD and (c.isprintable() or c.isspace()))
+    name = " ".join(name.split()).lstrip(".").strip()
+    return name[:SESSION_NAME_MAX].rstrip() or None
+
+
+def default_session_name(recordings_dir, day=None):
+    """The next free "M-D-YY - NN" for `day` (default today): one more than
+    the day's highest number already in `recordings_dir`."""
+    day = day or datetime.now()
+    prefix = f"{day.month}-{day.day}-{day:%y} - "
+    top = 0
+    try:
+        for p in Path(recordings_dir).iterdir():
+            tail = p.name[len(prefix):]
+            if p.name.startswith(prefix) and tail.isdigit():
+                top = max(top, int(tail))
+    except OSError:
+        pass
+    return f"{prefix}{top + 1:02d}"
 
 
 class PiEEGServer:
@@ -296,6 +332,7 @@ class PiEEGServer:
                         + list(self._recordings_dir.glob("*/raw/*.eegj")))
             for jrnl in sorted(journals, key=lambda p: p.stem):
                 base = jrnl.stem
+                q = quote(base)
                 folder, raw = self._session_dirs(base)
                 has_bdf = ((raw / f"{base}.bdf").exists()
                            or (folder / f"{base}.bdf").exists())
@@ -308,21 +345,21 @@ class PiEEGServer:
                     "has_sidecar": (raw / f"{base}.json").exists(),
                     # --- legacy keys (unchanged) ---
                     "has_edf": has_edf,
-                    "edf_url": f"/download/edf?session={base}",
-                    "journal_url": f"/download/journal?session={base}",
+                    "edf_url": f"/download/edf?session={q}",
+                    "journal_url": f"/download/journal?session={q}",
                     # EDF+ is the recording's file; BDF+ (lossless) on request
                     "has_bdf": has_bdf,
-                    "bdf_url": f"/download/bdf?session={base}",
+                    "bdf_url": f"/download/bdf?session={q}",
                     "primary_format": "bdf",
                     "formats": {
                         "bdf": {"primary": True, "lossless": True,
                                 "present": has_bdf,
-                                "url": f"/download/bdf?session={base}"},
+                                "url": f"/download/bdf?session={q}"},
                         "edf": {"primary": False, "lossless": False,
                                 "present": has_edf,
-                                "url": f"/download/edf?session={base}"},
+                                "url": f"/download/edf?session={q}"},
                         "journal": {"source_of_truth": True, "present": True,
-                                    "url": f"/download/journal?session={base}"},
+                                    "url": f"/download/journal?session={q}"},
                     },
                 })
         return {"recordings": sessions}
@@ -533,7 +570,10 @@ class PiEEGServer:
                 self.disable_notch()
                 logger.info("Notch filter disabled")
         elif cmd == "start_record":
-            await self._start_recording()
+            try:
+                await self._start_recording(msg.get("name"))
+            except ValueError as e:
+                logger.warning("start_record refused: %s", e)
         elif cmd == "stop_record":
             await self._stop_recording()
         elif cmd == "webhook_list":
@@ -592,12 +632,16 @@ class PiEEGServer:
         elif cmd == "reg_read":
             await self._ws_reg_read(ws)
 
-    async def _start_recording(self):
+    async def _start_recording(self, name=None):
         """Start recording: crash-safe binary journal + a convenience CSV.
 
         The journal (.eegj + .json sidecar) is the authoritative source of
         truth that EDF+ is later built from. The CSV is kept for backward
         compatibility / quick inspection.
+
+        name: the session's name (its folder and file base name). None or
+        blank -> the day's next "M-D-YY - NN". A name already used in the
+        recordings dir raises ValueError rather than mixing two sessions.
         """
         if self._recorder_task and not self._recorder_task.done():
             logger.warning("Recording already in progress")
@@ -619,7 +663,12 @@ class PiEEGServer:
 
         # One timestamp -> one base name shared by the CSV, the journal, its
         # sidecar, and the eventual EDF, so a session's files stay together.
-        session = datetime.now().strftime("pieeg_%Y%m%d_%H%M%S")
+        session = clean_session_name(name)
+        if session is None:
+            session = default_session_name(self._recordings_dir)
+        elif ((self._recordings_dir / session).exists()
+              or (self._recordings_dir / f"{session}.eegj").exists()):
+            raise ValueError(f'a session named "{session}" already exists')
         # Its own folder: <session>/ gets the EDF+ and summary JSON on stop;
         # everything written while recording goes in <session>/raw/.
         raw_dir = self._recordings_dir / session / "raw"
@@ -795,8 +844,8 @@ class PiEEGServer:
         info = {"journal": str(journal_path.resolve()),
                 "folder": str(folder.resolve()),
                 "primary_format": "bdf",
-                "edf_url": f"/download/edf?session={session}",
-                "bdf_url": f"/download/bdf?session={session}"}
+                "edf_url": f"/download/edf?session={quote(session)}",
+                "bdf_url": f"/download/bdf?session={quote(session)}"}
         try:
             bdf_path = await loop.run_in_executor(
                 None, edf_export.export_journal,

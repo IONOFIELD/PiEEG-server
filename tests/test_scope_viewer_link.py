@@ -109,8 +109,8 @@ def test_record_toggle_round_trip():
     started = time.time() - 5
     calls = []
 
-    def toggle():
-        calls.append(1)
+    def toggle(name=None):
+        calls.append(name)
         fut = concurrent.futures.Future()
         fut.set_result({"started": "pieeg_test"})
         return fut
@@ -119,7 +119,7 @@ def test_record_toggle_round_trip():
         rc = kwargs["record_control"]
         st = _wait_for(lambda: rc["status"]()["recording"] and rc["status"]())
         seen["elapsed"] = st["elapsed"]
-        fut = rc["toggle"]()
+        fut = rc["toggle"]("Smith baseline")    # the typed session name
         _wait_for(fut.done)
         seen["result"] = fut.result()
 
@@ -127,13 +127,13 @@ def test_record_toggle_round_trip():
         viewer,
         record_status=lambda: {"recording": True, "started": started},
         toggle=toggle)
-    assert calls == [1]
+    assert calls == ["Smith baseline"]
     assert seen["result"] == {"started": "pieeg_test"}
     assert 4.0 < seen["elapsed"] < 10.0
 
 
 def test_record_error_is_raised_in_the_viewer():
-    def toggle():
+    def toggle(name=None):
         fut = concurrent.futures.Future()
         fut.set_exception(RuntimeError("drive not mounted"))
         return fut
