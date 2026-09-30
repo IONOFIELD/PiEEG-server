@@ -1,7 +1,9 @@
-"""The montages follow the board: Adaptive (the default) is the double
-banana at the board's size, the other presets use every 10-20 site the board
-has, and saved edits stay with their board size."""
+"""The montages follow the board: Referential (the default) is every input
+against REF, the other presets use every 10-20 site the board has, and saved
+edits stay with their board size."""
 import json
+
+import numpy as np
 
 from pieeg_server import acq_viewer as av
 from pieeg_server.scope_console import _electrodes
@@ -17,15 +19,53 @@ def _inputs(m):
     return {m.site_index[s] + 1 for r in m.rows() for s in r["pair"]}
 
 
-def test_adaptive_is_the_default_double_banana_at_board_size(tmp_path):
-    for n, rows in ((8, 8), (16, 16), (32, 18)):
+def test_referential_is_the_default_one_row_per_input(tmp_path):
+    for n in (8, 16, 32):
         m = _model(n, tmp_path / "s.json")
-        assert m.current == av.ADAPTIVE_MONTAGE
-        adaptive = [r["pair"] for r in m.rows()]
-        assert len(adaptive) == rows
-        m.load_montage("Double banana")
-        assert [r["pair"] for r in m.rows()] == adaptive
+        assert m.current == av.REFERENTIAL_MONTAGE
+        assert [r["pair"] for r in m.rows()] == [
+            (x, av.REF_SITE) for x in m.electrodes]         # E-number order
+        assert m.row_label(m.rows()[0]) == f"{m.electrodes[0]}-REF"
+        assert m.epair_name(m.rows()[0]["pair"]) == "E1-REF"
 
+
+def test_referential_rows_are_the_inputs_as_measured(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    x = np.random.default_rng(0).normal(size=(50, 32))
+    m.push(x)
+    k = m.site_index["O1"]
+    assert np.allclose(m.derivation(("O1", av.REF_SITE)), m.filt[:, k])
+    assert m.site_contact(av.REF_SITE) is None          # IronBCI: no REF dot
+    assert set(m.montage_inputs()) == set(range(1, 33))
+
+
+def test_referential_on_two_boards_is_the_eeg_board_then_polygraphy(tmp_path):
+    m = _dual(tmp_path / "s.json")
+    labels = [m.row_label(r) for r in m.rows()]
+    assert len(labels) == 36 and labels[0] == "F7-REF"
+    assert labels[32:] == ["EKG", "EMG 1", "EMG 2", "EMG 3"]
+    assert not any(r["pair"][0].startswith("X") and r["pair"][1] == "REF"
+                   for r in m.rows())
+
+
+def test_choose_leads_trims_the_referential_montage(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    m.set_wired(m.electrodes[8:], False)                # bundle 1 only
+    assert [r["pair"][0] for r in m.visible_rows()] == m.electrodes[:8]
+    assert m.current == av.REFERENTIAL_MONTAGE and not m.dirty()
+
+
+def test_a_custom_lead_can_be_against_ref(tmp_path):
+    m = _model(32, tmp_path / "s.json")
+    m.load_montage("Double banana")
+    row = m.insert_row(0, "Cz", av.REF_SITE)
+    assert m.current == av.CUSTOM_MONTAGE and row["name"] == "Cz-REF"
+    assert m.insert_row(0, av.REF_SITE, "Cz") is None   # REF only below
+    assert m.save_current()
+    again = _model(32, tmp_path / "s.json")
+    again.load_montage(av.CUSTOM_MONTAGE)
+    assert again.rows()[0]["pair"] == ("Cz", av.REF_SITE)
+    assert av.row_side(("C3", av.REF_SITE)) == "left"
 
 def test_presets_use_every_input_of_a_16ch_board(tmp_path):
     m = _model(16, tmp_path / "s.json")
@@ -47,11 +87,13 @@ def test_8ch_board_keeps_the_8_site_presets(tmp_path):
 def test_saved_8ch_rows_do_not_replace_the_16ch_montage(tmp_path):
     path = tmp_path / "s.json"
     m8 = _model(8, path)
+    m8.load_montage("Double banana")
     m8.rows()[0]["on"] = False
     m8.set_montage_filters("1 Hz", "35 Hz", "60 Hz")
     assert m8.save_current()
 
     m16 = _model(16, path)
+    m16.load_montage("Double banana")
     assert len(m16.rows()) == 16 and all(r["on"] for r in m16.rows())
     # filters are shared by montage name
     assert m16.montage_filters() == ("1 Hz", "35 Hz", "60 Hz")
@@ -59,9 +101,11 @@ def test_saved_8ch_rows_do_not_replace_the_16ch_montage(tmp_path):
     m16.rows()[3]["on"] = False
     assert m16.save_current()
     data = json.loads(path.read_text())["montages"]
-    assert set(data) == {"Adaptive", "16ch/Adaptive"}
-    assert len(_model(8, path).rows()) == 8
-    assert not _model(16, path).rows()[3]["on"]
+    assert set(data) == {"Double banana", "16ch/Double banana"}
+    m8, m16 = _model(8, path), _model(16, path)
+    m8.load_montage("Double banana")
+    m16.load_montage("Double banana")
+    assert len(m8.rows()) == 8 and not m16.rows()[3]["on"]
 
 
 def test_ironbci32_sites_follow_its_electrode_map():
@@ -105,6 +149,7 @@ def test_sides_of_the_head():
 
 def test_show_only_one_side_on_the_ironbci(tmp_path):
     m = _model(32, tmp_path / "s.json")
+    m.load_montage("Double banana")
     m.show_only("left")
     shown = [r["pair"] for r in m.rows() if r["on"]]
     assert len(shown) == 8 and all(av.row_side(p) == "left" for p in shown)
@@ -118,6 +163,7 @@ def test_show_only_one_side_on_the_ironbci(tmp_path):
 
 def test_unwired_electrodes_leave_every_montage(tmp_path):
     m = _model(32, tmp_path / "s.json")
+    m.load_montage("Double banana")
     wired = {"Fp1", "F3", "C3", "P3", "O1", "Fz", "Cz", "Pz"}
     m.set_wired(m.electrodes, False)
     m.set_wired(wired, True)
@@ -154,6 +200,7 @@ def _dual(path):
 
 def test_two_boards_eeg_on_top_then_ekg_then_emg(tmp_path):
     m = _dual(tmp_path / "s.json")
+    m.load_montage("Double banana")
     labels = [m.row_label(r) for r in m.rows()]
     assert labels[:18] == [f"{a}-{b}" for a, b in
                            av.MONTAGE_PRESETS_32["Double banana"]]
@@ -173,6 +220,7 @@ def test_two_boards_eeg_on_top_then_ekg_then_emg(tmp_path):
 
 def test_unwiring_a_pieeg_input_hides_its_row_only(tmp_path):
     m = _dual(tmp_path / "s.json")
+    m.load_montage("Double banana")
     m.set_wired(["X5"], False)
     labels = [m.row_label(r) for r in m.visible_rows()]
     assert "EMG 2" not in labels and "EKG" in labels and len(labels) == 21
@@ -182,7 +230,7 @@ def test_no_reduced_montage_is_offered(tmp_path):
     # "Adaptive (reduced)" was removed (v7.6): Adaptive is the one default
     for m in (_dual(tmp_path / "s.json"),
               *(_model(n, tmp_path / f"{n}.json") for n in (8, 16, 32))):
-        assert m.montage_names()[0] == av.ADAPTIVE_MONTAGE
+        assert m.montage_names()[0] == av.REFERENTIAL_MONTAGE
         assert not any("reduced" in n for n in m.montage_names())
     assert not hasattr(av, "ADAPTIVE_REDUCED")
 

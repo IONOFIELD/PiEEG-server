@@ -25,7 +25,7 @@ MONTAGES (bipolar, sized to the board: 8 inputs, or 16 on a PiEEG-16)
     PiEEG-16 adds ch9..ch16 = F3 F4 P3 P4 F7 F8 T5 T6 (classic 10-20 names).
     Each montage row is a DIFFERENCE between two sites (e.g. Fp1-C3), which is
     what "bipolar" means. Four presets ship in code and are READ-ONLY:
-    Adaptive (the default: the double banana at the board's size), Double
+    Referential (the default: every input against REF, one row each), Double
     banana, Transverse, Circumferential, each drawn from every site the board
     has (MONTAGE_PRESETS / _16 / _32). Right-click a lead to edit
     YOUR copy of the current montage (rename / hide / reorder; Custom rows can
@@ -142,10 +142,11 @@ MONTAGE_PRESETS_32: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-# The double banana sized to the board that was found: the 8-site one on a
-# PiEEG-8, the 16-site one on a PiEEG-16, the 32-site one on an IronBCI-32.
-# The default montage.
-ADAPTIVE_MONTAGE = "Adaptive"
+# The default montage: every input on its own against the board's REF, one
+# row per electrode in E-number order (E1 F7-REF, E2-REF, …), which is how
+# the board measures it. REF_SITE stands for the reference in a row's pair.
+REFERENTIAL_MONTAGE = "Referential"
+REF_SITE = "REF"
 
 
 def presets_for(electrodes):
@@ -166,7 +167,7 @@ _ROWS_PREFIX = {id(MONTAGE_PRESETS): "", id(MONTAGE_PRESETS_16): "16ch/",
                 id(MONTAGE_PRESETS_32): "32ch/"}
 
 
-DEFAULT_MONTAGE = ADAPTIVE_MONTAGE
+DEFAULT_MONTAGE = REFERENTIAL_MONTAGE
 CUSTOM_MONTAGE = "Custom"
 # Where saved montage edits live between sessions (plain JSON, user-writable,
 # no network). One file for the whole scope; montages saved unedited are
@@ -175,7 +176,7 @@ STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
 # "Custom" montage you fill channel by channel (right-click → Add). Selecting a
 # preset always snaps straight back to it.
-MONTAGE_NAMES = ([ADAPTIVE_MONTAGE] + list(MONTAGE_PRESETS)
+MONTAGE_NAMES = ([REFERENTIAL_MONTAGE] + list(MONTAGE_PRESETS)
                  + [CUSTOM_MONTAGE])
 
 # ── filter menu choices (label, value). None = filter stage off ──────────────
@@ -726,13 +727,22 @@ class ViewerModel:
         """The montages this board offers."""
         return list(MONTAGE_NAMES)
 
+    def valid_site(self, site, lower=False):
+        """An input of this board, or (as a lead's lower end) REF."""
+        return site in self.site_index or (lower and site == REF_SITE)
+
     def _fresh_rows(self, name):
         rows = []
-        eeg = self.presets["Double banana" if name == ADAPTIVE_MONTAGE
-                           else name]
+        if name == REFERENTIAL_MONTAGE:
+            # the EEG board's inputs (not a second board's polygraphy ones,
+            # which come as their own rows below)
+            eeg_sites = self.boards[0][1] if self.boards else self.electrodes
+            eeg = [(x, REF_SITE) for x in eeg_sites]
+        else:
+            eeg = self.presets[name]
         for a, b in eeg:
             # Only keep rows whose two sites are actually available inputs.
-            if a in self.site_index and b in self.site_index:
+            if self.valid_site(a) and self.valid_site(b, lower=True):
                 rows.append({"pair": (a, b), "name": f"{a}-{b}", "on": True})
         for a, b, label in self.extra_rows:
             if a in self.site_index and b in self.site_index:
@@ -761,7 +771,7 @@ class ViewerModel:
                 a, b = item["pair"]
             except (TypeError, KeyError, ValueError):
                 continue
-            if a not in self.site_index or b not in self.site_index:
+            if not (self.valid_site(a) and self.valid_site(b, lower=True)):
                 continue
             row = {"pair": (a, b), "name": f"{a}-{b}",
                    "on": bool(item.get("on", True))}
@@ -813,6 +823,15 @@ class ViewerModel:
             # starts empty (filled from the channel box) and the presets
             # seed from their read-only definition.
             saved = self._saved_rows(name)
+            if (saved is None and name == CUSTOM_MONTAGE
+                    and self.current in self.sessions):
+                # Nothing saved in Custom yet: start it as a copy of the
+                # montage on screen, so there is something to edit
+                self.sessions[name] = [dict(r) for r in self.rows()]
+                self.session_filters[name] = self.session_filters[
+                    self.current]
+                self.current = name
+                return
             self.sessions[name] = (saved if saved is not None
                                    else self._factory_rows(name))
             filters = self._saved_filters(name)
@@ -860,11 +879,14 @@ class ViewerModel:
 
     # ---- chip-input (E-number) labelling ---------------------------------- #
     def elabel(self, site):
-        """Chip input label ('E1', 'E2', …) for a scalp site.
+        """Chip input label ('E1', 'E2', …) for a scalp site ("REF" for the
+        reference).
 
         The E-number is just the site's position in the input list + 1, so it
         always tracks DEFAULT_ELECTRODES / whatever electrode map was passed in.
         """
+        if site == REF_SITE:
+            return REF_SITE
         return self.input_labels.get(site) or f"E{self.site_index[site] + 1}"
 
     def input_text(self, site):
@@ -874,7 +896,10 @@ class ViewerModel:
         return e if site == e or site in self.input_labels else f"{e} {site}"
 
     def site_contact(self, site):
-        """Contact verdict (green/amber/red/None) for a scalp site's electrode."""
+        """Contact verdict (green/amber/red/None) for a scalp site's electrode
+        (REF: the lead-off REF verdict where the board has one)."""
+        if site == REF_SITE:
+            return None if self.signal_contact_n else self.contact.ref()
         i = self.site_index[site]
         if i < self.signal_contact_n:
             return self.signal_contact.electrode(i)
@@ -920,7 +945,7 @@ class ViewerModel:
         """
         if upper == lower:
             return False
-        if upper not in self.site_index or lower not in self.site_index:
+        if not (self.valid_site(upper) and self.valid_site(lower, True)):
             return False
         self.load_montage(CUSTOM_MONTAGE)          # ensure it exists + select it
         rows = self.sessions[CUSTOM_MONTAGE]
@@ -958,8 +983,8 @@ class ViewerModel:
         """Re-pair and (re)name a lead of the current montage: on a preset
         the edit goes to Custom (see _editable). Returns the edited row (in
         Custom when it forked), or None for a self-pair or unknown site."""
-        if (upper == lower or upper not in self.site_index
-                or lower not in self.site_index):
+        if (upper == lower or not self.valid_site(upper)
+                or not self.valid_site(lower, lower=True)):
             return None
         row = self._editable(row)
         row["pair"] = (upper, lower)
@@ -971,8 +996,8 @@ class ViewerModel:
         """Add an (upper - lower) channel to the CURRENT montage at `index`
         (clamped; None = the end). Returns the new row, or None for a
         self-pair or unknown site."""
-        if (upper == lower or upper not in self.site_index
-                or lower not in self.site_index):
+        if (upper == lower or not self.valid_site(upper)
+                or not self.valid_site(lower, lower=True)):
             return None
         self._editable()
         rows = self.rows()
@@ -1128,9 +1153,12 @@ class ViewerModel:
                        for site in r["pair"] if site in self.site_index})
 
     def derivation(self, pair, filt=None):
-        """Filtered (upper - lower) trace across the window, in microvolts."""
+        """Filtered (upper - lower) trace across the window, in microvolts
+        (lower REF: the input as measured, against the board's REF)."""
         a, b = pair
         f = self.filt if filt is None else filt
+        if b == REF_SITE:
+            return f[:, self.site_index[a]].copy()
         return f[:, self.site_index[a]] - f[:, self.site_index[b]]
 
     def measure(self, pair, frac0, frac1):
@@ -1269,6 +1297,8 @@ def row_side(pair):
     """The side a lead lies on: both electrodes' side, else None (a lead
     crossing the midline, like Fp1-Fp2)."""
     a, b = (site_side(x) for x in pair)
+    if pair[1] == REF_SITE:
+        return a
     return a if a == b else None
 
 
@@ -1690,6 +1720,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # so you select by the physical electrode you seated on the head.
     elec_choices = [(model.input_text(s).replace(" ", "  "), s)
                     for s in model.electrodes]
+    elec_choices.append((REF_SITE, REF_SITE))  # a lead against the reference
     elec_display = [d for d, _ in elec_choices]
     _disp_to_site = dict(elec_choices)
     _site_to_disp = {site: d for d, site in elec_choices}
@@ -2636,6 +2667,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _meas_press(evt):
         if _saline_tap(evt):
             return
+        if not model.visible_rows() and not _rev["on"]:
+            _channel_box(evt)               # empty chart: add a channel
+            return
         box = _imp["panel_box"]
         if (_imp["panel_until"] > time.monotonic() and box
                 and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]):
@@ -3556,14 +3590,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         win = vfilt.shape[0]
         starts = (np.arange(ncol) * win) // ncol
         ia = [model.site_index[a] for a, _ in (x["pair"] for x in rows)]
-        ib = [model.site_index[b] for _, b in (x["pair"] for x in rows)]
+        # a referential lead's lower end is REF: nothing subtracted
+        ib = [model.site_index.get(b, 0) for _, b in (x["pair"] for x in rows)]
+        ib_on = np.array([b != REF_SITE for _, b in (x["pair"] for x in rows)],
+                         dtype=np.float64)
         bases = (np.arange(len(rows)) * row_h + row_h / 2.0)[:, None]
         colours = [row_colour(model.row_label(x)) for x in rows]
         for c0, c1 in spans:
             p0 = starts[c0]
             p1 = starts[c1 + 1] if c1 + 1 < ncol else win
             f = vfilt[(np.arange(p0, p1) - head) % win]
-            first, second = column_envelope(f[:, ia] - f[:, ib],
+            first, second = column_envelope(f[:, ia] - f[:, ib] * ib_on,
                                             starts[c0:c1 + 1] - p0)
             r.draw(c0, c1, ncol,
                    trace_y(first, bases, sens, _px_mm["y"], half),
@@ -3832,8 +3869,16 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         n = len(rows)
         if not (W > 2 and H > 2 and n > 0):
             _sweep_reset()
-            canvas.delete("deco", "dots")
+            canvas.delete("deco", "dots", "sweep")
+            _sw["raster"] = None            # rebuilt when there are rows
             _deco["sig"], _deco["dot_sig"], _deco["dots"] = None, None, []
+            if W > 2 and H > 2:
+                canvas.create_text(
+                    W / 2, H / 2, anchor="center", justify="center",
+                    text=("no leads to show\npick a montage, or tap here "
+                          "to add a channel" if model.rows() else
+                          "this montage is empty\ntap here to add a channel"),
+                    fill=C["text_sec"], font=(_MONO, _fs(10)), tags="trace")
         if W > 2 and H > 2 and n > 0:
             _apply_timebase(W)
             if _rev["on"] and (model.frozen is None
