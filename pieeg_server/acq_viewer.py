@@ -25,8 +25,7 @@ MONTAGES (bipolar, sized to the board: 8 inputs, or 16 on a PiEEG-16)
     PiEEG-16 adds ch9..ch16 = F3 F4 P3 P4 F7 F8 T5 T6 (classic 10-20 names).
     Each montage row is a DIFFERENCE between two sites (e.g. Fp1-C3), which is
     what "bipolar" means. Four presets ship in code and are READ-ONLY:
-    Adaptive (the default: the double banana at the board's size; Adaptive
-    (reduced) cuts a 32-channel board's EEG to 16 leads), Double
+    Adaptive (the default: the double banana at the board's size), Double
     banana, Transverse, Circumferential, each drawn from every site the board
     has (MONTAGE_PRESETS / _16 / _32). Right-click a lead to edit
     YOUR copy of the current montage (rename / hide / reorder; Custom rows can
@@ -147,9 +146,6 @@ MONTAGE_PRESETS_32: dict[str, list[tuple[str, str]]] = {
 # PiEEG-8, the 16-site one on a PiEEG-16, the 32-site one on an IronBCI-32.
 # The default montage.
 ADAPTIVE_MONTAGE = "Adaptive"
-# The same with the EEG cut to 16 leads on a 32-channel board: the 16-site
-# double banana (no midline chain). Offered only when the board has more.
-ADAPTIVE_REDUCED = "Adaptive (reduced)"
 
 
 def presets_for(electrodes):
@@ -179,7 +175,7 @@ STORE_PATH = Path.home() / ".config" / "pieeg" / "scope_montages.json"
 # Names offered in the Montage picker: the three read-only presets, plus a
 # "Custom" montage you fill channel by channel (right-click → Add). Selecting a
 # preset always snaps straight back to it.
-MONTAGE_NAMES = ([ADAPTIVE_MONTAGE, ADAPTIVE_REDUCED] + list(MONTAGE_PRESETS)
+MONTAGE_NAMES = ([ADAPTIVE_MONTAGE] + list(MONTAGE_PRESETS)
                  + [CUSTOM_MONTAGE])
 
 # ── filter menu choices (label, value). None = filter stage off ──────────────
@@ -720,23 +716,20 @@ class ViewerModel:
             self.unwired = set(store.leads.get(self.leads_key, [])) & set(
                 self.electrodes)
         self.current = DEFAULT_MONTAGE
+        # the preset the last edit copied into Custom (the viewer says so
+        # once, then clears it)
+        self.forked_from = None
         self.load_montage(DEFAULT_MONTAGE)
 
     # ---- montage handling ------------------------------------------------- #
     def montage_names(self):
-        """The montages this board offers (Adaptive (reduced) only where it
-        cuts something: on a 32-channel board)."""
-        return [n for n in MONTAGE_NAMES if n != ADAPTIVE_REDUCED
-                or self.presets is MONTAGE_PRESETS_32]
+        """The montages this board offers."""
+        return list(MONTAGE_NAMES)
 
     def _fresh_rows(self, name):
         rows = []
-        if name == ADAPTIVE_REDUCED:
-            eeg = (MONTAGE_PRESETS_16 if self.presets is MONTAGE_PRESETS_32
-                   else self.presets)["Double banana"]
-        else:
-            eeg = self.presets["Double banana" if name == ADAPTIVE_MONTAGE
-                               else name]
+        eeg = self.presets["Double banana" if name == ADAPTIVE_MONTAGE
+                           else name]
         for a, b in eeg:
             # Only keep rows whose two sites are actually available inputs.
             if a in self.site_index and b in self.site_index:
@@ -937,15 +930,42 @@ class ViewerModel:
                      "on": True})
         return True
 
+    def _editable(self, row=None):
+        """Before any lead edit: the presets never change, so editing one
+        copies its leads (every row, in its order) and its filters into
+        Custom, which becomes current; the edit then lands on Custom. That
+        replaces Custom's unsaved state (Save keeps it, as always). `row`,
+        a row of the preset, comes back as its copy in Custom. Choosing
+        leads (set_wired) isn't an edit: presets just show fewer of theirs.
+        """
+        if self.current == CUSTOM_MONTAGE:
+            return row
+        src, rows = self.current, self.rows()
+        idx = next((k for k, r in enumerate(rows) if r is row), None)
+        copy = [dict(r) for r in rows]
+        self.sessions[CUSTOM_MONTAGE] = copy
+        self.session_filters[CUSTOM_MONTAGE] = self.session_filters[src]
+        self.current = CUSTOM_MONTAGE
+        self.forked_from = src
+        return copy[idx] if idx is not None else row
+
     def set_row_pair(self, row, upper, lower):
         """Point a row at a different electrode pair (upper - lower).
         Returns False, changing nothing, for a self-pair or unknown site."""
+        return self.edit_row(row, upper, lower, row.get("label")) is not None
+
+    def edit_row(self, row, upper, lower, label=None):
+        """Re-pair and (re)name a lead of the current montage: on a preset
+        the edit goes to Custom (see _editable). Returns the edited row (in
+        Custom when it forked), or None for a self-pair or unknown site."""
         if (upper == lower or upper not in self.site_index
                 or lower not in self.site_index):
-            return False
+            return None
+        row = self._editable(row)
         row["pair"] = (upper, lower)
         row["name"] = f"{upper}-{lower}"
-        return True
+        self.set_row_label(row, label)
+        return row
 
     def insert_row(self, index, upper, lower, label=None):
         """Add an (upper - lower) channel to the CURRENT montage at `index`
@@ -954,6 +974,7 @@ class ViewerModel:
         if (upper == lower or upper not in self.site_index
                 or lower not in self.site_index):
             return None
+        self._editable()
         rows = self.rows()
         row = {"pair": (upper, lower), "name": f"{upper}-{lower}", "on": True}
         self.set_row_label(row, label)
@@ -965,14 +986,16 @@ class ViewerModel:
         return self.sessions[self.current]
 
     def toggle_row(self, i):
-        r = self.rows()
-        if 0 <= i < len(r):
+        if 0 <= i < len(self.rows()):
+            self._editable()
+            r = self.rows()
             r[i]["on"] = not r[i]["on"]
 
     def show_only(self, side):
         """Show the current montage's leads on one side of the head and hide
         the rest: "all", "none", or "left" / "mid" / "right" (a lead is on a
         side when both of its electrodes are; see site_side)."""
+        self._editable()
         for r in self.rows():
             if side in ("all", "none"):
                 r["on"] = side == "all"
@@ -980,14 +1003,16 @@ class ViewerModel:
                 r["on"] = row_side(r["pair"]) == side
 
     def move_row(self, src, dst):
-        r = self.rows()
-        if 0 <= src < len(r) and 0 <= dst < len(r) and src != dst:
+        n = len(self.rows())
+        if 0 <= src < n and 0 <= dst < n and src != dst:
+            self._editable()
+            r = self.rows()
             r.insert(dst, r.pop(src))
 
     def remove_row(self, i):
-        r = self.rows()
-        if 0 <= i < len(r):
-            r.pop(i)
+        if 0 <= i < len(self.rows()):
+            self._editable()
+            self.rows().pop(i)
 
     # ---- data handling ---------------------------------------------------- #
     def set_filters(self, lff, hff, notch=None):
@@ -1646,10 +1671,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Montage: the list, then Save / Reset. The face grows a "*"
     # ("Transverse*") while the montage has edits Save hasn't kept.
     montage_var = tk.StringVar(value=DEFAULT_MONTAGE)
-    # wide enough for "Adaptive (reduced)*" where it is offered (32-channel
-    # boards, whose bar has no calibration / impedance buttons)
-    mont_mb, mont_menu = _dropdown(
-        bar, 19 if ADAPTIVE_REDUCED in model.montage_names() else 13)
+    mont_mb, mont_menu = _dropdown(bar, 13)
     mont_mb.configure(textvariable=montage_var)
     for _name in model.montage_names():
         mont_menu.add_command(label=_name,
@@ -1659,9 +1681,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # Saline bath check of the chosen IronBCI-32 bundles (a board with no
     # lead-off detection: model.signal_contact_n of its inputs)
     saline_ok = model.signal_contact_n >= 8
-    if saline_ok:
-        mont_menu.add_command(label="Saline check…",
-                              command=lambda: _saline_start())
     mont_menu.add_command(label="Save montage (leads + filters)",
                           command=lambda: _save_montage())
     mont_menu.add_command(label="Reset to factory",
@@ -2053,7 +2072,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         montage_var.set(model.current + ("*" if model.dirty() else ""))
 
     def _edited():
-        """After any montage edit: update the dirty star on the picker."""
+        """After any montage edit: update the dirty star on the picker (and
+        say so when the edit moved a preset's leads into Custom)."""
+        if model.forked_from:
+            _hint(f"{model.forked_from} copied to Custom · Save to keep it")
+            model.forked_from = None
         _refresh_montage_label()
 
     # Short feedback ("added E1-E3", "saved …") as a toast drawn at the top
@@ -2381,7 +2404,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if box and box[0] <= evt.x <= box[2] and box[1] <= evt.y <= box[3]:
             _imp["panel_until"] = 0.0
 
-    # ---- Ω menu: impedance check / saline check --------------------------- #
+    # ---- Ω menu: impedance check / saline check (the saline check's only
+    # way in) ---------------------------------------------------------------- #
     def _omega(evt):
         if not saline_ok:
             _run_impedance()
@@ -2812,8 +2836,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 name = name_var.get().strip()
                 if not r.get("label") and name == r["name"]:
                     name = ""
-                model.set_row_pair(r, *p)
-                model.set_row_label(r, name)
+                model.edit_row(r, *p, name)
             _edited()
             _close_popup()
 
@@ -4269,7 +4292,9 @@ def _selftest():
         s = ViewerModel(8, 250, DEFAULT_ELECTRODES, store=MontageStore(spath))
         assert s.dirty() is False                     # factory = clean
         s.load_montage("Transverse")
-        s.toggle_row(0)                               # prune a channel
+        s.toggle_row(0)                               # prune a channel ...
+        assert s.current == CUSTOM_MONTAGE            # ... lands in Custom
+        assert s.sessions["Transverse"][0]["on"] is True   # preset untouched
         rows_after_edit = [dict(r) for r in s.rows()]
         assert s.dirty() is True                      # edited -> "*"
         assert s.save_current() is True               # Save
@@ -4277,19 +4302,21 @@ def _selftest():
         s.set_row_label(s.rows()[1], "midline")       # rename counts as edit
         assert s.dirty() is True
         assert s.save_current() is True
-        # fresh model = "reboot": the saved copy loads instead of the preset
+        # fresh model = "reboot": Custom loads as saved, presets as factory
         s2 = ViewerModel(8, 250, DEFAULT_ELECTRODES, store=MontageStore(spath))
         s2.load_montage("Transverse")
+        assert s2.rows()[0]["on"] is True and not s2.dirty()
+        s2.load_montage(CUSTOM_MONTAGE)
         assert s2.dirty() is False
         assert s2.rows()[0]["on"] is False, "saved prune did not survive"
         assert s2.row_label(s2.rows()[1]) == "midline"
-        # Reset -> factory rows, dirty vs the saved copy; Save then drops the
-        # entry (factory needs no store) and everything is clean again
+        # Reset -> Custom empties, dirty vs the saved copy; Save then drops
+        # the entry and everything is clean again
         s2.reset_current_to_preset()
-        assert s2.rows()[0]["on"] is True
+        assert s2.rows() == []
         assert s2.dirty() is True
         assert s2.save_current() is True
-        assert "Transverse" not in s2.store.data
+        assert s2.rows_prefix + CUSTOM_MONTAGE not in s2.store.data
         assert s2.dirty() is False
         # presets in code were never touched
         assert all(len(p) == 2 for p in MONTAGE_PRESETS["Transverse"])

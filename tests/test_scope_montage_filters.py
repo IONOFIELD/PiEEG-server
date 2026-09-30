@@ -79,24 +79,61 @@ def test_rows_and_filters_saved_together(tmp_path):
     assert m2.montage_filters() == ("1 Hz", "70 Hz", "Off")
 
 
-def test_set_row_pair_and_insert_row_edit_the_current_montage(tmp_path):
+def test_editing_a_preset_moves_its_leads_into_custom(tmp_path):
     m = _model(tmp_path / "s.json")
-    name = m.current
-    rows = m.rows()
-    n = len(rows)
+    preset = m.current
+    factory = [dict(r) for r in m.rows()]
+    n = len(factory)
     a, b, c = m.electrodes[0], m.electrodes[1], m.electrodes[6]
-    assert not m.set_row_pair(rows[0], a, a)            # self-pair refused
-    assert m.set_row_pair(rows[0], a, c)
-    assert rows[0]["pair"] == (a, c) and rows[0]["name"] == f"{a}-{c}"
+    assert not m.set_row_pair(m.rows()[0], a, a)        # self-pair refused
+    assert m.current == preset                          # nothing happened
+    row = m.edit_row(m.rows()[0], a, c, "Fp1 test")
+    assert m.current == av.CUSTOM_MONTAGE and m.forked_from == preset
+    assert m.rows()[0] is row and row["pair"] == (a, c)
+    assert row["label"] == "Fp1 test"
+    assert m.sessions[preset] == factory                # the preset is untouched
+    assert len(m.rows()) == n                           # all its leads, in order
     new = m.insert_row(1, b, c, label="EMG 1")
-    assert m.current == name                            # stays on this montage
-    assert m.rows()[1] is new and new["label"] == "EMG 1"
-    assert len(m.rows()) == n + 1
+    assert m.current == av.CUSTOM_MONTAGE and m.rows()[1] is new
     assert m.insert_row(None, a, "nope") is None
     assert m.insert_row(99, b, a)["pair"] == (b, a)     # clamped to the end
-    assert m.rows()[-1]["pair"] == (b, a)
     assert m.dirty()
     m.save_current()
     m2 = _model(tmp_path / "s.json")
+    assert m2.current == av.DEFAULT_MONTAGE             # presets stay factory
+    m2.load_montage(av.CUSTOM_MONTAGE)
     assert [r["pair"] for r in m2.rows()] == [r["pair"] for r in m.rows()]
     assert m2.rows()[1]["label"] == "EMG 1"
+
+
+def test_each_kind_of_edit_moves_to_custom(tmp_path):
+    for edit in (lambda m: m.toggle_row(0), lambda m: m.move_row(0, 2),
+                 lambda m: m.remove_row(1),
+                 lambda m: m.insert_row(0, m.electrodes[0], m.electrodes[3])):
+        m = _model(tmp_path / "s.json")
+        m.load_montage("Transverse")
+        before = [dict(r) for r in m.rows()]
+        edit(m)
+        assert m.current == av.CUSTOM_MONTAGE
+        assert m.sessions["Transverse"] == before
+
+
+def test_edits_on_custom_stay_on_custom(tmp_path):
+    m = _model(tmp_path / "s.json")
+    m.toggle_row(0)
+    m.forked_from = None
+    m.move_row(0, 1)
+    assert m.current == av.CUSTOM_MONTAGE and m.forked_from is None
+
+
+def test_custom_takes_the_presets_filters(tmp_path):
+    m = _model(tmp_path / "s.json")
+    m.set_montage_filters("0.3 Hz", av.DEFAULT_HFF, "Off")
+    m.toggle_row(0)
+    assert m.montage_filters() == ("0.3 Hz", av.DEFAULT_HFF, "Off")
+
+
+def test_choosing_leads_is_not_an_edit(tmp_path):
+    m = _model(tmp_path / "s.json")
+    m.set_wired(m.electrodes[:2], False)
+    assert m.current == av.DEFAULT_MONTAGE and not m.dirty()

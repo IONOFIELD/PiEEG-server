@@ -423,6 +423,12 @@ SCOPE_CHANGELOG = [
             "recordings. The impedance check now tests only the chosen leads."),
     ("7.5", "Choose leads is remembered: the next launch starts with the same "
             "electrodes on and off (kept separately for each board setup)."),
+    ("7.6", "Editing a montage's leads (move, hide, rename, re-pair, add, "
+            "remove) now copies it into Custom and makes the edit there, so "
+            "the built-in montages always stay as shipped; Save keeps Custom. "
+            "Choose leads still just shows fewer of each montage's leads, in "
+            "the same order. The saline check is only on the Ω button now, "
+            "and the Montage list no longer has Adaptive (reduced)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
