@@ -421,6 +421,8 @@ SCOPE_CHANGELOG = [
             "lift and return by itself, and proves white is REF and black is "
             "BIAS. Every chosen bundle in turn; results are saved beside the "
             "recordings. The impedance check now tests only the chosen leads."),
+    ("7.5", "Choose leads is remembered: the next launch starts with the same "
+            "electrodes on and off (kept separately for each board setup)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 

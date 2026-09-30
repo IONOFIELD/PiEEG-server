@@ -53,7 +53,8 @@ def test_reset_restores_default_filters_and_saving_it_drops_the_entry(tmp_path):
     assert m.montage_filters() == m.default_filters()
     assert m.dirty()
     m.save_current()
-    assert json.loads(path.read_text()) == {"montages": {}, "filters": {}}
+    assert json.loads(path.read_text()) == {"montages": {}, "filters": {},
+                                            "leads": {}}
 
 
 def test_old_store_without_filters_and_stale_labels_load(tmp_path):

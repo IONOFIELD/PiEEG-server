@@ -449,7 +449,8 @@ class MontageStore:
 
     Maps montage name -> serialized rows, and (separately, so rows saved by
     older versions still load) montage name -> its display filters as menu
-    labels {"lff", "hff", "notch"}. A corrupt/missing file just means
+    labels {"lff", "hff", "notch"}, and board layout -> the electrodes
+    switched off in Choose leads ("leads"). A corrupt/missing file just means
     "nothing saved" (the scope must never fail to launch over its montage
     file). Writes go through a temp file + os.replace so a power cut on the
     Pi can't leave a half-written store.
@@ -459,6 +460,7 @@ class MontageStore:
         self.path = Path(path)
         self.data: dict[str, list] = {}
         self.filters: dict[str, dict] = {}
+        self.leads: dict[str, list] = {}
         try:
             raw = json.loads(self.path.read_text())
             raw = raw if isinstance(raw, dict) else {}
@@ -468,6 +470,9 @@ class MontageStore:
             filters = raw.get("filters", {})
             self.filters = {k: v for k, v in filters.items()
                             if isinstance(k, str) and isinstance(v, dict)}
+            leads = raw.get("leads", {})
+            self.leads = {k: v for k, v in leads.items()
+                          if isinstance(k, str) and isinstance(v, list)}
         except (OSError, ValueError, AttributeError):
             pass
 
@@ -480,11 +485,21 @@ class MontageStore:
                 table.pop(key, None)
             else:
                 table[key] = value
+        return self._write()
+
+    def put_unwired(self, layout, sites):
+        """Save the electrodes switched off (Choose leads) for a board
+        layout."""
+        self.leads[layout] = list(sites)
+        return self._write()
+
+    def _write(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".json.tmp")
             tmp.write_text(json.dumps({"montages": self.data,
-                                       "filters": self.filters}, indent=2))
+                                       "filters": self.filters,
+                                       "leads": self.leads}, indent=2))
             os.replace(tmp, self.path)
             return True
         except OSError:
@@ -663,10 +678,10 @@ class ViewerModel:
         self.input_labels = dict(input_labels or {})
         self.boards = [(n, list(k)) for n, k in (boards or [])]
         self.extra_rows = [tuple(r) for r in (extra_rows or [])]
-        # Electrodes switched off for this session (Choose leads >
-        # Electrodes): the ones not wired for this study. Every lead that
-        # uses one is off the screen in every montage. Not saved: each
-        # launch starts with the whole board.
+        # Electrodes switched off (Choose leads): the ones not wired for
+        # this study. Every lead that uses one is off the screen in every
+        # montage, and the checks (impedance, saline) skip it. Saved per
+        # board layout (set in __init__ below, once the layout is known).
         self.unwired: set[str] = set()
         self.win = int(round(WINDOW_SECONDS * fs))
         self.raw = np.zeros((self.win, num_channels), dtype=np.float64)
@@ -699,6 +714,11 @@ class ViewerModel:
         # rows would all still be valid sites). Filters are shared by name.
         self.rows_prefix = _ROWS_PREFIX[id(self.presets)] + (
             "+pg/" if self.extra_rows else "")
+        # the board layout the Choose leads selection is saved under
+        self.leads_key = f"{num_channels}:{self.rows_prefix}"
+        if store is not None:
+            self.unwired = set(store.leads.get(self.leads_key, [])) & set(
+                self.electrodes)
         self.current = DEFAULT_MONTAGE
         self.load_montage(DEFAULT_MONTAGE)
 
@@ -1068,10 +1088,14 @@ class ViewerModel:
         return [r for r in self.rows() if self.shown(r)]
 
     def set_wired(self, sites, wired):
-        """Mark electrodes wired (True) or not (False) for this session."""
+        """Mark electrodes wired (True) or not (False); saved for the next
+        launch on this board layout."""
         for site in sites:
             if site in self.site_index:
                 (self.unwired.discard if wired else self.unwired.add)(site)
+        if self.store is not None:
+            self.store.put_unwired(self.leads_key, sorted(
+                self.unwired, key=self.site_index.__getitem__))
 
     def montage_inputs(self):
         """1-based chip inputs of the electrodes in the visible rows."""
@@ -1923,8 +1947,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         # one row per cable bundle of 8 (a board's connector: CH 1-8,
         # 9-16, …). The bundle button switches its whole row on or off; each
         # E-number switches one electrode. Every lead using an electrode
-        # that's off leaves the screen, in every montage (this session).
-        # Display only: recordings always keep every input.
+        # that's off leaves the screen, in every montage, and the checks
+        # skip it; saved for the next launch on this board layout.
+        # Recordings always keep every input.
         win, body = _popup(f"Choose leads · {model.current}")
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(4, 4))
