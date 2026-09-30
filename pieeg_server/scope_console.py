@@ -54,6 +54,7 @@ import argparse
 import asyncio
 import collections
 import errno
+import datetime
 import logging
 import multiprocessing
 import os
@@ -408,6 +409,11 @@ SCOPE_CHANGELOG = [
             "connector (CH 1-8, 9-16, 17-24, 25-32). The CH button switches "
             "the whole bundle on or off (so a test can use just one), and "
             "each E-number still switches one electrode."),
+    ("7.3", "Session names: the box left of REC names the recording, and "
+            "that name is its folder and the name of every file in it. It "
+            "starts as the date and the day's recording number (\"9-30-26 - "
+            "01\", then 02 …); type over it for any other name. A name "
+            "already used is refused, so two recordings never mix."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -862,7 +868,7 @@ def main(argv=None):
     from .acquisition import AcquisitionLoop
     from .impedance import unsupported_reason
     from .journal import referential_labels
-    from .server import PiEEGServer
+    from .server import PiEEGServer, default_session_name
     from . import profiles
     from .detect import BOARD_NAMES, detect
 
@@ -1032,6 +1038,19 @@ def main(argv=None):
     # Drives the server's own recorder — the same start/stop a connected
     # client's start_record/stop_record commands use — so the journal, CSV and
     # BDF+ export are unchanged and clients are told the state either way.
+    # The name the next recording gets unless the operator types another:
+    # the day's next "M-D-YY - NN". Worked out again only when a recording
+    # starts or stops or the date changes (not on every 50 ms status tick).
+    _next_name = {"key": None, "name": None}
+
+    def _next_session():
+        key = (datetime.date.today(), server._last_session,
+               server._get_record_status()["record_status"]["recording"])
+        if _next_name["key"] != key:
+            _next_name.update(key=key, name=default_session_name(
+                args.recordings_dir))
+        return _next_name["name"]
+
     def _record_status():
         recording = server._get_record_status()["record_status"]["recording"]
         started = server._record_start_time
@@ -1040,9 +1059,10 @@ def main(argv=None):
                 else None,
                 # the session being written: the review screen won't open
                 # or delete it
-                "session": server._last_session if recording else None}
+                "session": server._last_session if recording else None,
+                "next": None if recording else _next_session()}
 
-    async def _toggle_record():
+    async def _toggle_record(name=None):
         status = _record_status()
         if server._impedance_active:
             raise RuntimeError("wait for the impedance check to finish")
@@ -1059,7 +1079,7 @@ def main(argv=None):
         if problem:
             logger.error("recording refused: %s", problem)
             raise RuntimeError(problem)
-        await server._start_recording()
+        await server._start_recording(name)
         return {"started": server._last_session}
 
     # ---- calibration (the viewer's square-wave button) ---------------------- #
@@ -1239,7 +1259,8 @@ def main(argv=None):
         # No Rec button on mock launches: synthetic data must never land in
         # recordings/ looking like a real session.
         toggle_record=None if args.mock else (
-            lambda: asyncio.run_coroutine_threadsafe(_toggle_record(), loop)),
+            lambda name=None: asyncio.run_coroutine_threadsafe(
+                _toggle_record(name), loop)),
         # Ω: the electrode impedance check (PiEEG-8 only; works on --mock too,
         # which simulates it). With two boards, on the PiEEG.
         impedance=_impedance_unless_cal if can_check else None,

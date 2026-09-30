@@ -4,6 +4,7 @@ Drives the real server against mock hardware: record -> stop -> BDF+ auto
 export -> HTTP download, plus on-demand re-export from the journal.
 """
 
+from urllib.parse import quote
 import asyncio
 
 import numpy as np
@@ -165,7 +166,7 @@ async def test_api_recordings_lists_both_formats(tmp_path):
     assert rec["formats"]["bdf"]["primary"] is True
     assert rec["formats"]["bdf"]["lossless"] is True
     assert rec["formats"]["journal"]["source_of_truth"] is True
-    assert rec["bdf_url"] == f"/download/bdf?session={session}"
+    assert rec["bdf_url"] == f"/download/bdf?session={quote(session)}"
 
 
 async def test_unified_download_route_and_traversal_guard(tmp_path):
@@ -173,7 +174,7 @@ async def test_unified_download_route_and_traversal_guard(tmp_path):
     session = srv._last_session
 
     # /download?format=bdf routes through _health_check to the BDF server.
-    req = _FakeReq(path=f"/download?format=bdf&session={session}")
+    req = _FakeReq(path=f"/download?format=bdf&session={quote(session)}")
     resp = await srv._health_check(None, req)
     assert resp.status_code == 200
     assert resp.headers.get("Content-Disposition") == \

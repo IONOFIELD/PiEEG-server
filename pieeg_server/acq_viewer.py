@@ -1684,7 +1684,28 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     # start the server's crash-safe recording, tap again to stop and export
     # the BDF+ into the recording's folder.
     rec_btn = None
+    # Session name, left of REC: its folder and file name. Shows the day's
+    # next "M-D-YY - NN" until the operator types another; while recording
+    # it shows the session being written and can't be edited.
+    name_var = tk.StringVar(value="")
+    name_ent = None
+    _name = {"typed": False}
     if record_control is not None:
+        name_ent = tk.Entry(ewrap, textvariable=name_var, width=13,
+                            bg=C["bg"], fg=C["text"], relief="flat",
+                            insertbackground=C["text"],
+                            disabledbackground=C["surface"],
+                            disabledforeground=C["text_sec"],
+                            highlightthickness=1,
+                            highlightbackground=C["border_hi"],
+                            highlightcolor=C["accent"],
+                            font=(_MONO, _fs(9)))
+        name_ent.pack(side="left", padx=(0, 4), pady=1, ipady=2)
+        name_ent.bind("<Key>", lambda e: _name.update(typed=True))
+        # Enter / Escape: done typing, give the keys back to the chart
+        name_ent.bind("<Return>", lambda e: root.focus_set())
+        name_ent.bind("<Escape>", lambda e: (_name.update(typed=False),
+                                             root.focus_set()))
         rec_box = tk.Frame(ewrap, bg=C["bg"], highlightthickness=1,
                            highlightbackground=C["red"],
                            highlightcolor=C["red"])
@@ -2040,8 +2061,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     def _toggle_record():
         if _rec["future"] is not None:
             return                          # a start/stop is still finishing
+        name = None
+        if not record_control["status"]().get("recording"):
+            name = name_var.get().strip() or None
+            root.focus_set()
         try:
-            _rec["future"] = record_control["toggle"]()
+            _rec["future"] = record_control["toggle"](name)
         except Exception as e:              # noqa: BLE001 - report, don't crash
             _hint(f"recording failed: {e}", seconds=8, fg=C["red"])
 
@@ -2072,6 +2097,19 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             st = record_control["status"]()
         except Exception:                   # noqa: BLE001 - display only
             return
+        if name_ent is not None:
+            if st.get("recording"):
+                if str(name_ent.cget("state")) != "disabled":
+                    name_ent.configure(state="disabled")
+                    _name["typed"] = False
+                if st.get("session") and name_var.get() != st["session"]:
+                    name_var.set(st["session"])
+            else:
+                if str(name_ent.cget("state")) == "disabled":
+                    name_ent.configure(state="normal")
+                if (not _name["typed"] and st.get("next")
+                        and name_var.get() != st["next"]):
+                    name_var.set(st["next"])
         if ann_bar is not None:
             shown = bool(ann_bar.winfo_manager())
             if st.get("recording") and not shown and not _rev["on"]:
@@ -3866,13 +3904,15 @@ def run_viewer_process(conn, contact=False, record=False, impedance=False,
         return {"recording": recording,
                 "elapsed": time.time() - started if recording and started
                 else None,
-                "session": rec.get("session") if recording else None}
+                "session": rec.get("session") if recording else None,
+                "next": None if recording else rec.get("next")}
 
     if contact:
         viewer_kwargs["contact_source"] = lambda: state["leadoff"]
     if record:
         viewer_kwargs["record_control"] = {
-            "status": status, "toggle": lambda: request("toggle_record")}
+            "status": status,
+            "toggle": lambda name=None: request("toggle_record", name)}
     if impedance:
         viewer_kwargs["impedance_control"] = {
             "run": lambda: request("impedance")}

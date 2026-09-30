@@ -99,7 +99,7 @@ async def _ws(cmd, port):
 
 
 def record(args):
-    before = set(p.name for p in args.recordings.glob("pieeg_*"))
+    before = set(p.name for p in args.recordings.iterdir())
     asyncio.run(_ws("start_record", args.port))
     print(f"recording; toggling GPIO{args.pin} for {args.seconds:g} s …")
     edges = _toggle(args.pin, args.chip, args.seconds,
@@ -108,8 +108,9 @@ def record(args):
     asyncio.run(_ws("stop_record", args.port))
     new = []
     for _ in range(120):                    # wait for the exports
-        new = [p for p in args.recordings.glob("pieeg_*")
-               if p.name not in before and (p / f"{p.name}.bdf").exists()]
+        new = [p for p in args.recordings.iterdir()
+               if p.is_dir() and p.name not in before
+               and (p / f"{p.name}.bdf").exists()]
         if new and (not (new[0] / "raw" / f"{new[0].name}_pg.eegj").exists()
                     or (new[0] / f"{new[0].name}_synced.bdf").exists()):
             break

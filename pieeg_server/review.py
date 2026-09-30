@@ -82,7 +82,11 @@ def list_sessions(recordings_dir):
             "bytes": sum(p.stat().st_size for p in session_files(journal)
                          if p.is_file()),
         })
-    out.sort(key=lambda s: s["session"], reverse=True)
+    # newest first by when it was recorded: names no longer sort by date
+    # ("10-1-26 - 01" < "9-30-26 - 01"), and old "pieeg_..." ones mix in
+    out.sort(key=lambda s: (s["start"].timestamp() if s["start"]
+                            else s["journal"].stat().st_mtime),
+             reverse=True)
     return out
 
 
