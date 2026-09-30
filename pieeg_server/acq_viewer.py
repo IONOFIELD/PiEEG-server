@@ -1891,30 +1891,22 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     canvas.bind("<Button-3>", lambda e: _channel_box(e))
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
 
-    def _leads_box(view="leads"):
-        # Which leads are on screen, two ways:
-        #   Leads      — one tap-toggle per row of the current montage (the
-        #                "*" until Save, like Hide in the channel box)
-        #   Electrodes — the board's inputs ("E1 F7"): switch off the ones
-        #                not wired for this study and every lead using them
-        #                leaves the screen, in every montage (this session)
-        # Quick sets by side of the head in both. Display only: recordings
-        # always keep every input.
+    def _leads_box():
+        # Which electrodes are on screen, by E-number only ("E1", "E2", …):
+        # switch off the ones not wired for this study and every lead using
+        # them leaves the screen, in every montage (this session). Display
+        # only: recordings always keep every input.
         win, body = _popup(f"Choose leads · {model.current}")
-        tabs = tk.Frame(body, bg=C["raised"])
-        tabs.pack(fill="x", pady=(4, 0))
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(4, 4))
         grid = tk.Frame(body, bg=C["raised"])
         grid.pack()
-        rows = model.rows()
         sites = list(model.electrodes)
         cells = []
 
-        def _button(parent, text, cmd, lit=False):
+        def _button(parent, text, cmd):
             b = tk.Label(parent, text=text, padx=8, pady=3, cursor="hand2",
-                         bg=C["accent"] if lit else C["surface"],
-                         fg=C["text"], font=(_MONO, _fs(9)),
+                         bg=C["surface"], fg=C["text"], font=(_MONO, _fs(9)),
                          highlightthickness=1,
                          highlightbackground=C["border_hi"])
             b.pack(side="left", padx=(0, 4))
@@ -1922,67 +1914,34 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             return b
 
         def paint():
-            if view == "leads":
-                states = [(model.shown(r), r["on"]) for r in rows]
-                for cell, (shown, on) in zip(cells, states):
-                    cell.configure(
-                        bg=C["accent"] if shown else C["surface"],
-                        fg=(C["text"] if shown else C["text_sec"] if on
-                            else C["text_dim"]))
-                n = sum(s for s, _ in states)
-                count.configure(text=f"{n}/{len(rows)} shown")
-            else:
-                for cell, site in zip(cells, sites):
-                    on = site not in model.unwired
-                    cell.configure(bg=C["accent"] if on else C["surface"],
-                                   fg=C["text"] if on else C["text_dim"])
-                count.configure(text=f"{len(sites) - len(model.unwired)}/"
-                                     f"{len(sites)} wired")
+            for cell, site in zip(cells, sites):
+                on = site not in model.unwired
+                cell.configure(bg=C["accent"] if on else C["surface"],
+                               fg=C["text"] if on else C["text_dim"])
+            count.configure(text=f"{len(sites) - len(model.unwired)}/"
+                                 f"{len(sites)} wired")
             _edited()
 
         def tap(i):
-            if view == "leads":
-                model.toggle_row(i)
-            else:
-                site = sites[i]
-                model.set_wired([site], site in model.unwired)
+            site = sites[i]
+            model.set_wired([site], site in model.unwired)
             paint()
 
-        def only(side):
-            if view == "leads":
-                model.show_only(side)
-            else:
-                keep = [x for x in sites if side == "all"
-                        or (side != "none" and site_side(x) == side)]
-                model.set_wired(sites, False)
-                model.set_wired(keep, True)
+        def every(on):
+            model.set_wired(sites, on)
             paint()
 
-        def switch(v):
-            _close_popup()
-            _leads_box(v)
-
-        _button(tabs, "Leads", lambda: switch("leads"), lit=view == "leads")
-        _button(tabs, "Electrodes", lambda: switch("electrodes"),
-                lit=view == "electrodes")
-        for label, side in (("All", "all"), ("None", "none"),
-                            ("Left", "left"), ("Midline", "mid"),
-                            ("Right", "right")):
-            _button(quick, label, lambda sd=side: only(sd))
+        _button(quick, "All", lambda: every(True))
+        _button(quick, "None", lambda: every(False))
         count = tk.Label(quick, bg=C["raised"], fg=C["text_sec"],
                          font=(_MONO, _fs(9)))
         count.pack(side="right", padx=(8, 0))
-        if view == "leads":
-            texts = [model.row_label(r) for r in rows]
-            cols, width = (3 if len(rows) <= 24 else 4), 11
-            groups = [(None, list(range(len(rows))))]
-        else:
-            texts = [model.input_text(x) for x in sites]
-            cols, width = (4, 9) if not model.boards else (8, 7)
-            # one section per board when two are connected
-            groups = ([(name, [model.site_index[k] for k in keys])
-                       for name, keys in model.boards]
-                      if model.boards else [(None, list(range(len(sites))))])
+        texts = [model.elabel(x) for x in sites]
+        cols, width = (4, 5) if not model.boards else (8, 5)
+        # one section per board when two are connected
+        groups = ([(name, [model.site_index[k] for k in keys])
+                   for name, keys in model.boards]
+                  if model.boards else [(None, list(range(len(sites))))])
         cells[:] = [None] * len(texts)
         grid_row = 0
         for name, members in groups:

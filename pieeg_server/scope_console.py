@@ -400,6 +400,10 @@ SCOPE_CHANGELOG = [
             "frequency (~5 s), then the PiEEG. Readings come from a 0/10k/47k "
             "calibration per input; before it they show as ≈ estimates. "
             "Between checks the test leads are high impedance."),
+    ("7.1", "Montage > Choose leads… picks electrodes by E-number only: each "
+            "input shows as \"E1\", \"E2\", … with no 10-20 site beside it. "
+            "Tap one to switch it off (every lead using it leaves the "
+            "screen), or All / None."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
