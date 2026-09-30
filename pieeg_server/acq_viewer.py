@@ -1892,10 +1892,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
 
     def _leads_box():
-        # Which electrodes are on screen, by E-number only ("E1", "E2", …):
-        # switch off the ones not wired for this study and every lead using
-        # them leaves the screen, in every montage (this session). Display
-        # only: recordings always keep every input.
+        # Which electrodes are on screen, by E-number only ("E1", "E2", …),
+        # one row per cable bundle of 8 (a board's connector: CH 1-8,
+        # 9-16, …). The bundle button switches its whole row on or off; each
+        # E-number switches one electrode. Every lead using an electrode
+        # that's off leaves the screen, in every montage (this session).
+        # Display only: recordings always keep every input.
         win, body = _popup(f"Choose leads · {model.current}")
         quick = tk.Frame(body, bg=C["raised"])
         quick.pack(fill="x", pady=(4, 4))
@@ -1903,6 +1905,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         grid.pack()
         sites = list(model.electrodes)
         cells = []
+        bundles = []                # (button, [site, …]) per row of 8
 
         def _button(parent, text, cmd):
             b = tk.Label(parent, text=text, padx=8, pady=3, cursor="hand2",
@@ -1918,6 +1921,14 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 on = site not in model.unwired
                 cell.configure(bg=C["accent"] if on else C["surface"],
                                fg=C["text"] if on else C["text_dim"])
+            for btn, members in bundles:
+                n = sum(x not in model.unwired for x in members)
+                # lit = whole bundle on, outlined = some, dim = none
+                btn.configure(
+                    bg=C["accent"] if n == len(members) else C["surface"],
+                    fg=C["text"] if n else C["text_dim"],
+                    highlightbackground=(C["accent"] if 0 < n < len(members)
+                                         else C["border_hi"]))
             count.configure(text=f"{len(sites) - len(model.unwired)}/"
                                  f"{len(sites)} wired")
             _edited()
@@ -1925,6 +1936,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         def tap(i):
             site = sites[i]
             model.set_wired([site], site in model.unwired)
+            paint()
+
+        def tap_bundle(members):
+            # all on -> all off; otherwise (some or none on) -> all on
+            model.set_wired(members, any(x in model.unwired
+                                         for x in members))
             paint()
 
         def every(on):
@@ -1937,7 +1954,6 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                          font=(_MONO, _fs(9)))
         count.pack(side="right", padx=(8, 0))
         texts = [model.elabel(x) for x in sites]
-        cols, width = (4, 5) if not model.boards else (8, 5)
         # one section per board when two are connected
         groups = ([(name, [model.site_index[k] for k in keys])
                    for name, keys in model.boards]
@@ -1948,17 +1964,26 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             if name:
                 tk.Label(grid, text=name, bg=C["raised"], fg=C["text_sec"],
                          font=(_MONO, _fs(9), "bold"), anchor="w").grid(
-                    row=grid_row, column=0, columnspan=cols, sticky="w",
+                    row=grid_row, column=0, columnspan=9, sticky="w",
                     pady=(4, 0))
                 grid_row += 1
-            for j, i in enumerate(members):
-                cell = tk.Label(grid, text=texts[i], width=width, pady=3,
-                                cursor="hand2", font=(_MONO, _fs(9)))
-                cell.grid(row=grid_row + j // cols, column=j % cols, padx=2,
-                          pady=2)
-                cell.bind("<Button-1>", lambda e, k=i: tap(k))
-                cells[i] = cell
-            grid_row += (len(members) + cols - 1) // cols
+            for b0 in range(0, len(members), 8):
+                chunk = members[b0:b0 + 8]
+                btn = tk.Label(grid, text=f"CH {b0 + 1}-{b0 + len(chunk)}",
+                               width=8, pady=3, cursor="hand2",
+                               font=(_MONO, _fs(9), "bold"),
+                               highlightthickness=1)
+                btn.grid(row=grid_row, column=0, padx=(0, 6), pady=2)
+                keys = [sites[i] for i in chunk]
+                btn.bind("<Button-1>", lambda e, k=keys: tap_bundle(k))
+                bundles.append((btn, keys))
+                for j, i in enumerate(chunk):
+                    cell = tk.Label(grid, text=texts[i], width=4, pady=3,
+                                    cursor="hand2", font=(_MONO, _fs(9)))
+                    cell.grid(row=grid_row, column=j + 1, padx=2, pady=2)
+                    cell.bind("<Button-1>", lambda e, k=i: tap(k))
+                    cells[i] = cell
+                grid_row += 1
         paint()
         win.update_idletasks()
         w, h = win.winfo_reqwidth(), win.winfo_reqheight()

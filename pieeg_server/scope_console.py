@@ -404,6 +404,10 @@ SCOPE_CHANGELOG = [
             "input shows as \"E1\", \"E2\", … with no 10-20 site beside it. "
             "Tap one to switch it off (every lead using it leaves the "
             "screen), or All / None."),
+    ("7.2", "Choose leads is laid out by cable bundle: one row per 8-pin "
+            "connector (CH 1-8, 9-16, 17-24, 25-32). The CH button switches "
+            "the whole bundle on or off (so a test can use just one), and "
+            "each E-number still switches one electrode."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
