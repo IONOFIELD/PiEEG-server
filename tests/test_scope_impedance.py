@@ -145,7 +145,8 @@ class TestAverageImpedance:
         model = acq_viewer.ViewerModel(8, 250, acq_viewer.DEFAULT_ELECTRODES[:8])
         inputs = model.montage_inputs()
         assert inputs and all(1 <= i <= 8 for i in inputs)
-        visible = {s for r in model.rows() if r["on"] for s in r["pair"]}
+        visible = {s for r in model.rows() if r["on"] for s in r["pair"]
+                   if s != acq_viewer.REF_SITE}
         assert inputs == sorted(model.site_index[s] + 1 for s in visible)
 
 

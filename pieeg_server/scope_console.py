@@ -429,6 +429,12 @@ SCOPE_CHANGELOG = [
             "Choose leads still just shows fewer of each montage's leads, in "
             "the same order. The saline check is only on the Ω button now, "
             "and the Montage list no longer has Adaptive (reduced)."),
+    ("7.7", "Referential replaces Adaptive as the default montage: every "
+            "electrode on its own against REF, one row each (E1 F7-REF, "
+            "E2-REF, …), exactly as the board measures it. REF can also be "
+            "the lower electrode of a Custom lead. Picking Custom no longer "
+            "freezes the traces: it starts as a copy of the montage on "
+            "screen, and an empty chart says so (tap it to add a channel)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
