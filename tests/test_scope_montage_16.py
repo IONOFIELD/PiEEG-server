@@ -126,7 +126,7 @@ def test_ironbci32_sites_follow_its_electrode_map():
     sites = _electrodes("ironbci32", 32)
     assert len(sites) == len(set(sites)) == 32
     # bank 1 is the cap as wired on site
-    assert sites[:8] == ["Fp1", "Fp2", "Fz", "C3", "C4", "Pz", "O1", "O2"]
+    assert sites[:8] == ["Fp1", "Fp2", "Fz", "Pz", "C3", "C4", "O1", "O2"]
     # the rest go by their input number unless they keep a 10-20 site
     assert all(x == f"E{i + 1}" for i, x in enumerate(sites)
                if x.startswith("E"))
