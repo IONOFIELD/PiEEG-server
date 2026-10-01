@@ -2142,12 +2142,17 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
 
     # ---- lead map: which colour goes where, and is it picking up ---------- #
-    # Opens with the Scope (lead_colours given) at the right edge, over the
-    # traces but without taking the taps: the Scope stays usable underneath.
+    # Opens with the Scope (lead_colours given) in the middle of the screen,
+    # over the traces but without taking the taps: the Scope stays usable
+    # underneath. With a PiEEG on the screen, its leads are listed on the
+    # right with their last impedance check, run from there only once every
+    # PiEEG lead is chosen (Choose leads).
     # Each wired lead is a dot in its wire colour at its site, with the live
     # contact bubble (green good / amber loose / red off / grey not yet
     # known) at its corner: the same verdicts as the dots on the traces.
-    _lmap = {"win": None, "canvas": None, "after": None}
+    _lmap = {"win": None, "canvas": None, "list": None, "run": None,
+             "after": None}
+    _LM_LIST_W = 220
     _LM_R = 118                     # head radius, px (fits 480 px tall)
     _LM_W = 2 * _LM_R + 64
 
@@ -2160,12 +2165,122 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         if win is not None and win.winfo_exists():
             win.destroy()
 
+    def _lm_pieeg():
+        """(board name, sites) of the PiEEG the impedance check runs on, or
+        None: the whole screen when it is the only board (it has lead-off
+        detection), else the second board next to an IronBCI."""
+        if impedance_control is None:
+            return None
+        if not model.signal_contact_n:
+            return lead_map_title or "PiEEG", list(model.electrodes)
+        if len(model.boards) > 1:
+            return model.boards[1][0], list(model.boards[1][1])
+        return None
+
+    def _lm_all_chosen(sites):
+        return not (set(sites) & model.unwired)
+
+    def _lm_run(_evt=None):
+        pe = _lm_pieeg()
+        if pe is None or _imp["future"] is not None:
+            return
+        if not _lm_all_chosen(pe[1]):
+            _hint(f"choose all {len(pe[1])} {pe[0]} leads first "
+                  "(Montage > Choose leads)", seconds=6, fg=C["yellow"])
+            return
+        _run_impedance()
+
+    def _lead_map_list(items):
+        """The PiEEG's leads on the right: wire colour + contact bubble,
+        E-number, site or name, and the last impedance check's value."""
+        lv, run = _lmap["list"], _lmap["run"]
+        pe = _lm_pieeg()
+        if lv is None or pe is None:
+            return
+        name, sites = pe
+        by_site = {it["site"]: it for it in items}
+        colour_of = dict(zip(model.electrodes, lead_colours))
+        res = _imp["result"]
+        first = int(res.get("first_input") or 1) - 1 if res else 0
+        withheld = bool(res and res.get("problem"))
+        lv.delete("all")
+        y = 12
+        lv.create_text(6, y, anchor="w", fill=C["text_sec"],
+                       font=(_MONO, _fs(9), "bold"),
+                       text=f"{name.upper()} IMPEDANCE")
+        if res is not None:
+            lv.create_text(_LM_LIST_W - 6, y, anchor="e", fill=C["text_dim"],
+                           font=(_MONO, _fs(9)), text=time.strftime(
+                               "%H:%M", time.localtime(_imp["at"])))
+        y += 8
+        for site in sites:
+            y += 26
+            colour = colour_of.get(site)
+            it = by_site.get(site)
+            off = site in model.unwired
+            if colour:
+                r = 9
+                lv.create_oval(16 - r, y - r, 16 + r, y + r,
+                               fill=WIRE_HEX.get(colour, colour),
+                               outline=C["text_sec"] if colour == "black"
+                               else C["bg"], width=2)
+                v = it["contact"] if it else None
+                fg = _CONTACT_FG.get(v) or C["text_dim"]
+                lv.create_oval(16 + 7 - 5, y - 7 - 5, 16 + 7 + 5, y - 7 + 5,
+                               fill=fg, outline=C["bg"], width=2)
+            label = (it["label"] if it and it["label"] else
+                     "" if site in model.input_labels else site)
+            lv.create_text(32, y, anchor="w",
+                           fill=C["text_dim"] if off else C["text"],
+                           font=(_MONO, _fs(9)),
+                           text=f"{model.elabel(site):<4}{label}")
+            value, vfg = "—", C["text_dim"]
+            if off:
+                value = "off"
+            elif res is not None and not withheld:
+                i = model.site_index[site] - first
+                leads = res.get("leads") or []
+                lead = leads[i] if 0 <= i < len(leads) else None
+                if lead and lead.get("status") != "untested":
+                    value = lead["text"]
+                    vfg = _BAND_FG.get(lead["band"], C["text_dim"])
+            lv.create_text(_LM_LIST_W - 6, y, anchor="e", fill=vfg,
+                           font=(_MONO, _fs(9), "bold"), text=value)
+        if res is not None:
+            y += 26
+            verdict = {"green": "ok", "red": "OFF", None: "?"}
+            lv.create_text(6, y, anchor="w", font=(_MONO, _fs(9)),
+                           fill=C["red"] if "red" in (res.get("ref"),
+                                                      res.get("gnd"))
+                           else C["text_sec"],
+                           text=f"REF {verdict.get(res.get('ref'), '?'):<4}"
+                                f"BIAS {verdict.get(res.get('gnd'), '?')}")
+        if withheld:
+            y += 22
+            lv.create_text(6, y, anchor="w", fill=C["red"],
+                           font=(_MONO, _fs(8)), width=_LM_LIST_W - 12,
+                           text=res["problem"])
+        lv.configure(height=y + 16)
+        # the button: only with every lead of this board chosen
+        if _imp["future"] is not None:
+            run.configure(text="measuring… hands off", fg=C["text_sec"],
+                          bg=C["surface"], cursor="")
+        elif _lm_all_chosen(sites):
+            run.configure(text="Check impedance", fg=C["text"],
+                          bg=C["accent"], cursor="hand2")
+        else:
+            run.configure(text=f"choose all {len(sites)} leads to check",
+                          fg=C["text_dim"], bg=C["surface"], cursor="")
+
     def _lead_map_draw():
         _lmap["after"] = None
         win, cv = _lmap["win"], _lmap["canvas"]
         if win is None or not win.winfo_exists():
             return
         items = lead_map_items(model, lead_colours)
+        _lead_map_list(items)
+        pe = _lm_pieeg()
+        listed = set(pe[1]) if pe and _lmap["list"] is not None else set()
         cv.delete("all")
         cx, cy, R = _LM_W / 2, _LM_R + 18, _LM_R
         line = C["border_hi"]
@@ -2200,7 +2315,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             bubble(x + r * 0.78, y - r * 0.78, verdict)
 
         on_head = [it for it in items if it["xy"]]
-        off_head = [it for it in items if not it["xy"]]
+        off_head = [it for it in items
+                    if not it["xy"] and it["site"] not in listed]
         for it in on_head:
             x, y = it["xy"]
             lead(cx + x * R, cy - y * R, it["colour"], it["site"],
@@ -2266,14 +2382,30 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                          padx=6)
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: _lead_map_close())
-        cv = tk.Canvas(win, width=_LM_W, height=300, bg=C["raised"],
+        body = tk.Frame(win, bg=C["raised"])
+        body.pack(padx=4, pady=(0, 4))
+        cv = tk.Canvas(body, width=_LM_W, height=300, bg=C["raised"],
                        highlightthickness=0)
-        cv.pack(padx=4, pady=(0, 4))
+        cv.pack(side="left", anchor="n")
         _lmap["canvas"] = cv
+        _lmap["list"] = _lmap["run"] = None
+        if _lm_pieeg() is not None:
+            side = tk.Frame(body, bg=C["raised"], highlightthickness=1,
+                            highlightbackground=C["border_hi"])
+            side.pack(side="left", anchor="n", padx=(4, 0), pady=(6, 0))
+            lv = tk.Canvas(side, width=_LM_LIST_W, height=200,
+                           bg=C["raised"], highlightthickness=0)
+            lv.pack()
+            run = tk.Label(side, text="Check impedance", pady=6,
+                           font=(_MONO, _fs(10), "bold"))
+            run.pack(fill="x", padx=6, pady=6)
+            run.bind("<Button-1>", _lm_run)
+            _lmap["list"], _lmap["run"] = lv, run
         _lead_map_draw()
         win.update_idletasks()
-        x = root.winfo_rootx() + root.winfo_width() - win.winfo_reqwidth() - 4
-        win.geometry(f"+{max(0, x)}+{root.winfo_rooty() + 40}")
+        x = (root.winfo_screenwidth() - win.winfo_reqwidth()) // 2
+        y = (root.winfo_screenheight() - win.winfo_reqheight()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
         try:
             win.attributes("-topmost", True)
         except tk.TclError:
