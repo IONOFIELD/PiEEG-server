@@ -104,10 +104,13 @@ class PiEEGServer:
     def __init__(self, acquisition: AcquisitionLoop,
                  host: str = DEFAULT_HOST, port: int = DEFAULT_PORT,
                  auth: AuthManager | None = None,
-                 num_channels: int = 16, channel_labels=None):
+                 num_channels: int = 16, channel_labels=None,
+                 channel_wires=None):
         self._acq = acquisition
         # recording labels (None: the journal's ch1..chN)
         self._channel_labels = channel_labels
+        # lead-wire colours for the recording sidecar (JournalWriter wires)
+        self._channel_wires = channel_wires
         self._host = host
         self._port = port
         self._auth = auth
@@ -696,6 +699,7 @@ class PiEEGServer:
             prefilter=None,
             channel_labels=self._channel_labels,
             timing_source=_timing_source(self._acq),
+            wires=self._channel_wires,
             **journal_kwargs,
         )
         self._last_session = session
@@ -726,7 +730,8 @@ class PiEEGServer:
             num_channels=acq.num_channels,
             sample_rate=acq.raw_rate,
             prefilter=None, channel_labels=src["labels"],
-            timing_source=_timing_source(acq), **kwargs)
+            timing_source=_timing_source(acq), wires=src.get("wires"),
+            **kwargs)
         rec = Recorder(acq, output=raw_dir / f"{name}.csv",
                        num_channels=acq.num_channels)
         logger.info("Recording second board: journal=%s", journal.journal_path)
@@ -1501,13 +1506,14 @@ class PiEEGServer:
     # ── Spike config ───────────────────────────────────────────────────
 
     def add_record_source(self, acquisition, tag, channel_labels,
-                          reference=None):
+                          reference=None, wires=None):
         """A second board recorded alongside this server's own: its journal
         and CSV start and stop with the recording, named <session>_<tag>, and
         its own BDF+ is exported beside the session's on stop."""
         self._extra_sources.append({"acq": acquisition, "tag": tag,
                                     "labels": list(channel_labels),
-                                    "reference": reference})
+                                    "reference": reference,
+                                    "wires": wires})
 
     def _recording_active(self) -> bool:
         return bool(self._recorder_task and not self._recorder_task.done())

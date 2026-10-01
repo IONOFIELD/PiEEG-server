@@ -95,6 +95,14 @@ def _channel_labels(meta, nch):
     return meta.get("channel_labels") or [f"ch{i}" for i in range(1, nch + 1)]
 
 
+def _transducers(meta, nch):
+    """Each channel's BDF/EDF transducer field: the lead-wire colour plugged
+    into it ("lead wire yellow"), from the sidecar; "" where unknown."""
+    wires = list(meta.get("channel_wire_colours") or [])
+    return [f"lead wire {wires[ci]}"[:80] if ci < len(wires) and wires[ci]
+            else "" for ci in range(nch)]
+
+
 # --------------------------------------------------------------------------- #
 # BDF+ 24-bit  (primary, lossless)
 # --------------------------------------------------------------------------- #
@@ -385,6 +393,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None,
     try:
         writer.setStartdatetime(start)
         headers = []
+        transducers = _transducers(meta, nch)
         for ci in range(nch):
             headers.append({
                 "label": str(labels[ci])[:16],   # header label field is 16 chars
@@ -394,7 +403,7 @@ def _write_bdfplus(counts, meta, out_path, annotations=(), prefilters=None,
                 "physical_max": phys_max,
                 "digital_min": _BDF_DIG_MIN,
                 "digital_max": _BDF_DIG_MAX,
-                "transducer": "",
+                "transducer": transducers[ci],
                 # Truthful: the journal is the chip's raw output, or says
                 # which decimation filter made it (oversampling), and which
                 # channels were resampled onto chip 1's times (PiEEG-16).
@@ -456,6 +465,7 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None,
     try:
         writer.setStartdatetime(start)
         channel_info = []
+        transducers = _transducers(meta, nch)
         for ci in range(nch):
             pmin, pmax = _physical_range(uv[:, ci])
             channel_info.append({
@@ -466,7 +476,7 @@ def _write_edfplus(counts, meta, out_path, annotations=(), prefilters=None,
                 "physical_max": pmax,
                 "digital_min": _EDF_DIG_MIN,
                 "digital_max": _EDF_DIG_MAX,
-                "transducer": "",
+                "transducer": transducers[ci],
                 "prefilter": ((prefilters[ci] if prefilters else None)
                               or meta.get("prefilter") or "")[:80],
             })
@@ -650,9 +660,11 @@ def export_master(primary_journal, other_journals, out_path):
         meta = b["meta"]
         labels = _channel_labels(meta, int(meta["channel_count"]))
         lsb = float(meta["lsb_uv"])
+        transducers = _transducers(meta, int(meta["channel_count"]))
         for ci in range(y.shape[1]):
             signals.append({"label": str(labels[ci])[:16], "rate": b["grid"],
-                            "lsb": lsb, "data": y[:, ci]})
+                            "lsb": lsb, "data": y[:, ci],
+                            "transducer": transducers[ci]})
         report.append({
             "file": b["journal"].stem, "channels": int(y.shape[1]),
             "measured_rate_hz": round(float(b["measured"]), 4),
@@ -685,7 +697,7 @@ def export_master(primary_journal, other_journals, out_path):
                     "physical_min": _BDF_DIG_MIN * sg["lsb"],
                     "physical_max": _BDF_DIG_MAX * sg["lsb"],
                     "digital_min": _BDF_DIG_MIN, "digital_max": _BDF_DIG_MAX,
-                    "transducer": "",
+                    "transducer": sg.get("transducer", ""),
                     "prefilter": ("raw; " + timebase.METHOD
                                   + " on the Pi clock")[:80]}
                    for sg in signals]
@@ -783,19 +795,21 @@ def write_summary(journal_path, edf_path, out_path, sidecar_path=None,
     fs = tb["rate_hz"] if tb is not None else int(meta["sample_rate"])
     labels = _channel_labels(meta, nch)
     inputs = meta.get("channel_inputs") or [f"E{i}" for i in range(1, nch + 1)]
+    wires = list(meta.get("channel_wire_colours") or [])
     uv = counts.astype(np.float64) * float(meta["lsb_uv"])
     bdf = edf_path.suffix.lower() == ".bdf"
     channels = []
     for ci in range(nch):
         pmin, pmax = _physical_range(uv[:, ci]) if len(uv) else (-1.0, 1.0)
+        wire = {"wire": wires[ci]} if ci < len(wires) and wires[ci] else {}
         if bdf:
             channels.append({
-                "label": str(labels[ci]), "input": inputs[ci],
+                "label": str(labels[ci]), "input": inputs[ci], **wire,
                 "data_min_uv": pmin, "data_max_uv": pmax,
                 "bdf_step_uv": round(float(meta["lsb_uv"]), 6)})
         else:
             channels.append({
-                "label": str(labels[ci]), "input": inputs[ci],
+                "label": str(labels[ci]), "input": inputs[ci], **wire,
                 "edf_physical_min_uv": pmin, "edf_physical_max_uv": pmax,
                 "edf_step_uv": round((pmax - pmin)
                                      / (_EDF_DIG_MAX - _EDF_DIG_MIN), 6)})
