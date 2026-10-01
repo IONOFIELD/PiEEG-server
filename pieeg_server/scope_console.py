@@ -441,6 +441,13 @@ SCOPE_CHANGELOG = [
             "settling O1 at 350 µV/s sits centred instead of +55 µV off at "
             "LFF 1 Hz). LFF Off still shows the true DC; PiEEG inputs, the "
             "stream and recordings are unchanged."),
+    ("7.9", "IronBCI-32 bank 1 is named for the cap as wired: E1 Fp1, E2 Fp2, "
+            "E3 Fz, E4 C3, E5 C4, E6 Pz, E7 O1, E8 O2 (on screen and in "
+            "recordings). The channel box's electrode pickers only offer the "
+            "electrodes switched on in Choose leads: picking a switched-off "
+            "one moved the lead to an input not on the head and it vanished. "
+            "Rename a lead in its name field; a lead that still ends up on a "
+            "switched-off electrode now says so."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -448,17 +455,19 @@ SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 # PiEEG-8/16: the harness order, first 8 = the 8-channel hookup.
 _ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
                "F3", "F4", "P3", "P4", "F7", "F8", "T5", "T6"]
-# IronBCI-32: input -> 10-20 site, like the PiEEG's list, from the board's
-# electrode location drawing (pieeg-club/ironbci-32 images/Electrode_Location
-# .png). Four banks of 8, one ADC each; bank 1 also has the REF and BIAS pins
-# (ear clips). 21 inputs sit on 10-20 positions (all 19 + Fpz, Oz); the other
-# 11 lie between them, have no 10-20 site and go by their input number. Edit
-# this list if your cap is wired differently.
+# IronBCI-32: input -> 10-20 site, like the PiEEG's list. Four banks of 8,
+# one ADC each; bank 1 also has the REF and BIAS pins (header order BIAS, 4,
+# 3, 2, 1, 5, 6, 7, 8, REF). Bank 1 is the 8-lead cap as wired on site
+# (2026-09-30): E1 Fp1, E2 Fp2, E3 Fz, E4 C3, E5 C4, E6 Pz, E7 O1, E8 O2.
+# Banks 2-4 keep the board's electrode location drawing (pieeg-club/
+# ironbci-32 images/Electrode_Location.png), except the inputs whose site
+# bank 1 now holds: those, and the inputs between 10-20 positions, go by
+# their input number. Edit this list if your cap is wired differently.
 _IRONBCI32_ELECTRODES = [
-    "F7", "E2", "T3", "E4", "T5", "O1", "P3", "E8",             # bank 1
-    "C3", "E10", "F3", "Fp1", "Fz", "E14", "Cz", "E16",         # bank 2
-    "Pz", "Oz", "O2", "P4", "E21", "C4", "E23", "F4",           # bank 3
-    "Fp2", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
+    "Fp1", "Fp2", "Fz", "C3", "C4", "Pz", "O1", "O2",           # bank 1
+    "E9", "E10", "F3", "E12", "E13", "E14", "Cz", "E16",        # bank 2
+    "E17", "Oz", "E19", "P4", "E21", "E22", "E23", "F4",        # bank 3
+    "E25", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
 ]
 
 

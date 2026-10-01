@@ -45,3 +45,15 @@ def test_model_filters_carry_drift_inputs():
     m = ViewerModel(4, FS, ["F7", "T3", "T5", "O1"], store=None,
                     drift_inputs=4)
     assert m.new_filter()._ndrift == 4
+
+
+def test_ironbci_bank1_is_the_site_cap():
+    from pieeg_server.scope_console import _IRONBCI32_ELECTRODES as E
+    assert E[:8] == ["Fp1", "Fp2", "Fz", "C3", "C4", "Pz", "O1", "O2"]
+    assert len(set(E)) == 32
+
+
+def test_wired_sites_skip_switched_off():
+    m = ViewerModel(4, FS, ["Fp1", "Fp2", "E3", "E4"], store=None)
+    m.set_wired(["E3", "E4"], False)
+    assert m.wired_sites() == ["Fp1", "Fp2"]
