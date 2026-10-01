@@ -162,9 +162,10 @@ def presets_for(electrodes):
     return MONTAGE_PRESETS
 
 
-# Saved row edits are keyed apart per preset set (see ViewerModel).
-_ROWS_PREFIX = {id(MONTAGE_PRESETS): "", id(MONTAGE_PRESETS_16): "16ch/",
-                id(MONTAGE_PRESETS_32): "32ch/"}
+def _rows_prefix(n_inputs):
+    """Store key prefix for an EEG board of n inputs (see ViewerModel): ""
+    for 8 (the original PiEEG keys), "16ch/", "32ch/"."""
+    return "" if n_inputs <= 8 else f"{n_inputs}ch/"
 
 
 DEFAULT_MONTAGE = REFERENTIAL_MONTAGE
@@ -742,10 +743,13 @@ class ViewerModel:
         self.store = store          # MontageStore or None (in-memory only)
         # 8-, 16- or 32-site presets, whichever this board's inputs can show.
         self.presets = presets_for(self.electrodes)
-        # Saved row edits are kept apart per preset set, so an 8-channel
+        # Saved row edits are kept apart per EEG board size, so an 8-channel
         # montage saved on a PiEEG-8 never replaces the 16-channel one (its
-        # rows would all still be valid sites). Filters are shared by name.
-        self.rows_prefix = _ROWS_PREFIX[id(self.presets)] + (
+        # rows would all still be valid sites). Keyed by input count, not by
+        # which presets fit: renaming a board's sites (a cap wired its own
+        # way) must not orphan what was saved. Filters are shared by name.
+        self.rows_prefix = _rows_prefix(
+            len(self.boards[0][1]) if self.boards else num_channels) + (
             "+pg/" if self.extra_rows else "")
         # the board layout the Choose leads selection is saved under
         self.leads_key = f"{num_channels}:{self.rows_prefix}"
@@ -1176,6 +1180,11 @@ class ViewerModel:
 
     def visible_rows(self):
         return [r for r in self.rows() if self.shown(r)]
+
+    def wired_sites(self):
+        """The electrodes on the head (not switched off in Choose leads),
+        in input order."""
+        return [s for s in self.electrodes if s not in self.unwired]
 
     def set_wired(self, sites, wired):
         """Mark electrodes wired (True) or not (False); saved for the next
@@ -2873,18 +2882,26 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                             font=(_MONO, _fs(10)))
         name_ent.pack(fill="x", **pad)
 
-        a0, b0 = (r["pair"] if r else
-                  (model.electrodes[0], model.electrodes[min(
-                      2, len(model.electrodes) - 1)]))
+        # Only the electrodes on the head (Choose leads) are offered: picking
+        # a switched-off one hid the lead the moment OK was pressed. The
+        # lead's own pair stays listed so an old row can still be opened.
+        wired = model.wired_sites()
+        if r:
+            a0, b0 = r["pair"]
+        else:
+            a0 = (wired or model.electrodes)[0]
+            b0 = wired[1] if len(wired) > 1 else REF_SITE
+        keep = set(wired) | {REF_SITE, a0, b0}
+        choices = [d for d, site in elec_choices if site in keep]
         a_var = tk.StringVar(value=_site_to_disp[a0])
         b_var = tk.StringVar(value=_site_to_disp[b0])
         epair = tk.Frame(body, bg=C["raised"])
         epair.pack(fill="x", **pad)
-        ttk.OptionMenu(epair, a_var, a_var.get(), *elec_display).pack(
+        ttk.OptionMenu(epair, a_var, a_var.get(), *choices).pack(
             side="left")
         tk.Label(epair, text="–", bg=C["raised"], fg=C["text_sec"]).pack(
             side="left", padx=2)
-        ttk.OptionMenu(epair, b_var, b_var.get(), *elec_display).pack(
+        ttk.OptionMenu(epair, b_var, b_var.get(), *choices).pack(
             side="left")
         for om in epair.winfo_children()[::2]:
             om.configure(width=6)
@@ -2901,20 +2918,34 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             _edited()
             _close_popup()
 
+        def offscreen(row):
+            """Say why a lead just edited/added isn't on the chart."""
+            off = [x for x in row["pair"] if x in model.unwired]
+            if row is not None and off:
+                _hint(f"{model.row_label(row)} uses "
+                      f"{', '.join(model.input_text(x) for x in off)}: "
+                      "switched off in Choose leads", seconds=8,
+                      fg=C["yellow"])
+                return True
+            return False
+
         def ok():
             p = pair()
             if p is None:
                 return
             if r is None:
-                model.insert_row(None, *p, label=name_var.get())
-                _hint(f"added {model.epair_name(p)}")
+                row = model.insert_row(None, *p, label=name_var.get())
+                if row is not None and not offscreen(row):
+                    _hint(f"added {model.epair_name(p)}")
             else:
                 # An unrenamed channel is named after its pair, so its name
                 # follows the new pair; a custom name ("EMG 1") is kept.
                 name = name_var.get().strip()
                 if not r.get("label") and name == r["name"]:
                     name = ""
-                model.edit_row(r, *p, name)
+                row = model.edit_row(r, *p, name)
+                if row is not None:
+                    offscreen(row)
             _edited()
             _close_popup()
 
@@ -2922,8 +2953,9 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             p = pair()
             if p is None:
                 return
-            model.insert_row(None if i is None else i + 1, *p)
-            _hint(f"added {model.epair_name(p)} below")
+            row = model.insert_row(None if i is None else i + 1, *p)
+            if row is not None and not offscreen(row):
+                _hint(f"added {model.epair_name(p)} below")
             _edited()
             _close_popup()
 

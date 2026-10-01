@@ -8,11 +8,25 @@ import numpy as np
 from pieeg_server import acq_viewer as av
 from pieeg_server.scope_console import _electrodes
 
+# A fully wired IronBCI-32 cap, from the board's electrode location drawing
+# (pieeg-club/ironbci-32 images/Electrode_Location.png): every 10-20 site, so
+# the full ACNS presets apply. The shipped map follows the cap on site.
+DRAWING_32 = [
+    "F7", "E2", "T3", "E4", "T5", "O1", "P3", "E8",
+    "C3", "E10", "F3", "Fp1", "Fz", "E14", "Cz", "E16",
+    "Pz", "Oz", "O2", "P4", "E21", "C4", "E23", "F4",
+    "Fp2", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",
+]
+
+
+def _sites(n):
+    if n == 32:
+        return list(DRAWING_32)
+    return _electrodes({8: "pieeg8", 16: "pieeg16"}[n], n)
+
 
 def _model(n, path):
-    device = {8: "pieeg8", 16: "pieeg16", 32: "ironbci32"}[n]
-    return av.ViewerModel(n, 250, _electrodes(device, n),
-                          store=av.MontageStore(path))
+    return av.ViewerModel(n, 250, _sites(n), store=av.MontageStore(path))
 
 
 def _inputs(m):
@@ -111,15 +125,21 @@ def test_saved_8ch_rows_do_not_replace_the_16ch_montage(tmp_path):
 def test_ironbci32_sites_follow_its_electrode_map():
     sites = _electrodes("ironbci32", 32)
     assert len(sites) == len(set(sites)) == 32
-    # spot checks against the board's electrode location drawing
-    assert (sites[0], sites[11], sites[14], sites[24], sites[31]) == (
-        "F7", "Fp1", "Cz", "Fp2", "E32")
-    tenty = [x for x in sites if not x.startswith("E")]
-    assert len(tenty) == 21                 # all 19 + Fpz, Oz
-    assert {"T3", "T4", "T5", "T6"} <= set(tenty)
-    # the rest go by their input number
+    # bank 1 is the cap as wired on site
+    assert sites[:8] == ["Fp1", "Fp2", "Fz", "C3", "C4", "Pz", "O1", "O2"]
+    # the rest go by their input number unless they keep a 10-20 site
     assert all(x == f"E{i + 1}" for i, x in enumerate(sites)
                if x.startswith("E"))
+
+
+def test_a_renamed_site_map_keeps_its_saved_montages(tmp_path):
+    path = tmp_path / "s.json"
+    m = av.ViewerModel(32, 250, DRAWING_32, store=av.MontageStore(path))
+    m.set_wired(m.electrodes[8:], False)
+    m2 = av.ViewerModel(32, 250, _electrodes("ironbci32", 32),
+                        store=av.MontageStore(path))
+    assert m2.rows_prefix == m.rows_prefix == "32ch/"
+    assert m2.leads_key == m.leads_key
 
 
 def test_ironbci32_gets_the_full_acns_presets(tmp_path):
@@ -135,7 +155,7 @@ def test_ironbci32_gets_the_full_acns_presets(tmp_path):
 def test_ironbci32_recording_labels_are_its_sites():
     from pieeg_server.journal import referential_labels
     labels = referential_labels(_electrodes("ironbci32", 32))
-    assert labels[0] == "EEG F7-REF" and labels[-1] == "EEG E32-REF"
+    assert labels[0] == "EEG Fp1-REF" and labels[-1] == "EEG E32-REF"
 
 
 def test_sides_of_the_head():
@@ -189,10 +209,10 @@ def test_input_text_like_the_pieeg(tmp_path):
 def _dual(path):
     pg = [f"X{i}" for i in range(1, 9)]
     return av.ViewerModel(
-        40, 512, _electrodes("ironbci32", 32) + pg,
+        40, 512, DRAWING_32 + pg,
         store=av.MontageStore(path),
         input_labels={k: f"E{i}" for i, k in enumerate(pg, start=1)},
-        boards=[("IronBCI-32", _electrodes("ironbci32", 32)),
+        boards=[("IronBCI-32", DRAWING_32),
                 ("PiEEG-8", pg)],
         extra_rows=[("X1", "X2", "EKG"), ("X3", "X4", "EMG 1"),
                     ("X5", "X6", "EMG 2"), ("X7", "X8", "EMG 3")])
