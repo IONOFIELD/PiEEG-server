@@ -7,8 +7,8 @@ from pieeg_server.scope_console import (_IRONBCI32_ELECTRODES, _lead_colours,
 def test_ironbci_colours_follow_the_header_strip():
     c = _lead_colours("ironbci32", 32)
     sites = dict(zip(_IRONBCI32_ELECTRODES[:8], c[:8]))
-    assert sites == {"Fp1": "yellow", "Fp2": "orange", "Fz": "red",
-                     "Pz": "brown", "C3": "green", "C4": "blue",
+    assert sites == {"Fp1": "yellow", "Fp2": "orange", "C3": "red",
+                     "C4": "brown", "Fz": "green", "Pz": "blue",
                      "O1": "purple", "O2": "grey"}
     assert c[8:] == [None] * 24             # only the cap (bank 1) is mapped
 

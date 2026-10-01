@@ -471,6 +471,9 @@ SCOPE_CHANGELOG = [
             "(white) and BIAS (black) wires, and every channel of the BDF+ "
             "/ EDF+ (and the synced master) says its colour in the "
             "transducer field (\"lead wire yellow\")."),
+    ("8.5", "IronBCI-32 bank 1 as worn: E1 Fp1, E2 Fp2, E3 C3, E4 C4, E5 Fz, "
+            "E6 Pz, E7 O1, E8 O2 (yellow, orange, red, brown, green, blue, "
+            "purple, grey)."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -481,14 +484,14 @@ _ELECTRODES = ["Fp1", "Fp2", "C3", "C4", "T3", "T4", "O1", "O2",
 # IronBCI-32: input -> 10-20 site, like the PiEEG's list. Four banks of 8,
 # one ADC each; bank 1 also has the REF and BIAS pins (header order BIAS, 4,
 # 3, 2, 1, 5, 6, 7, 8, REF). Bank 1 is the 8-lead cap as wired on site
-# (2026-10-01, E4 moved to Pz so the cap goes on front to back): E1 Fp1,
-# E2 Fp2, E3 Fz, E4 Pz, E5 C3, E6 C4, E7 O1, E8 O2.
+# (2026-10-01, as worn): E1 Fp1, E2 Fp2, E3 C3, E4 C4, E5 Fz, E6 Pz,
+# E7 O1, E8 O2.
 # Banks 2-4 keep the board's electrode location drawing (pieeg-club/
 # ironbci-32 images/Electrode_Location.png), except the inputs whose site
 # bank 1 now holds: those, and the inputs between 10-20 positions, go by
 # their input number. Edit this list if your cap is wired differently.
 _IRONBCI32_ELECTRODES = [
-    "Fp1", "Fp2", "Fz", "Pz", "C3", "C4", "O1", "O2",           # bank 1
+    "Fp1", "Fp2", "C3", "C4", "Fz", "Pz", "O1", "O2",           # bank 1
     "E9", "E10", "F3", "E12", "E13", "E14", "Cz", "E16",        # bank 2
     "E17", "Oz", "E19", "P4", "E21", "E22", "E23", "F4",        # bank 3
     "E25", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
