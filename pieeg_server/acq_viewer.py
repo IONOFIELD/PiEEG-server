@@ -287,10 +287,16 @@ _EKG_NAME = re.compile(r"(?<![A-Za-z])(EKG|ECG)(?![A-Za-z])", re.I)
 _EMG_NAME = re.compile(r"(?<![A-Za-z])EMG(?![A-Za-z])", re.I)
 
 
-def row_kind(name: str) -> str:
-    """"ekg", "emg" or "eeg" for a montage row, from its name: a row named
+ROW_KINDS = ("eeg", "ekg", "emg")
+
+
+def row_kind(name: str, kind: str | None = None) -> str:
+    """"ekg", "emg" or "eeg" for a montage row: the type picked in the
+    channel box (kind) when there is one, else from its name: a row named
     with EKG/ECG or EMG (e.g. "EKG", "EMG 1", "L tib EMG") is polygraphy,
     anything else is EEG."""
+    if kind in ROW_KINDS:
+        return kind
     if _EKG_NAME.search(name or ""):
         return "ekg"
     if _EMG_NAME.search(name or ""):
@@ -298,8 +304,8 @@ def row_kind(name: str) -> str:
     return "eeg"
 
 
-def row_colour(name: str) -> str:
-    return GEIST["trace_" + row_kind(name)]
+def row_colour(name: str, kind: str | None = None) -> str:
+    return GEIST["trace_" + row_kind(name, kind)]
 
 
 def find_mains_line(x, fs, mains):
@@ -818,6 +824,8 @@ class ViewerModel:
             label = str(item.get("label") or "").strip()
             if label:
                 row["label"] = label
+            if item.get("kind") in ROW_KINDS:
+                row["kind"] = item["kind"]
             rows.append(row)
         return rows
 
@@ -828,6 +836,8 @@ class ViewerModel:
             item = {"pair": list(r["pair"]), "on": bool(r["on"])}
             if r.get("label"):
                 item["label"] = r["label"]
+            if r.get("kind"):
+                item["kind"] = r["kind"]
             out.append(item)
         return out
 
@@ -968,6 +978,22 @@ class ViewerModel:
         """Display name for a row: a custom rename if set, else the site pair."""
         return row.get("label") or row["name"]
 
+    def row_kind(self, row):
+        """The row's type (eeg/ekg/emg): picked in the channel box, else
+        from its name."""
+        return row_kind(self.row_label(row), row.get("kind"))
+
+    def row_colour(self, row):
+        return GEIST["trace_" + self.row_kind(row)]
+
+    def set_row_kind(self, row, kind):
+        """Pin a row's type (None = follow its name). A pick that matches
+        what the name already says isn't stored, so a renamed "EMG 1" stays
+        EMG."""
+        row.pop("kind", None)
+        if kind in ROW_KINDS and kind != self.row_kind(row):
+            row["kind"] = kind
+
     def set_row_label(self, row, label):
         """Set/clear a row's custom name. Empty/whitespace clears it back to
         the site-pair default."""
@@ -1017,12 +1043,14 @@ class ViewerModel:
     def set_row_pair(self, row, upper, lower):
         """Point a row at a different electrode pair (upper - lower).
         Returns False, changing nothing, for a self-pair or unknown site."""
-        return self.edit_row(row, upper, lower, row.get("label")) is not None
+        return self.edit_row(row, upper, lower, row.get("label"),
+                             row.get("kind")) is not None
 
-    def edit_row(self, row, upper, lower, label=None):
+    def edit_row(self, row, upper, lower, label=None, kind=None):
         """Re-pair and (re)name a lead of the current montage: on a preset
         the edit goes to Custom (see _editable). Returns the edited row (in
-        Custom when it forked), or None for a self-pair or unknown site."""
+        Custom when it forked), or None for a self-pair or unknown site.
+        kind: the row's type (eeg/ekg/emg), None = follow its name."""
         if (upper == lower or not self.valid_site(upper)
                 or not self.valid_site(lower, lower=True)):
             return None
@@ -1030,9 +1058,10 @@ class ViewerModel:
         row["pair"] = (upper, lower)
         row["name"] = f"{upper}-{lower}"
         self.set_row_label(row, label)
+        self.set_row_kind(row, kind)
         return row
 
-    def insert_row(self, index, upper, lower, label=None):
+    def insert_row(self, index, upper, lower, label=None, kind=None):
         """Add an (upper - lower) channel to the CURRENT montage at `index`
         (clamped; None = the end). Returns the new row, or None for a
         self-pair or unknown site."""
@@ -1043,6 +1072,7 @@ class ViewerModel:
         rows = self.rows()
         row = {"pair": (upper, lower), "name": f"{upper}-{lower}", "on": True}
         self.set_row_label(row, label)
+        self.set_row_kind(row, kind)
         index = len(rows) if index is None else max(0, min(index, len(rows)))
         rows.insert(index, row)
         return row
@@ -2882,6 +2912,23 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                             font=(_MONO, _fs(10)))
         name_ent.pack(fill="x", **pad)
 
+        # Signal type: sets the trace colour (EEG blue, EKG red, EMG white).
+        # Starts at what the row is now (its name decides until one is
+        # picked), so a PiEEG polygraphy row can be turned into EEG.
+        kind0 = model.row_kind(r) if r else "eeg"
+        kind_var = tk.StringVar(value=kind0)
+        kinds = tk.Frame(body, bg=C["raised"])
+        kinds.pack(fill="x", **pad)
+        for k in ROW_KINDS:
+            tk.Radiobutton(
+                kinds, text=k.upper(), value=k, variable=kind_var,
+                indicatoron=0, width=4, relief="flat", bd=0,
+                bg=C["surface"], fg=GEIST["trace_" + k],
+                selectcolor=C["border_hi"], activebackground=C["border_hi"],
+                activeforeground=GEIST["trace_" + k],
+                font=(_MONO, _fs(10), "bold")).pack(
+                    side="left", expand=True, fill="x", padx=1)
+
         # Only the electrodes on the head (Choose leads) are offered: picking
         # a switched-off one hid the lead the moment OK was pressed. The
         # lead's own pair stays listed so an old row can still be opened.
@@ -2934,7 +2981,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             if p is None:
                 return
             if r is None:
-                row = model.insert_row(None, *p, label=name_var.get())
+                row = model.insert_row(None, *p, label=name_var.get(),
+                                       kind=kind_var.get())
                 if row is not None and not offscreen(row):
                     _hint(f"added {model.epair_name(p)}")
             else:
@@ -2943,7 +2991,11 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                 name = name_var.get().strip()
                 if not r.get("label") and name == r["name"]:
                     name = ""
-                row = model.edit_row(r, *p, name)
+                # untouched type buttons: the row keeps what it had (a name
+                # with EKG/EMG in it still decides); a pick pins the type
+                kind = (kind_var.get() if kind_var.get() != kind0
+                        else r.get("kind"))
+                row = model.edit_row(r, *p, name, kind)
                 if row is not None:
                     offscreen(row)
             _edited()
@@ -2953,7 +3005,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
             p = pair()
             if p is None:
                 return
-            row = model.insert_row(None if i is None else i + 1, *p)
+            row = model.insert_row(None if i is None else i + 1, *p,
+                                   kind=kind_var.get())
             if row is not None and not offscreen(row):
                 _hint(f"added {model.epair_name(p)} below")
             _edited()
@@ -3671,7 +3724,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         ib_on = np.array([b != REF_SITE for _, b in (x["pair"] for x in rows)],
                          dtype=np.float64)
         bases = (np.arange(len(rows)) * row_h + row_h / 2.0)[:, None]
-        colours = [row_colour(model.row_label(x)) for x in rows]
+        colours = [model.row_colour(x) for x in rows]
         for c0, c1 in spans:
             p0 = starts[c0]
             p1 = starts[c1 + 1] if c1 + 1 < ncol else win
@@ -3689,7 +3742,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         win = model.win
         vfilt, head, _ = model.view()
         sig = (W, H, row_h, sens, tuple(x["pair"] for x in rows),
-               tuple(row_colour(model.row_label(x)) for x in rows),
+               tuple(model.row_colour(x) for x in rows),
                model.cutoffs,
                id(model.frozen), win, _rev["on"] and _rev["gen"])
         if _rev["on"]:
