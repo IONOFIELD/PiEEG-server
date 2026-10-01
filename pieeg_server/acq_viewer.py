@@ -1381,6 +1381,63 @@ def row_side(pair):
     return a if a == b else None
 
 
+# ---- lead map: where each colour goes on the head ------------------------ #
+# 10-20 sites on a head of radius 1 (nose up, left on the left), the outer
+# ring at 0.8. Sites without a 10-20 name (E12 …) aren't drawn on the head;
+# the map lists them underneath.
+HEAD_XY = {
+    "Fpz": (0.0, 0.8), "Fp1": (-0.25, 0.76), "Fp2": (0.25, 0.76),
+    "F7": (-0.65, 0.47), "F3": (-0.33, 0.4), "Fz": (0.0, 0.4),
+    "F4": (0.33, 0.4), "F8": (0.65, 0.47),
+    "T3": (-0.8, 0.0), "C3": (-0.4, 0.0), "Cz": (0.0, 0.0),
+    "C4": (0.4, 0.0), "T4": (0.8, 0.0),
+    "T5": (-0.65, -0.47), "P3": (-0.33, -0.4), "Pz": (0.0, -0.4),
+    "P4": (0.33, -0.4), "T6": (0.65, -0.47),
+    "O1": (-0.25, -0.76), "Oz": (0.0, -0.8), "O2": (0.25, -0.76),
+    "T7": (-0.8, 0.0), "T8": (0.8, 0.0), "P7": (-0.65, -0.47),
+    "P8": (0.65, -0.47), "A1": (-1.08, 0.0), "A2": (1.08, 0.0),
+}
+# Lead-wire colours as drawn, and the text that reads on each.
+WIRE_HEX = {
+    "white": "#f4f4f4", "black": "#000000", "grey": "#9a9a9a",
+    "purple": "#9b4fd1", "blue": "#2f6bff", "green": "#2ea84a",
+    "yellow": "#f2d40c", "orange": "#ff8a1c", "red": "#e53935",
+    "brown": "#8b5a2b",
+}
+_WIRE_DARK_TEXT = {"white", "grey", "yellow", "orange", "green"}
+
+
+def wire_text(colour):
+    return "#000000" if colour in _WIRE_DARK_TEXT else "#ffffff"
+
+
+def lead_map_items(model, colours):
+    """The leads to show on the lead map, one dict per wired input that has
+    a wire colour: {"site", "input" ("E5"), "colour", "xy" (HEAD_XY, or None
+    off the head), "contact" (green/amber/red/None), "board", "label" (the
+    first row using it, for leads off the head)}. colours: a wire colour (or
+    None) per input, in model.electrodes order."""
+    board_of = {}
+    for name, keys in model.boards:
+        for k in keys:
+            board_of[k] = name
+    rows = model.rows()
+    out = []
+    for i, site in enumerate(model.electrodes):
+        colour = colours[i] if i < len(colours) else None
+        if not colour or site in model.unwired:
+            continue
+        label = next((model.row_label(r) for r in rows
+                      if site in r["pair"] and r.get("label")), None)
+        out.append({"site": site, "input": model.elabel(site),
+                    "colour": colour,
+                    "xy": None if site in model.input_labels
+                    else HEAD_XY.get(site),
+                    "contact": model.site_contact(site),
+                    "board": board_of.get(site), "label": label})
+    return out
+
+
 def column_envelope(seg, local_starts):
     """Min/max of each pixel column of a sweep segment, in time order.
 
@@ -1590,7 +1647,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                calibrate_control=None, board_warning=None,
                input_labels=None, boards=None, extra_rows=None,
                impedance_first_input=1, signal_contact_inputs=0,
-               drift_inputs=0):
+               drift_inputs=0, lead_colours=None, lead_map_ref=None,
+               lead_map_title=None):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     impedance_first_input: the input (1-based) the impedance check's first
@@ -1600,6 +1658,12 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     live contact ESTIMATE dot from their mains pickup (SignalContact).
     drift_inputs: that many leading inputs (the IronBCI's) get the display
     filter's ramp-cancelling drift stage (StreamingFilter).
+    lead_colours: the wire colour plugged into each input (model.electrodes
+    order, None = no wire). When given, the lead map opens with the Scope: a
+    head with every wired lead in its wire colour at its site and a live
+    contact bubble on it (Montage ▸ Lead map… brings it back).
+    lead_map_ref: True when the first board's REF/BIAS have lead-off
+    verdicts (a PiEEG on its own), so the map shows bubbles on those too.
 
     board_warning: text shown as a red banner on the chart for the whole
     session (the board came up wrong, e.g. dead inputs or an odd rate), and
@@ -1791,6 +1855,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                               command=lambda n=_name: _switch_montage(n))
     mont_menu.add_separator()
     mont_menu.add_command(label="Choose leads…", command=lambda: _leads_box())
+    if lead_colours:
+        mont_menu.add_command(label="Lead map…", command=lambda: _lead_map())
     # Saline bath check of the chosen IronBCI-32 bundles (a board with no
     # lead-off detection: model.signal_contact_n of its inputs)
     saline_ok = model.signal_contact_n >= 8
@@ -2074,6 +2140,145 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
 
     canvas.bind("<Button-3>", lambda e: _channel_box(e))
     canvas.bind("<Button-2>", lambda e: _channel_box(e))
+
+    # ---- lead map: which colour goes where, and is it picking up ---------- #
+    # Opens with the Scope (lead_colours given) at the right edge, over the
+    # traces but without taking the taps: the Scope stays usable underneath.
+    # Each wired lead is a dot in its wire colour at its site, with the live
+    # contact bubble (green good / amber loose / red off / grey not yet
+    # known) at its corner: the same verdicts as the dots on the traces.
+    _lmap = {"win": None, "canvas": None, "after": None}
+    _LM_R = 118                     # head radius, px (fits 480 px tall)
+    _LM_W = 2 * _LM_R + 64
+
+    def _lead_map_close():
+        if _lmap["after"] is not None:
+            root.after_cancel(_lmap["after"])
+            _lmap["after"] = None
+        win = _lmap["win"]
+        _lmap["win"] = None
+        if win is not None and win.winfo_exists():
+            win.destroy()
+
+    def _lead_map_draw():
+        _lmap["after"] = None
+        win, cv = _lmap["win"], _lmap["canvas"]
+        if win is None or not win.winfo_exists():
+            return
+        items = lead_map_items(model, lead_colours)
+        cv.delete("all")
+        cx, cy, R = _LM_W / 2, _LM_R + 18, _LM_R
+        line = C["border_hi"]
+        # nose, ears, head
+        cv.create_polygon(cx - 12, cy - R + 2, cx, cy - R - 14,
+                          cx + 12, cy - R + 2, fill=C["surface"],
+                          outline=C["text_dim"])
+        for sx in (-1, 1):
+            cv.create_oval(cx + sx * R - 8, cy - 22, cx + sx * R + 8, cy + 22,
+                           fill=C["surface"], outline=C["text_dim"])
+        cv.create_oval(cx - R, cy - R, cx + R, cy + R, fill=C["surface"],
+                       outline=C["text_dim"], width=2)
+        cv.create_line(cx, cy - R, cx, cy + R, fill=line, dash=(2, 4))
+        cv.create_line(cx - R, cy, cx + R, cy, fill=line, dash=(2, 4))
+        cv.create_text(cx - R + 4, cy - R + 4, text="L", anchor="nw",
+                       fill=C["text_dim"], font=(_MONO, _fs(9), "bold"))
+        cv.create_text(cx + R - 4, cy - R + 4, text="R", anchor="ne",
+                       fill=C["text_dim"], font=(_MONO, _fs(9), "bold"))
+
+        def bubble(x, y, verdict, r=6):
+            fg = _CONTACT_FG.get(verdict) or C["text_dim"]
+            cv.create_oval(x - r, y - r, x + r, y + r, fill=fg,
+                           outline=C["bg"], width=2)
+
+        def lead(x, y, colour, text, verdict, r=15):
+            cv.create_oval(x - r, y - r, x + r, y + r,
+                           fill=WIRE_HEX.get(colour, colour),
+                           outline=C["text_sec"] if colour == "black"
+                           else C["bg"], width=2)
+            cv.create_text(x, y, text=text, fill=wire_text(colour),
+                           font=(_MONO, _fs(8), "bold"))
+            bubble(x + r * 0.78, y - r * 0.78, verdict)
+
+        on_head = [it for it in items if it["xy"]]
+        off_head = [it for it in items if not it["xy"]]
+        for it in on_head:
+            x, y = it["xy"]
+            lead(cx + x * R, cy - y * R, it["colour"], it["site"],
+                 it["contact"])
+        good = sum(1 for it in items if it["contact"] == "green")
+        y = cy + R + 16
+        cv.create_text(cx, y, fill=C["text_sec"], font=(_MONO, _fs(9)),
+                       text=f"{good}/{len(items)} picking up well"
+                       if items else "no leads chosen (Choose leads…)")
+        # the shared leads, then any lead that isn't on a 10-20 site (the
+        # PiEEG's EKG/EMG next to an IronBCI, E-numbered inputs)
+        refs = [("REF", "white", lead_map_ref and model.contact.ref()),
+                ("BIAS", "black", lead_map_ref and model.contact.gnd())]
+        y += 24
+        for k, (name, colour, verdict) in enumerate(refs):
+            x = cx - 60 + 120 * k
+            lead(x - 22, y, colour, "", verdict or None, r=11)
+            cv.create_text(x - 6, y, text=name, anchor="w", fill=C["text"],
+                           font=(_MONO, _fs(9), "bold"))
+        # four to a row (three where they carry a name like "EMG 1"); a
+        # second board (the PiEEG's body leads next to an IronBCI) gets its
+        # own heading
+        first = model.boards[0][0] if model.boards else None
+        board, col = first, 0
+        y += 4
+        named = {it["board"] for it in off_head if it["label"]}
+        for it in off_head:
+            if it["board"] != board:
+                board = it["board"]
+                y += 22
+                cv.create_text(8, y, text=board or "", anchor="w",
+                               fill=C["text_sec"], font=(_MONO, _fs(9)))
+                col = 0
+            per = 3 if board in named else 4
+            if col % per == 0:
+                y += 22
+            x = 16 + (col % per) * (_LM_W // per)
+            lead(x, y, it["colour"], "", it["contact"], r=8)
+            cv.create_text(x + 12, y, anchor="w", fill=C["text"],
+                           font=(_MONO, _fs(9)),
+                           text=f"{it['input']} {it['label'] or ''}".strip())
+            col += 1
+        cv.configure(height=y + 14)
+        _lmap["after"] = root.after(500, _lead_map_draw)
+
+    def _lead_map():
+        if not lead_colours:
+            return
+        _lead_map_close()
+        win = tk.Toplevel(root, bg=C["raised"], highlightthickness=1,
+                          highlightbackground=C["border_hi"])
+        win.overrideredirect(True)
+        _lmap["win"] = win
+        head = tk.Frame(win, bg=C["raised"])
+        head.pack(fill="x", padx=6, pady=(2, 0))
+        title = lead_map_title or (
+            model.boards[0][0] if model.boards else "Leads")
+        tk.Label(head, text=f"Lead map · {title}", bg=C["raised"],
+                 fg=C["text"], font=(_MONO, _fs(10), "bold")).pack(
+                     side="left")
+        close = tk.Label(head, text="✕", bg=C["raised"], fg=C["text_sec"],
+                         cursor="hand2", font=("TkDefaultFont", _fs(13)),
+                         padx=6)
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: _lead_map_close())
+        cv = tk.Canvas(win, width=_LM_W, height=300, bg=C["raised"],
+                       highlightthickness=0)
+        cv.pack(padx=4, pady=(0, 4))
+        _lmap["canvas"] = cv
+        _lead_map_draw()
+        win.update_idletasks()
+        x = root.winfo_rootx() + root.winfo_width() - win.winfo_reqwidth() - 4
+        win.geometry(f"+{max(0, x)}+{root.winfo_rooty() + 40}")
+        try:
+            win.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        win.lift()
 
     def _leads_box():
         # Which electrodes are on screen, by E-number only ("E1", "E2", …),
@@ -4238,6 +4443,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     if connect_popup:
         # ~1.2 s lets the scope map and paint its first frames first.
         root.after(1200, _show_connect_popup)
+    if lead_colours:
+        root.after(1500, _lead_map)
 
     if auto_shot or auto_close_ms:
         def _auto():
