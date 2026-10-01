@@ -466,6 +466,11 @@ SCOPE_CHANGELOG = [
             "screen its leads are listed on the right (wire colour, contact "
             "bubble, last impedance value) with a Check impedance button "
             "that runs only once every PiEEG lead is chosen in Choose leads."),
+    ("8.4", "Recordings carry the lead-wire colours of both boards: the raw "
+            "sidecars (.json) list the colour on every input plus the REF "
+            "(white) and BIAS (black) wires, and every channel of the BDF+ "
+            "/ EDF+ (and the synced master) says its colour in the "
+            "transducer field (\"lead wire yellow\")."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -498,6 +503,13 @@ _IRONBCI32_ELECTRODES = [
 # E6 orange, E7 red, E8 brown (a PiEEG-16's second 8 repeat it).
 _PIEEG_LEAD_COLOURS = ("grey", "purple", "blue", "green", "yellow", "orange",
                        "red", "brown")
+
+
+def _wires(device: str, n: int) -> dict:
+    """Lead-wire colours for a recording's sidecar (JournalWriter wires)."""
+    from .saline_check import BIAS_COLOUR, REF_COLOUR
+    return {"channels": _lead_colours(device, n), "ref": REF_COLOUR,
+            "bias": BIAS_COLOUR}
 
 
 def _lead_colours(device: str, n: int) -> list[str | None]:
@@ -1075,7 +1087,8 @@ def main(argv=None):
     # Recordings carry the same input -> site map the viewer shows.
     server = PiEEGServer(acq, host=args.host, port=args.port,
                          num_channels=acq.num_channels,
-                         channel_labels=referential_labels(electrodes))
+                         channel_labels=referential_labels(electrodes),
+                         channel_wires=_wires(args.device, acq.num_channels))
     server._lsl_groups = profiles.load_lsl_groups()
     server._recordings_dir = args.recordings_dir
     if serial:
@@ -1087,7 +1100,8 @@ def main(argv=None):
         # by what the default rows use them for (EKG on E1-E2, EMG after)
         server.add_record_source(acq2, "pg", _pg_labels(pg_n),
                                  reference="PiEEG inputs against its own "
-                                           "SRB1 REF (polygraphy)")
+                                           "SRB1 REF (polygraphy)",
+                                 wires=_wires(f"pieeg{pg_n}", pg_n))
 
     dashboard = None
     if not args.no_dashboard:

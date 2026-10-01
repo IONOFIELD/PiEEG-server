@@ -175,3 +175,24 @@ def test_no_annotations_file_exports_without_marks(tmp_path):
     out = edf_export.export_journal(jrnl)
     with pyedflib.EdfReader(str(out)) as r:
         assert len(r.readAnnotations()[0]) == 0
+
+
+def test_wire_colours_reach_bdf_and_edf_transducers(tmp_path):
+    """The lead-wire colour on each input lands in its transducer field;
+    an input with nothing plugged in stays blank."""
+    counts = np.zeros((500, 3), dtype=JOURNAL_DTYPE)
+    jrnl = _make_journal(tmp_path, counts)
+    side = tmp_path / "sess.json"
+    meta = json.loads(side.read_text())
+    meta.update(channel_wire_colours=["yellow", "orange", None],
+                ref_wire_colour="white", bias_wire_colour="black")
+    side.write_text(json.dumps(meta))
+    for fmt in ("bdf", "edf"):
+        out = edf_export.export_journal(jrnl, fmt=fmt)
+        r = pyedflib.EdfReader(str(out))
+        try:
+            assert [r.getTransducer(i) for i in range(3)] == [
+                "lead wire yellow", "lead wire orange", ""]
+        finally:
+            r.close()
+        out.unlink()

@@ -141,7 +141,7 @@ class JournalWriter:
     def __init__(self, acquisition, out_dir, session_name=None,
                  num_channels=None, sample_rate=250, channel_labels=None,
                  gain=GAIN, vref_uv=VREF_UV, prefilter=None, reference=None,
-                 timing_source="data_ready_edge"):
+                 timing_source="data_ready_edge", wires=None):
         self._acq = acquisition
         # Recordings are raw: the chip's own samples (subscribe_raw; with
         # oversampling that is the chip rate, before any decimation filter).
@@ -152,6 +152,9 @@ class JournalWriter:
         self._nch = int(num_channels or acquisition.num_channels)
         self._fs = int(sample_rate)
         self._labels = list(channel_labels) if channel_labels else default_labels(self._nch)
+        # lead-wire colours as plugged (see _write_sidecar): {"channels":
+        # [colour or None per input], "ref": colour, "bias": colour}
+        self._wires = dict(wires) if wires else None
         # Gain and Vref define the PHYSICAL calibration. They should be passed
         # straight from the hardware register readback so the sidecar can never
         # desync from the chip. lsb_uv is derived from them, never hard-coded.
@@ -211,6 +214,13 @@ class JournalWriter:
             "channel_labels": self._labels,
             # the chip input each column came from (E1 = first input)
             "channel_inputs": [f"E{i}" for i in range(1, self._nch + 1)],
+            # the lead-wire colour plugged into each input (null: nothing
+            # plugged there), and the REF / BIAS wires
+            **({"channel_wire_colours":
+                list(self._wires.get("channels") or [])[:self._nch],
+                "ref_wire_colour": self._wires.get("ref"),
+                "bias_wire_colour": self._wires.get("bias")}
+               if self._wires else {}),
             "sample_rate": self._fs,
             # gain + lsb_uv both come from the same source (the hardware
             # readback passed into __init__), so register and metadata cannot
