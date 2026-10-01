@@ -462,6 +462,10 @@ SCOPE_CHANGELOG = [
             "off, grey not known yet), plus REF (white) and BIAS (black). "
             "IronBCI-32: the 8-lead cap on bank 1. PiEEG: E1 grey … E8 brown; "
             "next to an IronBCI its body leads are listed under the head."),
+    ("8.3", "Lead map opens in the middle of the screen. With a PiEEG on "
+            "screen its leads are listed on the right (wire colour, contact "
+            "bubble, last impedance value) with a Check impedance button "
+            "that runs only once every PiEEG lead is chosen in Choose leads."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
