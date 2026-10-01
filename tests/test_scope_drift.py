@@ -49,7 +49,7 @@ def test_model_filters_carry_drift_inputs():
 
 def test_ironbci_bank1_is_the_site_cap():
     from pieeg_server.scope_console import _IRONBCI32_ELECTRODES as E
-    assert E[:8] == ["Fp1", "Fp2", "Fz", "C3", "C4", "Pz", "O1", "O2"]
+    assert E[:8] == ["Fp1", "Fp2", "Fz", "Pz", "C3", "C4", "O1", "O2"]
     assert len(set(E)) == 32
 
 
