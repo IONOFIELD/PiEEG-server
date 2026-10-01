@@ -198,6 +198,13 @@ DEFAULT_NOTCH = "60 Hz"   # local mains (US grid)
 HFF_ORDER = 4
 # LFF roll-off: first order, like an analog RC coupling (time constant).
 LFF_ORDER = 1
+# Drift stage (IronBCI inputs): a single-pole LFF passes DC but not a ramp —
+# an electrode drifting at s µV/s keeps a standing offset of s·TC, which
+# pinned a settling O1 (349 µV/s → +55 µV at 1 Hz, +180 µV at 0.3 Hz) on its
+# row edge. A 2nd-order high-pass this far below any LFF choice cancels a
+# steady ramp outright; 0.5 Hz and up pass unchanged (0.1 Hz: -3%).
+DRIFT_HZ = 0.05
+DRIFT_ORDER = 2
 DEFAULT_SENS = 20         # microvolts per millimetre
 # Mains tracking. The chip's clock runs a little off nominal (249.41 SPS
 # measured on this board), and every filter is designed on the nominal 250
@@ -326,11 +333,18 @@ class StreamingFilter:
     Filtering is linear, so we filter the raw referential channels here and
     the viewer forms the bipolar differences afterwards — the order does not
     change the result and keeps this class montage-agnostic.
+
+    drift_inputs: that many leading channels (the IronBCI's) also go through
+    the DRIFT_HZ ramp-cancelling high-pass ahead of the LFF, whenever an LFF
+    is on (LFF Off still shows the true DC).
     """
 
-    def __init__(self, num_channels: int, fs: float):
+    def __init__(self, num_channels: int, fs: float, drift_inputs: int = 0):
         self._nch = num_channels
         self._fs = fs
+        self._ndrift = max(0, min(int(drift_inputs), num_channels))
+        self._drift = None   # (b, a) ramp-cancelling high-pass, or None
+        self._zi_drift = None
         self._hp = None      # (b, a) high-pass for LFF, or None
         self._lp = None      # (b, a) low-pass for HFF, or None
         self._notch = None   # (b, a) band-stop for mains, or None
@@ -355,6 +369,10 @@ class StreamingFilter:
             # single pole, the RC time-constant filter: TC = 1 / (2π·LFF),
             # -6 dB/octave (0.3 Hz ≈ TC 0.53 s, 1 Hz ≈ TC 0.16 s)
             self._hp = signal.butter(LFF_ORDER, lff / nyq, btype="highpass")
+        self._drift = None
+        if self._hp is not None and self._ndrift and DRIFT_HZ < lff:
+            self._drift = signal.butter(DRIFT_ORDER, DRIFT_HZ / nyq,
+                                        btype="highpass")
         self._lp = None
         if hff is not None and 0 < hff < nyq:
             self._lp = signal.butter(HFF_ORDER, hff / nyq, btype="lowpass")
@@ -381,6 +399,12 @@ class StreamingFilter:
 
     def _reset_state(self):
         # One filter-delay vector per channel (axis=0 is time, axis=1 channels).
+        if self._drift is not None:
+            b, a = self._drift
+            zi = signal.lfilter_zi(b, a)
+            self._zi_drift = np.repeat(zi[:, None], self._ndrift, axis=1)
+        else:
+            self._zi_drift = None
         if self._hp is not None:
             b, a = self._hp
             zi = signal.lfilter_zi(b, a)
@@ -413,6 +437,10 @@ class StreamingFilter:
         # DC unchanged.
         if not self._primed:
             level = chunk[0]
+            if self._zi_drift is not None:
+                self._zi_drift = self._zi_drift * level[:self._ndrift]
+                level = np.concatenate((np.zeros(self._ndrift),
+                                        level[self._ndrift:]))
             if self._zi_hp is not None:
                 self._zi_hp = self._zi_hp * level
                 level = np.zeros_like(level)
@@ -421,6 +449,12 @@ class StreamingFilter:
             if self._zi_notch is not None:
                 self._zi_notch = self._zi_notch * level
             self._primed = True
+        if self._drift is not None:
+            b, a = self._drift
+            n = self._ndrift
+            head, self._zi_drift = signal.lfilter(b, a, out[:, :n], axis=0,
+                                                  zi=self._zi_drift)
+            out = np.concatenate((head, out[:, n:]), axis=1)
         if self._hp is not None:
             b, a = self._hp
             out, self._zi_hp = signal.lfilter(b, a, out, axis=0, zi=self._zi_hp)
@@ -662,7 +696,7 @@ class ViewerModel:
 
     def __init__(self, num_channels, fs, electrodes, store=None,
                  input_labels=None, boards=None, extra_rows=None,
-                 signal_contact_inputs=0):
+                 signal_contact_inputs=0, drift_inputs=0):
         self.nch = num_channels
         self.fs = fs
         self.electrodes = list(electrodes)
@@ -691,7 +725,9 @@ class ViewerModel:
         # the operator presses on the chart. Acquisition keeps going into
         # raw/filt underneath; only the drawing and measuring use the copy.
         self.frozen = None
-        self.filter = StreamingFilter(num_channels, fs)
+        # the leading drift_inputs inputs (the IronBCI's) get the drift stage
+        self.drift_n = int(drift_inputs)
+        self.filter = self.new_filter()
         self.contact = ContactTracker(num_channels)
         # The first signal_contact_inputs inputs (a board without lead-off
         # detection) get the mains-pickup contact estimate instead.
@@ -1040,6 +1076,10 @@ class ViewerModel:
             self.rows().pop(i)
 
     # ---- data handling ---------------------------------------------------- #
+    def new_filter(self):
+        """A fresh StreamingFilter for this model's inputs (default cutoffs)."""
+        return StreamingFilter(self.nch, self.fs, drift_inputs=self.drift_n)
+
     def set_filters(self, lff, hff, notch=None):
         if notch != self.cutoffs[2]:
             self.mains_line = None          # a different grid: find it again
@@ -1049,7 +1089,7 @@ class ViewerModel:
         # Re-run the whole visible raw window so the filtered view is coherent.
         self.filt = self._refilter(self.raw, self.filled, self.filter)
         if self.frozen is not None:
-            f = StreamingFilter(self.nch, self.fs)
+            f = self.new_filter()
             f.tune_notch(self.mains_line)
             f.set_cutoffs(lff, hff, notch)
             self.frozen["filt"] = self._refilter(self.frozen["raw"],
@@ -1510,7 +1550,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
                annotate_control=None, recordings_dir=None,
                calibrate_control=None, board_warning=None,
                input_labels=None, boards=None, extra_rows=None,
-               impedance_first_input=1, signal_contact_inputs=0):
+               impedance_first_input=1, signal_contact_inputs=0,
+               drift_inputs=0):
     """Open the viewer window. Drains frame dicts from frame_queue.
 
     impedance_first_input: the input (1-based) the impedance check's first
@@ -1518,6 +1559,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     only its inputs are held flat meanwhile. signal_contact_inputs: that many
     leading inputs (a board with no lead-off detection, the IronBCI-32) get a
     live contact ESTIMATE dot from their mains pickup (SignalContact).
+    drift_inputs: that many leading inputs (the IronBCI's) get the display
+    filter's ramp-cancelling drift stage (StreamingFilter).
 
     board_warning: text shown as a red banner on the chart for the whole
     session (the board came up wrong, e.g. dead inputs or an odd rate), and
@@ -1572,7 +1615,8 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
     model = ViewerModel(num_channels, fs, electrodes, store=MontageStore(),
                         input_labels=input_labels, boards=boards,
                         extra_rows=extra_rows,
-                        signal_contact_inputs=signal_contact_inputs)
+                        signal_contact_inputs=signal_contact_inputs,
+                        drift_inputs=drift_inputs)
     # inputs the impedance check drives: held flat while it runs
     imp_col0 = max(0, int(impedance_first_input) - 1)
 
@@ -3333,7 +3377,7 @@ def run_viewer(frame_queue: "queue.Queue", num_channels=8, fs=250,
         out = np.empty_like(uv)
         for a, b in zip(cuts[:-1], cuts[1:]):
             if b > a:
-                f = StreamingFilter(model.nch, model.fs)
+                f = model.new_filter()
                 f.tune_notch(line)
                 f.set_cutoffs(*model.cutoffs)
                 out[a:b] = f.process(uv[a:b])

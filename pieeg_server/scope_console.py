@@ -435,6 +435,12 @@ SCOPE_CHANGELOG = [
             "the lower electrode of a Custom lead. Picking Custom no longer "
             "freezes the traces: it starts as a copy of the montage on "
             "screen, and an empty chart says so (tap it to add a channel)."),
+    ("7.8", "IronBCI leads no longer pin to their row edge while an electrode "
+            "drifts: the display filter cancels a steady DC ramp on every "
+            "IronBCI input (a 0.05 Hz 2nd-order stage ahead of the LFF, so a "
+            "settling O1 at 350 µV/s sits centred instead of +55 µV off at "
+            "LFF 1 Hz). LFF Off still shows the true DC; PiEEG inputs, the "
+            "stream and recordings are unchanged."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -1306,7 +1312,11 @@ def main(argv=None):
                 impedance_first_input=imp_first,
                 # no lead-off comparators (IronBCI): the live contact estimate
                 signal_contact_inputs=(0 if callable(getattr(
-                    hw, "leadoff_status", None)) else acq.num_channels))
+                    hw, "leadoff_status", None)) else acq.num_channels),
+                # IronBCI inputs: ramp-cancelling drift stage on the display
+                drift_inputs=(acq.num_channels
+                              if str(args.device).startswith("ironbci")
+                              else 0))
     leadoff = _contact_source(hw)
     if acq2 is not None:
         pg = _pg_keys(pg_n)
