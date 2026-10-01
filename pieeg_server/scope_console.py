@@ -456,6 +456,12 @@ SCOPE_CHANGELOG = [
             "polygraphy rows can be switched to EEG and back. Untouched, a "
             "name with EKG/EMG in it still decides; the pick is saved with "
             "the montage."),
+    ("8.2", "Lead map: opens with the Scope (and from Montage ▸ Lead map…). "
+            "A head with each lead in its wire colour at its 10-20 site and "
+            "a live bubble on it (green picking up well, amber loose, red "
+            "off, grey not known yet), plus REF (white) and BIAS (black). "
+            "IronBCI-32: the 8-lead cap on bank 1. PiEEG: E1 grey … E8 brown; "
+            "next to an IronBCI its body leads are listed under the head."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
@@ -478,6 +484,25 @@ _IRONBCI32_ELECTRODES = [
     "E17", "Oz", "E19", "P4", "E21", "E22", "E23", "F4",        # bank 3
     "E25", "F8", "E27", "T4", "E29", "T6", "Fpz", "E32",        # bank 4
 ]
+
+
+# Lead-wire colour on each input, for the lead map. IronBCI-32: every bank's
+# header takes the same strip (top down: white REF on pin 15, then grey 8,
+# purple 7, blue 6, green 5, yellow 1, orange 2, red 3, brown 4, black
+# BIAS), so input n gets saline_check.LEAD_COLOURS[(n-1) % 8]. PiEEG: white
+# REF, black BIAS, then E1 grey, E2 purple, E3 blue, E4 green, E5 yellow,
+# E6 orange, E7 red, E8 brown (a PiEEG-16's second 8 repeat it).
+_PIEEG_LEAD_COLOURS = ("grey", "purple", "blue", "green", "yellow", "orange",
+                       "red", "brown")
+
+
+def _lead_colours(device: str, n: int) -> list[str | None]:
+    """Wire colour per input; None = nothing plugged there. The IronBCI-32
+    has only the 8-lead cap on bank 1: banks 2-4 stay off the lead map."""
+    from .saline_check import LEAD_COLOURS
+    if str(device).startswith("ironbci"):
+        return [LEAD_COLOURS[i] if i < 8 else None for i in range(n)]
+    return [_PIEEG_LEAD_COLOURS[i % 8] for i in range(n)]
 
 
 # A PiEEG next to an IronBCI-32 records polygraphy: its inputs are keyed
@@ -1334,7 +1359,11 @@ def main(argv=None):
                 # IronBCI inputs: ramp-cancelling drift stage on the display
                 drift_inputs=(acq.num_channels
                               if str(args.device).startswith("ironbci")
-                              else 0))
+                              else 0),
+                # the lead map (opens with the Scope): wire colour per input
+                lead_colours=_lead_colours(args.device, acq.num_channels),
+                lead_map_title=board,
+                lead_map_ref=callable(getattr(hw, "leadoff_status", None)))
     leadoff = _contact_source(hw)
     if acq2 is not None:
         pg = _pg_keys(pg_n)
@@ -1344,7 +1373,12 @@ def main(argv=None):
             input_labels={k: f"E{i}" for i, k in enumerate(pg, start=1)},
             boards=[(BOARD_NAMES.get(args.device, args.device), electrodes),
                     (BOARD_NAMES.get(f"pieeg{pg_n}", "PiEEG"), pg)],
-            extra_rows=PG_ROWS)
+            extra_rows=PG_ROWS,
+            lead_colours=(view["lead_colours"]
+                          + _lead_colours(f"pieeg{pg_n}", pg_n)),
+            # the PiEEG's REF/BIAS are on the body here, not the head
+            lead_map_ref=False,
+            lead_map_title=BOARD_NAMES.get(args.device, args.device))
         leadoff = _pg_leadoff(_contact_source(hw2), acq.num_channels)
     link = _ViewerLink(
         dict(view, fs=fs, title=title,
