@@ -451,6 +451,11 @@ SCOPE_CHANGELOG = [
     ("8.0", "IronBCI-32 bank 1 reordered for application: E4 is now Pz and "
             "C3/C4 move to E5/E6 (E1 Fp1, E2 Fp2, E3 Fz, E4 Pz, E5 C3, E6 C4, "
             "E7 O1, E8 O2), on screen and in recordings."),
+    ("8.1", "Channel box: EEG / EKG / EMG buttons set a channel's type and "
+            "trace colour (EEG blue, EKG red, EMG white), so the PiEEG's "
+            "polygraphy rows can be switched to EEG and back. Untouched, a "
+            "name with EKG/EMG in it still decides; the pick is saved with "
+            "the montage."),
 ]
 SCOPE_VERSION = SCOPE_CHANGELOG[-1][0]
 
