@@ -11,3 +11,19 @@ __pycache__/
 .pytest_cache/
 recordings/
 .venv/
+.env
+*.pyo
+dist/
+build/
+.cache/
+logs
+*.log
+
+# ---- editor / OS ----
+.DS_Store
+.idea
+.vscode
+
+# ---- dashboard (React/Vite) ----
+dashboard/node_modules/
+webhooks.json
